@@ -395,7 +395,12 @@ pub(super) async fn handle_worker_start(
     }
 
     if !request.force {
-        let preflight = collect_worker_start_preflight(state, log_file).await?;
+        let preflight = match collect_worker_start_preflight_bounded(state, log_file).await? {
+            PreflightOutcome::Ready(preflight) => preflight,
+            PreflightOutcome::TimedOut { seconds } => {
+                return write_preflight_timeout_response(socket, seconds).await;
+            }
+        };
         if !preflight.can_start {
             let payload = json!({
                 "success": false,
@@ -437,7 +442,12 @@ pub(super) async fn handle_worker_start(
             .await;
         }
     } else {
-        let preflight = collect_worker_start_preflight(state, log_file).await?;
+        let preflight = match collect_worker_start_preflight_bounded(state, log_file).await? {
+            PreflightOutcome::Ready(preflight) => preflight,
+            PreflightOutcome::TimedOut { seconds } => {
+                return write_preflight_timeout_response(socket, seconds).await;
+            }
+        };
         if !preflight.can_start {
             let payload = json!({
                 "success": false,
@@ -534,7 +544,12 @@ pub(super) async fn handle_worker_start_check(
         return write_session_required(socket).await;
     }
 
-    let preflight = collect_worker_start_preflight(state, log_file).await?;
+    let preflight = match collect_worker_start_preflight_bounded(state, log_file).await? {
+        PreflightOutcome::Ready(preflight) => preflight,
+        PreflightOutcome::TimedOut { seconds } => {
+            return write_preflight_timeout_response(socket, seconds).await;
+        }
+    };
     let payload = json!({
         "success": true,
         "data": preflight,
@@ -550,6 +565,63 @@ pub(super) async fn handle_worker_start_check(
 
 fn parse_worker_start_request(body: &[u8]) -> WorkerStartRequest {
     serde_json::from_slice::<WorkerStartRequest>(body).unwrap_or_default()
+}
+
+enum PreflightOutcome {
+    Ready(WorkerStartPreflightData),
+    TimedOut { seconds: u64 },
+}
+
+/// Bound the whole worker-start preflight (component registry load, domain
+/// list, per-site relations/rules fetches). Without this, a stalled component
+/// catalog or WP endpoint can wedge /api/worker/start-check indefinitely
+/// (observed with malformed local components awaiting a template alias
+/// download from an unresponsive server).
+/// WPTSALL_PREFLIGHT_TIMEOUT_SECS (default 60, 0 = unlimited) caps the total.
+async fn collect_worker_start_preflight_bounded(
+    state: &Arc<Mutex<WebUiState>>,
+    log_file: &str,
+) -> anyhow::Result<PreflightOutcome> {
+    let seconds = env_u64("WPTSALL_PREFLIGHT_TIMEOUT_SECS", 60);
+    if seconds == 0 {
+        return Ok(PreflightOutcome::Ready(
+            collect_worker_start_preflight(state, log_file).await?,
+        ));
+    }
+    match tokio::time::timeout(
+        Duration::from_secs(seconds),
+        collect_worker_start_preflight(state, log_file),
+    )
+    .await
+    {
+        Ok(result) => Ok(PreflightOutcome::Ready(result?)),
+        Err(_) => {
+            let _ = log_event(
+                log_file,
+                "warning",
+                "worker.preflight.timeout",
+                json!({ "timeout_seconds": seconds }),
+            );
+            Ok(PreflightOutcome::TimedOut { seconds })
+        }
+    }
+}
+
+async fn write_preflight_timeout_response(
+    socket: &mut TcpStream,
+    seconds: u64,
+) -> anyhow::Result<()> {
+    write_error_response_with_status(
+        socket,
+        "504 Gateway Timeout",
+        "WORKER_START_PREFLIGHT_TIMEOUT",
+        &format!(
+            "worker preflight exceeded {}s: component catalog or site relation fetch stalled; \
+             check network, WP endpoints, or local component configuration",
+            seconds
+        ),
+    )
+    .await
 }
 
 async fn collect_worker_start_preflight(
@@ -612,25 +684,46 @@ async fn collect_worker_start_preflight(
                     .filter(|pem| pem.trim().starts_with("-----BEGIN PUBLIC KEY-----"))
             };
             let session_token_str = session_token.as_deref().unwrap_or("");
-            match load_component_runtimes(
+            // A stalled component catalog (e.g. a local component that needs a
+            // template alias download from an unresponsive server) must not
+            // wedge the preflight forever: bound the registry load and degrade
+            // exactly like a load error. WPTSALL_PREFLIGHT_COMPONENT_TIMEOUT_SECS
+            // (default 15, 0 = unlimited) caps this phase; the total preflight
+            // bound (WPTSALL_PREFLIGHT_TIMEOUT_SECS) still applies on top.
+            let component_timeout_seconds =
+                env_u64("WPTSALL_PREFLIGHT_COMPONENT_TIMEOUT_SECS", 15);
+            let mut component_bindings_for_load = component_bindings.clone();
+            let registry_load = load_component_runtimes(
                 &client,
                 &server_base,
                 session_token_str,
                 log_file,
-                &mut component_bindings.clone(),
+                &mut component_bindings_for_load,
                 &component_bindings_path,
                 Some(&target_component_ids),
                 signing_key_from_db.as_deref(),
-            )
-            .await
-            {
-                Ok(registry) => Some(Arc::new(registry)),
-                Err(err) => {
+            );
+            let timed_registry_load = match component_timeout_seconds {
+                0 => tokio::time::timeout(Duration::MAX, registry_load),
+                secs => tokio::time::timeout(Duration::from_secs(secs), registry_load),
+            };
+            match timed_registry_load.await {
+                Ok(Ok(registry)) => Some(Arc::new(registry)),
+                Ok(Err(err)) => {
                     let _ = log_event(
                         log_file,
                         "warning",
                         "worker.preflight.component_registry_unavailable",
                         json!({ "error": snippet(&format!("{:#}", err)) }),
+                    );
+                    None
+                }
+                Err(_) => {
+                    let _ = log_event(
+                        log_file,
+                        "warning",
+                        "worker.preflight.component_registry_timeout",
+                        json!({ "timeout_seconds": component_timeout_seconds }),
                     );
                     None
                 }

@@ -215,3 +215,300 @@ async fn worker_config_partial_update_preserves_existing_poll_seconds() {
         Some("true".to_string())
     );
 }
+
+// ---- preflight hang regressions (2026-09-08 hazard fix) ----
+//
+// The worker preflight must never hang forever: the component registry load
+// is bounded and degrades, and the whole preflight collection is bounded and
+// answers with a structured 504. Black-hole servers (accept, never respond)
+// reproduce the stalled-catalog / stalled-endpoint conditions.
+
+async fn spawn_blackhole_server() -> (String, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hold = tokio::spawn(async move {
+        // Accept every connection and keep it alive: never read, never
+        // respond. Dropping the connection would let the client error out
+        // immediately instead of stalling.
+        let mut held: Vec<tokio::net::TcpStream> = Vec::new();
+        while let Ok((conn, _)) = listener.accept().await {
+            held.push(conn);
+        }
+    });
+    (format!("http://{}", addr), hold)
+}
+
+fn seed_preflight_local_docs(component: serde_json::Value) -> (String, String) {
+    let db_path = format!(
+        "/tmp/wptsall-preflight-{}-{}.db",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    let components_path = format!(
+        "/tmp/wptsall-preflight-{}-{}.json",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    );
+    let doc: crate::types::ComponentsLocalDoc = serde_json::from_value(json!({
+        "version": 1,
+        "components": {
+            "comp-preflight-stall": component
+        }
+    }))
+    .unwrap();
+    {
+        let conn = crate::db::open_db(&db_path).unwrap();
+        crate::db::schema::create_tables(&conn).unwrap();
+        crate::db::components::save_local_components_doc(&conn, &doc).unwrap();
+    }
+    std::fs::write(&components_path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    (db_path, components_path)
+}
+
+#[tokio::test]
+async fn worker_start_check_degrades_when_component_catalog_stalls() {
+    let _env_scope = components_env_lock().lock().unwrap();
+    let _server_mode_guard =
+        EnvVarGuard::set("WPTSALL_USE_SERVER_CONTROL_PLANE", "true".to_string());
+    let _component_timeout_guard =
+        EnvVarGuard::set("WPTSALL_PREFLIGHT_COMPONENT_TIMEOUT_SECS", "1".to_string());
+    let _skip_sig_guard =
+        EnvVarGuard::set("WPTSALL_SKIP_SIGNATURE_CHECK", "true".to_string());
+
+    // A local component that still needs a server-side template alias
+    // download forces the loader to contact the (stalled) catalog.
+    let (db_path, components_path) = seed_preflight_local_docs(json!({
+        "name": "Stalled Template",
+        "template_id": "stalled-template-v1",
+        "vendor_id": "local-vendor",
+        "kind": "text",
+        "enabled": true,
+        "created_at": "1",
+        "versions": {}
+    }));
+    let _db_guard = EnvVarGuard::set("WPTSALL_DB_PATH", db_path.clone());
+    let _components_guard =
+        EnvVarGuard::set("WPTSALL_COMPONENTS_LOCAL_FILE", components_path.clone());
+
+    let (server_base, hold) = spawn_blackhole_server().await;
+    let state = build_test_web_ui_state(&server_base, Some("sess_stall_test"));
+
+    let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let downstream_addr = downstream.local_addr().unwrap();
+    let reader = tokio::spawn(async move {
+        let mut client = tokio::net::TcpStream::connect(downstream_addr)
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&mut response).to_string()
+    });
+    let (mut socket, _) = downstream.accept().await.unwrap();
+    handle_worker_start_check(
+        &mut socket,
+        &state,
+        "/tmp/wptsall-worker-start-check-stall-test.log",
+    )
+    .await
+    .unwrap();
+    drop(socket);
+
+    let response = reader.await.unwrap();
+    hold.abort();
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "stalled component catalog must degrade preflight instead of hanging: {}",
+        response
+    );
+    assert!(
+        response.contains("\"can_start\":true"),
+        "degraded preflight should default to allow-start: {}",
+        response
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&components_path);
+}
+
+#[tokio::test]
+async fn worker_start_check_returns_504_when_preflight_exceeds_total_bound() {
+    let _env_scope = components_env_lock().lock().unwrap();
+    let _server_mode_guard =
+        EnvVarGuard::set("WPTSALL_USE_SERVER_CONTROL_PLANE", "true".to_string());
+    let _total_timeout_guard =
+        EnvVarGuard::set("WPTSALL_PREFLIGHT_TIMEOUT_SECS", "1".to_string());
+
+    // Inline local template: the catalog fetch is skipped entirely, so the
+    // registry builds locally; the server-mode domain list fetch then stalls
+    // on the black-hole server and the total bound must answer with a 504.
+    let (db_path, components_path) = seed_preflight_local_docs(json!({
+        "name": "Inline Local",
+        "template_id": "",
+        "vendor_id": "local-vendor",
+        "kind": "text",
+        "enabled": true,
+        "created_at": "1",
+        "versions": {},
+        "template_json": {
+            "id": "inline-template",
+            "name": "Inline Template",
+            "version": "1.0.0",
+            "type": "text",
+            "auth": null,
+            "request": {
+                "method": "POST",
+                "url": "http://127.0.0.1:1/translate",
+                "headers": null,
+                "body": {"text": "{{input.text}}"}
+            },
+            "response": {
+                "translated_text_path": "data.text",
+                "error_path": null,
+                "translated_ref_path": null,
+                "translated_media_ref_path": null,
+                "translated_image_ref_path": null,
+                "translated_video_ref_path": null,
+                "translated_audio_ref_path": null,
+                "translated_document_ref_path": null
+            }
+        }
+    }));
+    let _db_guard = EnvVarGuard::set("WPTSALL_DB_PATH", db_path.clone());
+    let _components_guard =
+        EnvVarGuard::set("WPTSALL_COMPONENTS_LOCAL_FILE", components_path.clone());
+
+    let (server_base, hold) = spawn_blackhole_server().await;
+    let state = build_test_web_ui_state(&server_base, Some("sess_total_test"));
+
+    let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let downstream_addr = downstream.local_addr().unwrap();
+    let reader = tokio::spawn(async move {
+        let mut client = tokio::net::TcpStream::connect(downstream_addr)
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&mut response).to_string()
+    });
+    let (mut socket, _) = downstream.accept().await.unwrap();
+    handle_worker_start_check(
+        &mut socket,
+        &state,
+        "/tmp/wptsall-worker-start-check-total-timeout-test.log",
+    )
+    .await
+    .unwrap();
+    drop(socket);
+
+    let response = reader.await.unwrap();
+    hold.abort();
+
+    assert!(
+        response.starts_with("HTTP/1.1 504 Gateway Timeout"),
+        "preflight exceeding the total bound must answer with a structured 504: {}",
+        response
+    );
+    assert!(
+        response.contains("\"WORKER_START_PREFLIGHT_TIMEOUT\""),
+        "preflight timeout must carry a stable error code: {}",
+        response
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&components_path);
+}
+
+#[tokio::test]
+async fn worker_start_returns_504_when_preflight_exceeds_total_bound() {
+    let _env_scope = components_env_lock().lock().unwrap();
+    let _server_mode_guard =
+        EnvVarGuard::set("WPTSALL_USE_SERVER_CONTROL_PLANE", "true".to_string());
+    let _total_timeout_guard =
+        EnvVarGuard::set("WPTSALL_PREFLIGHT_TIMEOUT_SECS", "1".to_string());
+    let _wp_token_guard =
+        EnvVarGuard::set("WPTSALL_WP_CLIENT_TOKEN", "wp_token_test".to_string());
+
+    let (db_path, components_path) = seed_preflight_local_docs(json!({
+        "name": "Inline Local",
+        "template_id": "",
+        "vendor_id": "local-vendor",
+        "kind": "text",
+        "enabled": true,
+        "created_at": "1",
+        "versions": {},
+        "template_json": {
+            "id": "inline-template",
+            "name": "Inline Template",
+            "version": "1.0.0",
+            "type": "text",
+            "auth": null,
+            "request": {
+                "method": "POST",
+                "url": "http://127.0.0.1:1/translate",
+                "headers": null,
+                "body": {"text": "{{input.text}}"}
+            },
+            "response": {
+                "translated_text_path": "data.text",
+                "error_path": null,
+                "translated_ref_path": null,
+                "translated_media_ref_path": null,
+                "translated_image_ref_path": null,
+                "translated_video_ref_path": null,
+                "translated_audio_ref_path": null,
+                "translated_document_ref_path": null
+            }
+        }
+    }));
+    let _db_guard = EnvVarGuard::set("WPTSALL_DB_PATH", db_path.clone());
+    let _components_guard =
+        EnvVarGuard::set("WPTSALL_COMPONENTS_LOCAL_FILE", components_path.clone());
+
+    let (server_base, hold) = spawn_blackhole_server().await;
+    let state = build_test_web_ui_state(&server_base, Some("sess_total_test"));
+    let runtime_control = WebUiRuntimeControl::new();
+
+    let downstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let downstream_addr = downstream.local_addr().unwrap();
+    let reader = tokio::spawn(async move {
+        let mut client = tokio::net::TcpStream::connect(downstream_addr)
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&mut response).to_string()
+    });
+    let (mut socket, _) = downstream.accept().await.unwrap();
+    handle_worker_start(
+        &mut socket,
+        &state,
+        &runtime_control,
+        "/tmp/wptsall-worker-start-total-timeout-test.log",
+        b"{}",
+    )
+    .await
+    .unwrap();
+    drop(socket);
+
+    let response = reader.await.unwrap();
+    hold.abort();
+
+    assert!(
+        response.starts_with("HTTP/1.1 504 Gateway Timeout"),
+        "worker start preflight timeout must answer with a structured 504: {}",
+        response
+    );
+    assert!(
+        response.contains("\"WORKER_START_PREFLIGHT_TIMEOUT\""),
+        "worker start timeout must carry a stable error code: {}",
+        response
+    );
+    assert!(
+        !runtime_control.worker_running.load(std::sync::atomic::Ordering::SeqCst),
+        "worker loop must remain stopped when preflight times out"
+    );
+
+    let _ = std::fs::remove_file(&db_path);
+    let _ = std::fs::remove_file(&components_path);
+}
