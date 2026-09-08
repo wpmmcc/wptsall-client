@@ -1,0 +1,40 @@
+# WPTSALL Client — Client de traduction local-first (WebUI + Desktop)
+
+**Le client du plugin WordPress WPMMCC ATS — sur votre machine, pas dans le cloud.**
+
+[English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md) | [한국어](README.ko.md) | [Español](README.es.md) | **Français** | [Deutsch](README.de.md) | [Português (Brasil)](README.pt-BR.md) | [Italiano](README.it.md) | [Русский](README.ru.md) | [العربية](README.ar.md) | [हिन्दी](README.hi.md) | [Türkçe](README.tr.md) | [Tiếng Việt](README.vi.md) | [Bahasa Indonesia](README.id.md)
+
+WPTSALL Client est le client compagnon du plugin WordPress WPMMCC ATS. Il tourne sur votre machine — en interface web locale ou en application bureautique native — conserve chaque réglage dans une base de données locale, se connecte directement à votre propre WordPress avec un jeton d'appareil et pilote n'importe quel fournisseur de traduction HTTP(S) que vous configurez. Sans compte, sans licence, sans dépendance au cloud.
+
+## Fonctionnalités
+- Deux produits, un cœur — une WebUI locale sur 127.0.0.1:8977 et une application bureautique native (Tauri) partageant le même cœur Rust
+- Local-first — sites, fournisseurs, composants et règles restent dans votre base locale, jamais dans le cloud
+- Connexion directe — dialogue avec votre WordPress via l'API Protocol v2 du plugin
+- N'importe quel fournisseur — apportez votre endpoint de traduction HTTP(S) et vos identifiants
+- Worker — modes ponctuel et continu, avec tentatives bornées et rappels idempotents
+- Empaquetage — kits multiplateformes (Linux / Windows / macOS) avec mises à jour OTA signées
+
+## Prérequis
+- Un site WordPress faisant tourner le plugin WPMMCC ATS 2.x — https://github.com/wpmmcc/wpmmcc-ats
+- Un jeton d'appareil et un route secret émis par le plugin
+- Un endpoint de fournisseur de traduction (toute API HTTP(S))
+
+## Installation
+1. Récupérez un kit signé ou un installateur sur https://github.com/wpmmcc/wptsall-client-releases
+2. Ou compilez depuis les sources : cargo build --release dans client-wpplugin/source (binaire WebUI), ou la chaîne Tauri dans client-desktop (application bureautique)
+3. Démarrez le binaire WebUI et ouvrez http://127.0.0.1:8977
+
+## Démarrage rapide
+1. Ajoutez votre site — collez l'URL client du plugin, le route secret et le jeton d'appareil
+2. Configurez un fournisseur de traduction — endpoint et identifiants, stockés localement
+3. Lancez le worker une fois — il réclame un lot, le traduit et écrit les résultats
+
+## Données locales et confidentialité
+Toute la configuration et l'état des tâches restent sur votre machine (SQLite et fichiers locaux). Le client ne communique qu'avec le site WordPress configuré et l'endpoint du fournisseur choisi.
+
+## Languages
+L'interface du client embarque sa propre localisation. Ce README est disponible en 16 langues — voir le tableau en haut. Les contributions pour d'autres langues sont bienvenues.
+
+## License
+GPL-2.0-or-later. Voir [LICENSE](../LICENSE).
+

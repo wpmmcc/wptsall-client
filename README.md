@@ -2,6 +2,7 @@
 
 **The translation client for the WPMMCC ATS WordPress plugin — on your machine, not in a cloud.**
 
+**English** | [简体中文](readme/README.zh-CN.md) | [繁體中文](readme/README.zh-TW.md) | [日本語](readme/README.ja.md) | [한국어](readme/README.ko.md) | [Español](readme/README.es.md) | [Français](readme/README.fr.md) | [Deutsch](readme/README.de.md) | [Português (Brasil)](readme/README.pt-BR.md) | [Italiano](readme/README.it.md) | [Русский](readme/README.ru.md) | [العربية](readme/README.ar.md) | [हिन्दी](readme/README.hi.md) | [Türkçe](readme/README.tr.md) | [Tiếng Việt](readme/README.vi.md) | [Bahasa Indonesia](readme/README.id.md)
 
 WPTSALL Client is the companion client for the WPMMCC ATS WordPress plugin. It runs on your machine — as a local web UI or as a native desktop app — keeps every setting in a local database, connects directly to your own WordPress with a device-scoped token, and drives any HTTP(S) translation provider you configure. No account, no license, no cloud dependency.
 
@@ -32,7 +33,7 @@ WPTSALL Client is the companion client for the WPMMCC ATS WordPress plugin. It r
 All configuration and task state stay on your machine (SQLite plus local files). The client only ever talks to the WordPress site you configured and the translation provider endpoint you chose.
 
 ## Languages
-The client UI ships its own localization. This README is English for now; more languages are planned and will be based on this English text.
+The client UI ships its own localization. This README is available in 16 languages — see the table at the top. Contributions for further languages are welcome.
 
 ## License
 GPL-2.0-or-later. See [LICENSE](LICENSE).

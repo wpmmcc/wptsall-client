@@ -8390,7 +8390,7 @@ dependencies = [
 
 [[package]]
 name = "wptsall-client"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -8451,7 +8451,7 @@ dependencies = [
 
 [[package]]
 name = "wptsall-desktop"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "anyhow",
  "client-runtime-core",

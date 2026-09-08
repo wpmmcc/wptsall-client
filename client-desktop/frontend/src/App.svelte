@@ -9,6 +9,8 @@
   import { onMount } from 'svelte';
   import { apiFetch, isOk } from './lib/api/client';
   import type { UpdateCheckResult } from './lib/api/types';
+  import { _, locale } from 'svelte-i18n';
+  import { availableLocales, initializeI18n, setLocale, t } from './i18n';
 
   type SiteInfo = {
     id: string;
@@ -97,16 +99,16 @@
   const importPackPlaceholder = '{"schema":"wptsall-site-connection.v1",...}';
 
   const pages = [
-    { id: 'overview', label: 'Overview' },
-    { id: 'sites', label: 'Sites' },
-    { id: 'credentials', label: 'Credentials' },
-    { id: 'tasks', label: 'Tasks' },
-    { id: 'components', label: 'Components' },
-    { id: 'providers', label: 'Providers' },
-    { id: 'integration_pack', label: 'Integration pack' },
-    { id: 'history', label: 'History' },
-    { id: 'logs', label: 'Logs' },
-    { id: 'settings', label: 'Settings' },
+    { id: 'overview', key: 'nav.overview' },
+    { id: 'sites', key: 'nav.sites' },
+    { id: 'credentials', key: 'nav.credentials' },
+    { id: 'tasks', key: 'nav.tasks' },
+    { id: 'components', key: 'nav.components' },
+    { id: 'providers', key: 'nav.providers' },
+    { id: 'integration_pack', key: 'nav.integration_pack' },
+    { id: 'history', key: 'nav.history' },
+    { id: 'logs', key: 'nav.logs' },
+    { id: 'settings', key: 'nav.settings' },
   ];
 
   let currentPage = $state('overview');
@@ -186,7 +188,7 @@
   let vendorKeys = $state<Array<Record<string, unknown>>>([]);
   let vendorKeysBusy = $state(false);
   let vendorKeyVendorId = $state('openai');
-  let vendorKeyLabel = $state('Desktop key');
+  let vendorKeyLabel = $state(t('defaults.default_key_label'));
   let vendorKeySecret = $state('');
   let vendorKeySaving = $state(false);
 
@@ -263,7 +265,7 @@
     if (isOk(r)) {
       statusInfo = r.data;
     } else {
-      setError(r.error?.message || 'Status request failed');
+      setError(r.error?.message || t('fb.status'));
     }
   }
 
@@ -272,7 +274,7 @@
     if (isOk(r)) {
       worker = r.data;
     } else {
-      setError(r.error?.message || 'Worker status request failed');
+      setError(r.error?.message || t('fb.worker_status'));
     }
   }
 
@@ -281,7 +283,7 @@
     if (isOk(r)) {
       sites = r.data;
     } else {
-      setError(r.error?.message || 'Site list request failed');
+      setError(r.error?.message || t('fb.site_list'));
     }
   }
 
@@ -290,7 +292,7 @@
     if (isOk(r)) {
       tasks = r.data;
     } else {
-      setError(r.error?.message || 'Task list request failed');
+      setError(r.error?.message || t('fb.task_list'));
     }
   }
 
@@ -299,7 +301,7 @@
     if (isOk(r)) {
       components = r.data;
     } else {
-      setError(r.error?.message || 'Component list request failed');
+      setError(r.error?.message || t('fb.component_list'));
     }
   }
 
@@ -316,7 +318,7 @@
           ? data.items
           : [];
     } else {
-      setError(r.error?.message || 'Vendor key list failed');
+      setError(r.error?.message || t('fb.vendor_key_list'));
     }
     vendorKeysBusy = false;
   }
@@ -324,7 +326,7 @@
   async function saveVendorKey(event?: Event) {
     event?.preventDefault();
     if (!vendorKeySecret.trim()) {
-      setError('API key secret is required');
+      setError(t('err.api_key_required'));
       return;
     }
     vendorKeySaving = true;
@@ -332,16 +334,16 @@
       method: 'POST',
       body: {
         vendor_id: vendorKeyVendorId.trim(),
-        label: vendorKeyLabel.trim() || 'Desktop key',
+        label: vendorKeyLabel.trim() || t('defaults.default_key_label'),
         api_key: vendorKeySecret.trim(),
       },
     });
     if (isOk(r)) {
-      setMessage(`Vendor key saved for ${vendorKeyVendorId}`);
+      setMessage(t('msg.vendor_key_saved', {vendor: vendorKeyVendorId}));
       vendorKeySecret = '';
       await loadVendorKeys();
     } else {
-      setError(r.error?.message || 'Vendor key save failed');
+      setError(r.error?.message || t('fb.vendor_key_save'));
     }
     vendorKeySaving = false;
   }
@@ -352,10 +354,10 @@
       method: 'DELETE',
     });
     if (isOk(r)) {
-      setMessage(`Vendor key deleted: ${keyId}`);
+      setMessage(t('msg.vendor_key_deleted', {key_id: keyId}));
       await loadVendorKeys();
     } else {
-      setError(r.error?.message || 'Vendor key delete failed');
+      setError(r.error?.message || t('fb.vendor_key_delete'));
     }
     vendorKeysBusy = false;
   }
@@ -373,7 +375,7 @@
           ? data.items
           : [];
     } else {
-      setError(r.error?.message || 'Vendor OAuth list failed');
+      setError(r.error?.message || t('fb.vendor_oauth_list'));
     }
     vendorOauthBusy = false;
   }
@@ -381,7 +383,7 @@
   async function saveVendorOauth(event?: Event) {
     event?.preventDefault();
     if (!oauthId.trim() || !oauthVendorId.trim()) {
-      setError('OAuth id and vendor id are required');
+      setError(t('err.oauth_ids_required'));
       return;
     }
     oauthSaving = true;
@@ -395,11 +397,11 @@
       },
     });
     if (isOk(r)) {
-      setMessage(`Vendor OAuth saved: ${oauthId}`);
+      setMessage(t('msg.oauth_saved', {id: oauthId}));
       oauthClientSecret = '';
       await loadVendorOauth();
     } else {
-      setError(r.error?.message || 'Vendor OAuth save failed');
+      setError(r.error?.message || t('fb.vendor_oauth_save'));
     }
     oauthSaving = false;
   }
@@ -422,7 +424,7 @@
       }
       await loadVendorOauth();
     } else {
-      setError(r.error?.message || 'Vendor OAuth authorize failed');
+      setError(r.error?.message || t('fb.vendor_oauth_authorize'));
     }
     vendorOauthBusy = false;
   }
@@ -433,10 +435,10 @@
       method: 'DELETE',
     });
     if (isOk(r)) {
-      setMessage(`Vendor OAuth deleted: ${id}`);
+      setMessage(t('msg.oauth_deleted', {id: id}));
       await loadVendorOauth();
     } else {
-      setError(r.error?.message || 'Vendor OAuth delete failed');
+      setError(r.error?.message || t('fb.vendor_oauth_delete'));
     }
     vendorOauthBusy = false;
   }
@@ -454,7 +456,7 @@
           ? data.items
           : [];
     } else {
-      setError(r.error?.message || 'Proxy profile list failed');
+      setError(r.error?.message || t('fb.proxy_list'));
     }
     proxyBusy = false;
   }
@@ -462,7 +464,7 @@
   async function saveProxyProfile(event?: Event) {
     event?.preventDefault();
     if (!proxyId.trim() || !proxyHost.trim()) {
-      setError('Proxy id and host are required');
+      setError(t('err.proxy_required'));
       return;
     }
     proxySaving = true;
@@ -479,10 +481,10 @@
       },
     });
     if (isOk(r)) {
-      setMessage(`Proxy profile saved: ${proxyId}`);
+      setMessage(t('msg.proxy_saved', {id: proxyId}));
       await loadProxyProfiles();
     } else {
-      setError(r.error?.message || 'Proxy profile save failed');
+      setError(r.error?.message || t('fb.proxy_save'));
     }
     proxySaving = false;
   }
@@ -501,7 +503,7 @@
           : `Proxy ${id} test completed`
       );
     } else {
-      setError(r.error?.message || 'Proxy test failed');
+      setError(r.error?.message || t('fb.proxy_test'));
     }
     proxyBusy = false;
   }
@@ -512,10 +514,10 @@
       method: 'DELETE',
     });
     if (isOk(r)) {
-      setMessage(`Proxy profile deleted: ${id}`);
+      setMessage(t('msg.proxy_deleted', {id: id}));
       await loadProxyProfiles();
     } else {
-      setError(r.error?.message || 'Proxy profile delete failed');
+      setError(r.error?.message || t('fb.proxy_delete'));
     }
     proxyBusy = false;
   }
@@ -537,7 +539,7 @@
           ? data.items
           : [];
     } else {
-      setError(r.error?.message || 'Job items request failed');
+      setError(r.error?.message || t('fb.job_items'));
       jobItems = [];
     }
     jobItemsBusy = false;
@@ -558,7 +560,7 @@
             ? JSON.stringify(translated, null, 2)
             : '';
     } else {
-      setError(r.error?.message || 'Item content request failed');
+      setError(r.error?.message || t('fb.item_content'));
       itemContent = null;
     }
     itemBusy = false;
@@ -578,10 +580,10 @@
       { method: 'PUT', body: { content } }
     );
     if (isOk(r)) {
-      setMessage(`Saved translation for item ${selectedItemId}`);
+      setMessage(t('msg.translation_saved', {item: selectedItemId}));
       await openItemReview(selectedItemId);
     } else {
-      setError(r.error?.message || 'Save translation failed');
+      setError(r.error?.message || t('fb.save_translation'));
     }
     itemBusy = false;
   }
@@ -594,10 +596,10 @@
       { method: 'POST' }
     );
     if (isOk(r)) {
-      setMessage(`Approved item ${selectedItemId}`);
+      setMessage(t('msg.item_approved', {item: selectedItemId}));
       if (selectedJobId) await loadJobItems(selectedJobId);
     } else {
-      setError(r.error?.message || 'Approve failed');
+      setError(r.error?.message || t('fb.approve'));
     }
     itemBusy = false;
   }
@@ -610,9 +612,9 @@
       { method: 'POST' }
     );
     if (isOk(r)) {
-      setMessage(`Retranslate queued for item ${selectedItemId}`);
+      setMessage(t('msg.retranslate_queued', {item: selectedItemId}));
     } else {
-      setError(r.error?.message || 'Retranslate failed');
+      setError(r.error?.message || t('fb.retranslate'));
     }
     itemBusy = false;
   }
@@ -624,7 +626,7 @@
       { method: 'POST', body: {} }
     );
     if (isOk(r)) {
-      setMessage(`Quick-test OK: ${componentId}`);
+      setMessage(t('msg.quick_test_ok', {component: componentId}));
     } else {
       setError(r.error?.message || `Quick-test failed: ${componentId}`);
     }
@@ -647,7 +649,7 @@
         logLines = [];
       }
     } else {
-      setError(r.error?.message || 'Logs request failed');
+      setError(r.error?.message || t('fb.logs'));
     }
     logsBusy = false;
   }
@@ -671,7 +673,7 @@
       historyTotal = Number(r.data?.total || 0);
       historySelected = new Set();
     } else {
-      setError(r.error?.message || 'History request failed');
+      setError(r.error?.message || t('fb.history'));
     }
     historyBusy = false;
   }
@@ -700,10 +702,10 @@
       body: { ids },
     });
     if (isOk(r)) {
-      setMessage(`Queued ${r.data?.queued ?? ids.length} translation(s) for retry`);
+      setMessage(t('msg.batch_retry_queued', {count: r.data?.queued ?? ids.length}));
       await loadHistory();
     } else {
-      setError(r.error?.message || 'Batch retry failed');
+      setError(r.error?.message || t('fb.batch_retry'));
     }
     historyBatchBusy = false;
   }
@@ -711,7 +713,7 @@
   async function batchDeleteHistory() {
     const ids = [...historySelected];
     if (ids.length === 0) return;
-    if (!confirm(`Delete ${ids.length} translation record(s)?`)) return;
+    if (!confirm(t('history.confirm_delete', {count: ids.length}))) return;
     historyBatchBusy = true;
     const r = await apiFetch<Record<string, unknown>>('/api/translations/batch-delete', {
       method: 'POST',
@@ -721,7 +723,7 @@
       setMessage(`Deleted ${ids.length} translation record(s)`);
       await loadHistory();
     } else {
-      setError(r.error?.message || 'Batch delete failed');
+      setError(r.error?.message || t('fb.batch_delete'));
     }
     historyBatchBusy = false;
   }
@@ -732,7 +734,7 @@
       method: 'POST',
     });
     if (isOk(r)) {
-      setMessage(`Queued retry for #${id}`);
+      setMessage(t('msg.retry_queued', {id: id}));
       await loadHistory();
     } else {
       setError(r.error?.message || `Retry failed for #${id}`);
@@ -755,7 +757,7 @@
     if (isOk(r)) {
       providerCatalog = r.data;
     } else {
-      setError(r.error?.message || 'Provider catalog request failed');
+      setError(r.error?.message || t('fb.provider_catalog'));
     }
     providerCatalogBusy = false;
   }
@@ -767,10 +769,10 @@
       body: {},
     });
     if (isOk(r)) {
-      setMessage(`Provider catalog verified: ${String(r.data.catalog_version || 'local')}`);
+      setMessage(t('msg.catalog_verified', {version: String(r.data.catalog_version || 'local')}));
       await loadProviderCatalog();
     } else {
-      setError(r.error?.message || 'Provider catalog verification failed');
+      setError(r.error?.message || t('fb.provider_catalog_verify'));
     }
     providerCatalogRefreshing = false;
   }
@@ -790,10 +792,10 @@
       body: { entry_id: item.entry_id, local_id: catalogLocalId(item) },
     });
     if (isOk(r)) {
-      setMessage(`Provider template installed: ${String(r.data.id || item.template_id)}`);
+      setMessage(t('msg.template_installed', {id: String(r.data.id || item.template_id)}));
       await loadComponents();
     } else {
-      setError(r.error?.message || 'Provider template installation failed');
+      setError(r.error?.message || t('fb.provider_install'));
     }
     providerCatalogInstalling = null;
   }
@@ -842,16 +844,16 @@
     if (isOk(r)) {
       wizardLocalId = String(r.data.id || wizardLocalId);
       wizardStep = 'key';
-      setMessage(`Installed ${wizardLocalId}`);
+      setMessage(t('msg.installed', {id: wizardLocalId}));
     } else {
-      setError(r.error?.message || 'Install failed');
+      setError(r.error?.message || t('fb.install'));
     }
     wizardBusy = false;
   }
 
   async function wizardBindKey() {
     if (!wizardItem || !wizardPrimarySecret()) {
-      setError('Credentials are required');
+      setError(t('err.credentials_required'));
       return;
     }
     wizardBusy = true;
@@ -872,7 +874,7 @@
       },
     });
     if (!isOk(keyRes)) {
-      setError(keyRes.error?.message || 'Save key failed');
+      setError(keyRes.error?.message || t('fb.save_key'));
       wizardBusy = false;
       return;
     }
@@ -922,7 +924,7 @@
       },
     });
     if (!isOk(r)) {
-      setError(r.error?.message || 'Quick-test failed');
+      setError(r.error?.message || t('fb.quick_test'));
       wizardHint = (r.error as { hint?: string } | undefined)?.hint || '';
       wizardBusy = false;
       return;
@@ -948,7 +950,7 @@
     if (isOk(r)) {
       wizardStep = 'route';
     } else {
-      setError(r.error?.message || 'Enable failed');
+      setError(r.error?.message || t('fb.enable'));
     }
     wizardBusy = false;
   }
@@ -970,14 +972,14 @@
       );
       await loadComponents();
     } else {
-      setError(r.error?.message || 'Route binding failed');
+      setError(r.error?.message || t('fb.route_binding'));
     }
     wizardBusy = false;
   }
 
   function parseIntegrationPack(): Record<string, unknown> | null {
     if (!integrationImportJson.trim()) {
-      setError('Paste an integration pack JSON first');
+      setError(t('err.paste_pack_first'));
       return null;
     }
     try {
@@ -987,7 +989,7 @@
       }
       return value as Record<string, unknown>;
     } catch (error) {
-      setError(`Invalid integration pack JSON: ${String(error)}`);
+      setError(t('err.invalid_pack_json', {error: String(error)}));
       return null;
     }
   }
@@ -1002,11 +1004,11 @@
     try {
       if (integrationExportMode === 'private') {
         if (!integrationConfirmPrivate) {
-          setError('Confirm the private backup warning first');
+          setError(t('err.confirm_private_first'));
           return;
         }
         if (integrationExportPassphrase.trim().length < 8) {
-          setError('A passphrase of at least 8 characters is required');
+          setError(t('err.passphrase_min'));
           return;
         }
       }
@@ -1022,9 +1024,9 @@
       if (isOk(r)) {
         integrationExportJson = JSON.stringify(r.data, null, 2);
         integrationExportPassphrase = '';
-        setMessage('Integration pack exported');
+        setMessage(t('msg.pack_exported'));
       } else {
-        setError(r.error?.message || 'Integration pack export failed');
+        setError(r.error?.message || t('fb.pack_export'));
       }
     } finally {
       integrationExportBusy = false;
@@ -1055,10 +1057,10 @@
         integrationPreview = r.data;
         integrationPreviewInput = integrationImportJson;
         integrationPreviewPassphrase = integrationImportPassphrase;
-        setMessage('Integration pack preview ready');
+        setMessage(t('msg.pack_preview_ready'));
         return true;
       }
-      setError(r.error?.message || 'Integration pack preview failed');
+      setError(r.error?.message || t('fb.pack_preview'));
     } finally {
       integrationPreviewBusy = false;
     }
@@ -1068,7 +1070,7 @@
   async function importIntegrationPackDesktop() {
     if (!(await previewIntegrationPackDesktop())) return;
     if (integrationPreview?.safe_to_import !== true) {
-      setError('Integration pack is not safe to import');
+      setError(t('msg.pack_not_safe'));
       return;
     }
     integrationImportBusy = true;
@@ -1080,7 +1082,7 @@
         body: { ...integrationPackWithPassphrase(pack), overwrite: integrationOverwrite },
       });
       if (isOk(r)) {
-        setMessage('Integration pack imported');
+        setMessage(t('msg.pack_imported'));
         integrationImportJson = '';
         integrationImportPassphrase = '';
         integrationPreview = null;
@@ -1088,7 +1090,7 @@
         integrationPreviewPassphrase = '';
         await loadAll();
       } else {
-        setError(r.error?.message || 'Integration pack import failed');
+        setError(r.error?.message || t('fb.pack_import'));
       }
     } finally {
       integrationImportBusy = false;
@@ -1123,7 +1125,7 @@
 
   async function refreshDomains() {
     await loadAll();
-    setMessage(`Local data refreshed: ${sites.length} sites`);
+    setMessage(t('msg.data_refreshed', {count: sites.length}));
   }
 
   async function addSite(event: Event) {
@@ -1140,13 +1142,13 @@
       },
     });
     if (isOk(r)) {
-      setMessage(`Site saved: ${r.data.domain || r.data.wp_url}`);
+      setMessage(t('msg.site_saved', {site: r.data.domain || r.data.wp_url}));
       addWpUrl = '';
       addToken = '';
       addRouteSecret = '';
       await loadAll();
     } else {
-      setError(r.error?.message || 'Add site failed');
+      setError(r.error?.message || t('fb.add_site'));
     }
     siteBusy = false;
   }
@@ -1154,14 +1156,14 @@
   async function importSiteConnection(event: Event) {
     event.preventDefault();
     if (!importPackJson.trim()) {
-      setError('Paste a site connection pack JSON first');
+      setError(t('msg.paste_conn_pack_first'));
       return;
     }
     let pack: unknown;
     try {
       pack = JSON.parse(importPackJson);
     } catch (err) {
-      setError(`Invalid connection pack JSON: ${String(err)}`);
+      setError(t('err.invalid_conn_pack', {error: String(err)}));
       return;
     }
     importBusy = true;
@@ -1176,13 +1178,13 @@
       },
     });
     if (isOk(r)) {
-      setMessage(`Connection pack imported: ${r.data.api_base_url}`);
+      setMessage(t('msg.conn_pack_imported', {url: r.data.api_base_url}));
       importPackJson = '';
       importPairingCode = '';
       importDeviceLabel = '';
       await loadAll();
     } else {
-      setError(r.error?.message || 'Connection pack import failed');
+      setError(r.error?.message || t('fb.import_pack'));
     }
     importBusy = false;
   }
@@ -1208,7 +1210,7 @@
       body: { siteId },
     });
     if (isOk(r)) {
-      setMessage(`Site removed: ${siteId}`);
+      setMessage(t('msg.site_removed', {site: siteId}));
       await loadAll();
     } else {
       setError(r.error?.message || `Remove failed: ${siteId}`);
@@ -1220,10 +1222,10 @@
     workerBusy = true;
     const r = await apiFetch<void>('/api/worker/start', { method: 'POST' });
     if (isOk(r)) {
-      setMessage('Worker started');
+      setMessage(t('msg.worker_started'));
       await loadWorkerStatus();
     } else {
-      setError(r.error?.message || 'Worker start failed');
+      setError(r.error?.message || t('fb.worker_start'));
     }
     workerBusy = false;
   }
@@ -1232,10 +1234,10 @@
     workerBusy = true;
     const r = await apiFetch<void>('/api/worker/stop', { method: 'POST' });
     if (isOk(r)) {
-      setMessage('Worker stopped');
+      setMessage(t('msg.worker_stopped'));
       await loadWorkerStatus();
     } else {
-      setError(r.error?.message || 'Worker stop failed');
+      setError(r.error?.message || t('fb.worker_stop'));
     }
     workerBusy = false;
   }
@@ -1247,10 +1249,10 @@
       body: { siteId },
     });
     if (isOk(r)) {
-      setMessage(`Discovery queued: ${r.data}`);
+      setMessage(t('msg.discovery_queued', {data: r.data}));
       await loadTasks();
     } else {
-      setError(r.error?.message || 'Discovery failed');
+      setError(r.error?.message || t('fb.discovery_failed'));
     }
     discoverBusy = false;
   }
@@ -1270,10 +1272,10 @@
       },
     });
     if (isOk(r)) {
-      setMessage(`Component configured: ${r.data.id}`);
+      setMessage(t('msg.component_configured', {id: r.data.id}));
       await loadComponents();
     } else {
-      setError(r.error?.message || 'Component configuration failed');
+      setError(r.error?.message || t('fb.component_config'));
     }
     componentBusy = false;
   }
@@ -1282,7 +1284,7 @@
     event?.preventDefault();
     const relationId = Number.parseInt(focusRelationId, 10);
     if (!Number.isFinite(relationId) || relationId <= 0) {
-      setError('Relation ID must be a positive integer');
+      setError(t('err.relation_positive'));
       return;
     }
     focusBusy = true;
@@ -1297,9 +1299,9 @@
       },
     });
     if (isOk(r)) {
-      setMessage(`Focused relation ${r.data.relation_id}: enabled=${r.data.enabled}, updated=${r.data.updated}`);
+      setMessage(t('msg.relation_focused', {relation: r.data.relation_id, enabled: r.data.enabled, updated: r.data.updated}));
     } else {
-      setError(r.error?.message || 'Focus relation failed');
+      setError(r.error?.message || t('fb.focus_relation'));
     }
     focusBusy = false;
   }
@@ -1322,7 +1324,7 @@
       },
     });
     if (!isOk(config)) {
-      setError(config.error?.message || 'Worker config failed');
+      setError(config.error?.message || t('fb.worker_config'));
       runOnceBusy = false;
       return;
     }
@@ -1339,10 +1341,10 @@
     });
     if (isOk(r)) {
       workerRunSummary = r.data;
-      setMessage(`Run once complete: processed=${Number(r.data.tasks_processed ?? r.data.total_items ?? 0)}, succeeded=${Number(r.data.tasks_succeeded ?? 0)}, failed=${Number(r.data.tasks_failed ?? 0)}`);
+      setMessage(t('msg.run_once_complete', {processed: Number(r.data.tasks_processed ?? r.data.total_items ?? 0), succeeded: Number(r.data.tasks_succeeded ?? 0), failed: Number(r.data.tasks_failed ?? 0)}));
       await loadAll();
     } else {
-      setError(r.error?.message || 'Worker run-once failed');
+      setError(r.error?.message || t('fb.worker_run_once'));
     }
     runOnceBusy = false;
   }
@@ -1356,7 +1358,7 @@
     if (isOk(r)) {
       updateInfo = r.data;
     } else {
-      updateError = r.error?.message || 'Check failed';
+      updateError = r.error?.message || t('fb.check');
     }
     updateChecking = false;
   }
@@ -1379,12 +1381,13 @@
       }
       // binary: app restarts — leave updating true
     } else {
-      updateError = r.error?.message || 'Update failed';
+      updateError = r.error?.message || t('fb.update');
       updating = false;
     }
   }
 
   onMount(() => {
+    initializeI18n();
     void loadAll();
     void loadProviderCatalog();
   });
@@ -1394,7 +1397,7 @@
   <nav class="w-60 bg-slate-900 text-white flex flex-col">
     <div class="p-4 border-b border-slate-700">
       <h1 class="text-lg font-bold">WPTSALL</h1>
-      <p class="text-xs text-slate-400">Translation Client · Desktop</p>
+      <p class="text-xs text-slate-400">{$_('shell.subtitle')}</p>
     </div>
     <ul class="flex-1 py-2">
       {#each pages as page}
@@ -1404,21 +1407,36 @@
             class:bg-slate-700={currentPage === page.id}
             onclick={() => void navigateTo(page.id)}
           >
-            {page.label}
+            {$_(page.key)}
           </button>
         </li>
       {/each}
     </ul>
-    <div class="p-3 border-t border-slate-700 text-xs text-slate-400">
-      v2.1.0 · embedded runtime
+    <div class="p-3 border-t border-slate-700 text-xs text-slate-400 space-y-3">
+      <div class="flex items-center gap-1" role="group" aria-label={$_('lang.language')}>
+        {#each availableLocales as loc (loc)}
+          <button
+            type="button"
+            data-locale={loc}
+            aria-pressed={$locale === loc}
+            onclick={() => setLocale(loc)}
+            class="flex-1 rounded border px-2 py-1 transition-colors {$locale === loc
+              ? 'border-slate-400 bg-slate-700 text-white'
+              : 'border-slate-600 text-slate-300 hover:bg-slate-700'}"
+          >
+            {$_(loc === 'zh-CN' ? 'lang.zh_CN' : 'lang.en')}
+          </button>
+        {/each}
+      </div>
+      <div>{$_('shell.version_runtime')}</div>
     </div>
   </nav>
 
   <main class="flex-1 overflow-auto p-6 space-y-5">
     <header class="flex items-center justify-between gap-4">
       <div>
-        <h2 class="text-xl font-semibold capitalize">{currentPage}</h2>
-        <p class="text-sm text-slate-500">Shared WebUI runtime through Tauri commands.</p>
+        <h2 class="text-xl font-semibold capitalize">{$_('nav.' + currentPage)}</h2>
+        <p class="text-sm text-slate-500">{$_('shell.runtime_note')}</p>
       </div>
       <button
         class="text-xs px-3 py-2 border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-50"
@@ -1439,29 +1457,29 @@
     {#if currentPage === 'overview'}
       <section class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <div class="card">
-          <p class="label">Sites</p>
+          <p class="label">{$_('nav.sites')}</p>
           <p class="value">{sites.length}</p>
-          <p class="hint">Device-token bindings stored in local SQLite.</p>
+          <p class="hint">{$_('overview.sites_hint')}</p>
         </div>
         <div class="card">
-          <p class="label">Worker</p>
+          <p class="label">{$_('overview.worker_card')}</p>
           <p class="value">{worker?.running ? 'Running' : 'Idle'}</p>
           <p class="hint">Completed total: {worker?.completed_total ?? 0}</p>
         </div>
         <div class="card">
-          <p class="label">Device ID</p>
+          <p class="label">{$_('overview.device_id')}</p>
           <p class="value text-sm break-all">{statusInfo?.device_id || 'unknown'}</p>
-          <p class="hint break-all">Use this ID in WordPress to issue a site connection pack.</p>
+          <p class="hint break-all">{$_('overview.device_id_hint')}</p>
         </div>
       </section>
 
       <section class="card space-y-3">
-        <h3 class="section-title">Quick actions</h3>
+        <h3 class="section-title">{$_('overview.quick_actions')}</h3>
         <div class="flex flex-wrap gap-2">
-          <button class="btn" disabled={loading} onclick={refreshDomains}>Refresh local data</button>
-          <button class="btn-primary" disabled={workerBusy || worker?.running} onclick={startWorker}>Start worker</button>
-          <button class="btn" disabled={workerBusy || !worker?.running} onclick={stopWorker}>Stop worker</button>
-          <button class="btn" disabled={discoverBusy} onclick={() => triggerDiscover()}>Bootstrap discovery tasks</button>
+          <button class="btn" disabled={loading} onclick={refreshDomains}>{$_('overview.refresh_data')}</button>
+          <button class="btn-primary" disabled={workerBusy || worker?.running} onclick={startWorker}>{$_('overview.start_worker')}</button>
+          <button class="btn" disabled={workerBusy || !worker?.running} onclick={stopWorker}>{$_('overview.stop_worker')}</button>
+          <button class="btn" disabled={discoverBusy} onclick={() => triggerDiscover()}>{$_('overview.bootstrap_discovery')}</button>
           <button class="btn-primary" data-testid="overview-run-once" disabled={runOnceBusy} onclick={runWorkerOnce}>
             {runOnceBusy ? 'Running once…' : 'Run worker once'}
           </button>
@@ -1472,12 +1490,12 @@
       </section>
     {:else if currentPage === 'sites'}
       <section class="card space-y-4">
-        <h3 class="section-title">Import site connection pack</h3>
-        <p class="hint">Paste the JSON produced by WordPress: wp wptsall security issue-pairing-pack --device-id=&lt;this client device id&gt;</p>
+        <h3 class="section-title">{$_('overview.import_pack')}</h3>
+        <p class="hint">{$_('overview.pack_paste_hint')}</p>
         <form class="grid grid-cols-1 lg:grid-cols-3 gap-3" onsubmit={importSiteConnection}>
           <textarea class="input lg:col-span-3 min-h-28 font-mono text-xs" bind:value={importPackJson} placeholder={importPackPlaceholder}></textarea>
-          <input class="input font-mono" bind:value={importPairingCode} placeholder="Pairing code (optional if pack includes it)" />
-          <input class="input" bind:value={importDeviceLabel} placeholder="Device label (optional)" />
+          <input class="input font-mono" bind:value={importPairingCode} placeholder={$_('ph.pairing_code')} />
+          <input class="input" bind:value={importDeviceLabel} placeholder={$_('ph.device_label')} />
           <button class="btn-primary" disabled={importBusy || !importPackJson} type="submit">
             {importBusy ? 'Importing…' : 'Import and claim token'}
           </button>
@@ -1485,26 +1503,26 @@
       </section>
 
       <section class="card space-y-4">
-        <h3 class="section-title">Add WordPress site manually</h3>
+        <h3 class="section-title">{$_('overview.add_site_manually')}</h3>
         <form class="grid grid-cols-1 lg:grid-cols-4 gap-3" onsubmit={addSite}>
           <input
             class="input lg:col-span-2"
             data-testid="sites-modal-url"
             bind:value={addWpUrl}
-            placeholder="https://site.test or full /wp-json/wptsall/v2/<secret>/client URL"
+            placeholder={$_('ph.site_url')}
           />
           <input
             class="input"
             data-testid="sites-modal-token"
             bind:value={addToken}
-            placeholder="Device token"
+            placeholder={$_('ph.device_token')}
             type="password"
           />
           <input
             class="input"
             data-testid="sites-modal-route-secret"
             bind:value={addRouteSecret}
-            placeholder="Route secret (optional if URL includes it)"
+            placeholder={$_('ph.route_secret')}
           />
           <button
             class="btn-primary lg:col-span-4"
@@ -1518,9 +1536,9 @@
       </section>
 
       <section class="card">
-        <h3 class="section-title">Connected sites</h3>
+        <h3 class="section-title">{$_('overview.connected_sites')}</h3>
         {#if sites.length === 0}
-          <p class="hint">No sites configured yet.</p>
+          <p class="hint">{$_('overview.no_sites')}</p>
         {:else}
           <div class="divide-y divide-slate-100">
             {#each sites as site}
@@ -1530,9 +1548,9 @@
                   <p class="hint">{site.connected ? 'connected' : 'not verified'} · {site.languages.join(', ') || 'languages unknown'}</p>
                 </div>
                 <div class="flex gap-2">
-                  <button class="btn" data-testid="sites-test-connection" disabled={siteBusy} onclick={() => testSite(site.id)}>Test</button>
-                  <button class="btn-danger" disabled={siteBusy} onclick={() => removeSite(site.id)}>Remove</button>
-                  <button class="btn" disabled={discoverBusy} onclick={() => triggerDiscover(site.id)}>Discover</button>
+                  <button class="btn" data-testid="sites-test-connection" disabled={siteBusy} onclick={() => testSite(site.id)}>{$_('common.test')}</button>
+                  <button class="btn-danger" disabled={siteBusy} onclick={() => removeSite(site.id)}>{$_('common.remove')}</button>
+                  <button class="btn" disabled={discoverBusy} onclick={() => triggerDiscover(site.id)}>{$_('common.discover')}</button>
                 </div>
               </div>
             {/each}
@@ -1542,21 +1560,21 @@
     {:else if currentPage === 'credentials'}
       <section class="card space-y-4">
         <div>
-          <h3 class="section-title">Vendor API keys</h3>
-          <p class="hint">Store provider credentials locally through the embedded WebUI runtime (same as WebUI API Keys).</p>
+          <h3 class="section-title">{$_('creds.vendor_keys')}</h3>
+          <p class="hint">{$_('creds.vendor_keys_hint')}</p>
         </div>
         <form class="grid grid-cols-1 md:grid-cols-4 gap-3" onsubmit={saveVendorKey}>
-          <input class="input" bind:value={vendorKeyVendorId} placeholder="Vendor ID (e.g. openai)" />
-          <input class="input" bind:value={vendorKeyLabel} placeholder="Label" />
-          <input class="input" type="password" bind:value={vendorKeySecret} placeholder="API key secret" />
+          <input class="input" bind:value={vendorKeyVendorId} placeholder={$_('ph.vendor_id_eg')} />
+          <input class="input" bind:value={vendorKeyLabel} placeholder={$_('common.label')} />
+          <input class="input" type="password" bind:value={vendorKeySecret} placeholder={$_('ph.api_key_secret')} />
           <button class="btn-primary" disabled={vendorKeySaving || !vendorKeyVendorId.trim() || !vendorKeySecret.trim()} type="submit">
             {vendorKeySaving ? 'Saving…' : 'Save key'}
           </button>
         </form>
         {#if vendorKeysBusy}
-          <p class="hint">Loading keys…</p>
+          <p class="hint">{$_('creds.loading_keys')}</p>
         {:else if vendorKeys.length === 0}
-          <p class="hint">No vendor keys yet.</p>
+          <p class="hint">{$_('creds.no_keys')}</p>
         {:else}
           <div class="divide-y divide-slate-100">
             {#each vendorKeys as key (String(key.id || key.label))}
@@ -1565,9 +1583,7 @@
                   <p class="font-medium">{String(key.label || key.id || 'key')}</p>
                   <p class="hint">{String(key.vendor_id || '-')} · {String(key.masked_key || key.key_prefix || '••••')}</p>
                 </div>
-                <button class="btn" disabled={vendorKeysBusy || !key.id} onclick={() => deleteVendorKey(String(key.id))}>
-                  Delete
-                </button>
+                <button class="btn" disabled={vendorKeysBusy || !key.id} onclick={() => deleteVendorKey(String(key.id))}>{$_('common.delete')}</button>
               </div>
             {/each}
           </div>
@@ -1576,22 +1592,22 @@
 
       <section class="card space-y-4">
         <div>
-          <h3 class="section-title">Vendor OAuth (translation providers)</h3>
-          <p class="hint">Local provider OAuth configs only — not website account login. Authorize opens the provider URL when returned.</p>
+          <h3 class="section-title">{$_('creds.vendor_oauth')}</h3>
+          <p class="hint">{$_('creds.oauth_hint')}</p>
         </div>
         <form class="grid grid-cols-1 md:grid-cols-5 gap-3" onsubmit={saveVendorOauth}>
-          <input class="input" bind:value={oauthId} placeholder="Config id" />
-          <input class="input" bind:value={oauthVendorId} placeholder="Vendor ID" />
-          <input class="input" bind:value={oauthClientId} placeholder="Client id (optional)" />
-          <input class="input" type="password" bind:value={oauthClientSecret} placeholder="Client secret (optional)" />
+          <input class="input" bind:value={oauthId} placeholder={$_('ph.config_id')} />
+          <input class="input" bind:value={oauthVendorId} placeholder={$_('ph.vendor_id')} />
+          <input class="input" bind:value={oauthClientId} placeholder={$_('ph.client_id')} />
+          <input class="input" type="password" bind:value={oauthClientSecret} placeholder={$_('ph.client_secret')} />
           <button class="btn-primary" disabled={oauthSaving || !oauthId.trim() || !oauthVendorId.trim()} type="submit">
             {oauthSaving ? 'Saving…' : 'Save OAuth'}
           </button>
         </form>
         {#if vendorOauthBusy}
-          <p class="hint">Loading OAuth configs…</p>
+          <p class="hint">{$_('creds.loading_oauth')}</p>
         {:else if vendorOauthConfigs.length === 0}
-          <p class="hint">No vendor OAuth configs yet.</p>
+          <p class="hint">{$_('creds.no_oauth')}</p>
         {:else}
           <div class="divide-y divide-slate-100">
             {#each vendorOauthConfigs as cfg (String(cfg.id))}
@@ -1601,12 +1617,8 @@
                   <p class="hint">{String(cfg.vendor_id || '-')} · {String(cfg.status || cfg.token_preview || 'configured')}</p>
                 </div>
                 <div class="flex gap-2">
-                  <button class="btn" disabled={vendorOauthBusy} onclick={() => authorizeVendorOauth(String(cfg.id))}>
-                    Authorize
-                  </button>
-                  <button class="btn" disabled={vendorOauthBusy} onclick={() => deleteVendorOauth(String(cfg.id))}>
-                    Delete
-                  </button>
+                  <button class="btn" disabled={vendorOauthBusy} onclick={() => authorizeVendorOauth(String(cfg.id))}>{$_('common.authorize')}</button>
+                  <button class="btn" disabled={vendorOauthBusy} onclick={() => deleteVendorOauth(String(cfg.id))}>{$_('common.delete')}</button>
                 </div>
               </div>
             {/each}
@@ -1616,22 +1628,22 @@
 
       <section class="card space-y-4">
         <div>
-          <h3 class="section-title">Proxy profiles</h3>
-          <p class="hint">Optional local HTTP(S) proxies for provider calls (embedded WebUI runtime).</p>
+          <h3 class="section-title">{$_('creds.proxies')}</h3>
+          <p class="hint">{$_('creds.proxies_hint')}</p>
         </div>
         <form class="grid grid-cols-1 md:grid-cols-5 gap-3" onsubmit={saveProxyProfile}>
-          <input class="input" bind:value={proxyId} placeholder="Profile id" />
-          <input class="input" bind:value={proxyName} placeholder="Name" />
-          <input class="input" bind:value={proxyHost} placeholder="Host" />
-          <input class="input" bind:value={proxyPort} placeholder="Port" />
+          <input class="input" bind:value={proxyId} placeholder={$_('ph.profile_id')} />
+          <input class="input" bind:value={proxyName} placeholder={$_('common.name')} />
+          <input class="input" bind:value={proxyHost} placeholder={$_('common.host')} />
+          <input class="input" bind:value={proxyPort} placeholder={$_('common.port')} />
           <button class="btn-primary" disabled={proxySaving || !proxyId.trim() || !proxyHost.trim()} type="submit">
             {proxySaving ? 'Saving…' : 'Save proxy'}
           </button>
         </form>
         {#if proxyBusy}
-          <p class="hint">Loading proxies…</p>
+          <p class="hint">{$_('creds.loading_proxies')}</p>
         {:else if proxyProfiles.length === 0}
-          <p class="hint">No proxy profiles yet.</p>
+          <p class="hint">{$_('creds.no_proxies')}</p>
         {:else}
           <div class="divide-y divide-slate-100">
             {#each proxyProfiles as profile (String(profile.id))}
@@ -1641,12 +1653,8 @@
                   <p class="hint">{String(profile.host || '-')}:{String(profile.port || '-')}</p>
                 </div>
                 <div class="flex gap-2">
-                  <button class="btn" disabled={proxyBusy} onclick={() => testProxyProfile(String(profile.id))}>
-                    Test
-                  </button>
-                  <button class="btn" disabled={proxyBusy} onclick={() => deleteProxyProfile(String(profile.id))}>
-                    Delete
-                  </button>
+                  <button class="btn" disabled={proxyBusy} onclick={() => testProxyProfile(String(profile.id))}>{$_('common.test')}</button>
+                  <button class="btn" disabled={proxyBusy} onclick={() => deleteProxyProfile(String(profile.id))}>{$_('common.delete')}</button>
                 </div>
               </div>
             {/each}
@@ -1656,20 +1664,18 @@
     {:else if currentPage === 'tasks'}
       <section class="card">
         <div class="flex items-center justify-between gap-3 mb-3">
-          <h3 class="section-title">Translation jobs</h3>
+          <h3 class="section-title">{$_('tasks.jobs')}</h3>
           <div class="flex gap-2">
-            <button class="btn" disabled={discoverBusy} onclick={() => triggerDiscover()}>Bootstrap discovery</button>
+            <button class="btn" disabled={discoverBusy} onclick={() => triggerDiscover()}>{$_('tasks.bootstrap')}</button>
             <button class="btn-primary" data-testid="overview-run-once" disabled={runOnceBusy} onclick={runWorkerOnce}>
               {runOnceBusy ? 'Running once…' : 'Run worker once'}
             </button>
           </div>
         </div>
         <form class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-3" onsubmit={focusRelation}>
-          <input class="input md:col-span-2" bind:value={focusRelationId} placeholder="Focus relation ID (optional)" />
+          <input class="input md:col-span-2" bind:value={focusRelationId} placeholder={$_('ph.focus_relation')} />
           <label class="checkbox-row">
-            <input type="checkbox" bind:checked={focusIncludeResync} />
-            include resync
-          </label>
+            <input type="checkbox" bind:checked={focusIncludeResync} />{$_('tasks.include_resync')}</label>
           <button class="btn" disabled={focusBusy || !focusRelationId} type="submit">
             {focusBusy ? 'Focusing…' : 'Focus relation'}
           </button>
@@ -1678,7 +1684,7 @@
           <pre class="summary-json mb-3">{JSON.stringify(workerRunSummary, null, 2)}</pre>
         {/if}
         {#if tasks.length === 0}
-          <p class="hint">No jobs yet.</p>
+          <p class="hint">{$_('tasks.no_jobs')}</p>
         {:else}
           <div class="space-y-3">
             {#each tasks as task}
@@ -1708,9 +1714,9 @@
         <section class="card space-y-3">
           <h3 class="section-title">Job #{selectedJobId} items</h3>
           {#if jobItemsBusy}
-            <p class="hint">Loading items…</p>
+            <p class="hint">{$_('tasks.loading_items')}</p>
           {:else if jobItems.length === 0}
-            <p class="hint">No items for this job.</p>
+            <p class="hint">{$_('tasks.no_items')}</p>
           {:else}
             <div class="divide-y divide-slate-100">
               {#each jobItems as item (String(item.id))}
@@ -1719,7 +1725,7 @@
                     <p class="font-medium">Item #{String(item.id)} · {String(item.status || 'unknown')}</p>
                     <p class="hint">{String(item.source_lang || '?')} → {String(item.target_lang || '?')}</p>
                   </div>
-                  <button class="btn" disabled={itemBusy} onclick={() => openItemReview(String(item.id))}>Review</button>
+                  <button class="btn" disabled={itemBusy} onclick={() => openItemReview(String(item.id))}>{$_('common.review')}</button>
                 </div>
               {/each}
             </div>
@@ -1731,25 +1737,25 @@
         <section class="card space-y-3">
           <h3 class="section-title">Review item #{selectedItemId}</h3>
           {#if itemBusy && !itemContent}
-            <p class="hint">Loading content…</p>
+            <p class="hint">{$_('tasks.loading_content')}</p>
           {:else}
             <textarea class="input min-h-40 font-mono text-xs" bind:value={translatedDraft}></textarea>
             <div class="flex flex-wrap gap-2">
-              <button class="btn-primary" disabled={itemBusy} onclick={saveItemTranslation}>Save translation</button>
-              <button class="btn" disabled={itemBusy} onclick={approveSelectedItem}>Approve</button>
-              <button class="btn" disabled={itemBusy} onclick={retranslateSelectedItem}>Retranslate</button>
+              <button class="btn-primary" disabled={itemBusy} onclick={saveItemTranslation}>{$_('tasks.save_translation')}</button>
+              <button class="btn" disabled={itemBusy} onclick={approveSelectedItem}>{$_('tasks.approve')}</button>
+              <button class="btn" disabled={itemBusy} onclick={retranslateSelectedItem}>{$_('tasks.retranslate')}</button>
             </div>
           {/if}
         </section>
       {/if}
     {:else if currentPage === 'components'}
       <section class="card space-y-4">
-        <h3 class="section-title">Configure local mock component</h3>
+        <h3 class="section-title">{$_('components.mock_config')}</h3>
         <form class="grid grid-cols-1 lg:grid-cols-4 gap-3" onsubmit={configureMockComponent}>
-          <input class="input" bind:value={mockComponentId} placeholder="Component ID" />
-          <input class="input" bind:value={mockApiBase} placeholder="Mock API base" />
-          <input class="input" bind:value={mockModel} placeholder="Model" />
-          <input class="input" bind:value={mockApiKey} placeholder="API key" type="password" />
+          <input class="input" bind:value={mockComponentId} placeholder={$_('ph.component_id')} />
+          <input class="input" bind:value={mockApiBase} placeholder={$_('ph.mock_api_base')} />
+          <input class="input" bind:value={mockModel} placeholder={$_('common.model')} />
+          <input class="input" bind:value={mockApiKey} placeholder={$_('ph.api_key')} type="password" />
           <button class="btn-primary lg:col-span-4" disabled={componentBusy || !mockComponentId || !mockApiBase || !mockModel || !mockApiKey} type="submit">
             {componentBusy ? 'Configuring…' : 'Configure mock component'}
           </button>
@@ -1757,9 +1763,9 @@
       </section>
 
       <section class="card">
-        <h3 class="section-title">Local runtime components</h3>
+        <h3 class="section-title">{$_('components.local_components')}</h3>
         {#if components.length === 0}
-          <p class="hint">No local components configured yet.</p>
+          <p class="hint">{$_('components.no_components')}</p>
         {:else}
           <div class="divide-y divide-slate-100">
             {#each components as component}
@@ -1789,8 +1795,8 @@
       <section class="card space-y-4">
         <div class="flex items-center justify-between gap-3">
           <div>
-            <h3 class="section-title">Local provider catalog</h3>
-            <p class="hint">Postman-style templates: install → key → quick-test → enable → route. Prefer mock-verified + mock-api (:9090).</p>
+            <h3 class="section-title">{$_('components.catalog')}</h3>
+            <p class="hint">{$_('components.catalog_hint')}</p>
           </div>
           <div class="flex gap-2">
             <button class="btn" disabled={providerCatalogBusy} onclick={loadProviderCatalog}>
@@ -1808,14 +1814,14 @@
                 <h4 class="font-medium text-sm">Setup wizard · {wizardItem.name}</h4>
                 <p class="hint">{wizardItem.family} · {wizardItem.evidence_tier || 'schema-only'} · step {wizardStep}</p>
               </div>
-              <button class="btn" data-testid="wizard-close" disabled={wizardBusy} onclick={() => (wizardItem = null)}>Close</button>
+              <button class="btn" data-testid="wizard-close" disabled={wizardBusy} onclick={() => (wizardItem = null)}>{$_('common.close')}</button>
             </div>
             {#if wizardHint}<p class="text-xs text-amber-800" data-testid="wizard-hint">{wizardHint}</p>{/if}
             {#if wizardStep === 'install'}
               <input class="input font-mono text-xs" data-testid="wizard-local-id" bind:value={wizardLocalId} />
-              <button class="btn-primary" data-testid="wizard-install-next" disabled={wizardBusy} onclick={wizardInstall}>Install and continue</button>
+              <button class="btn-primary" data-testid="wizard-install-next" disabled={wizardBusy} onclick={wizardInstall}>{$_('components.install_continue')}</button>
             {:else if wizardStep === 'key'}
-              <input class="input font-mono text-xs" data-testid="wizard-key-id" bind:value={wizardKeyId} placeholder="key id" />
+              <input class="input font-mono text-xs" data-testid="wizard-key-id" bind:value={wizardKeyId} placeholder={$_('ph.key_id')} />
               {#each wizardAuthFields as fieldName, idx}
                 <input
                   class="input font-mono text-xs"
@@ -1825,40 +1831,40 @@
                   placeholder={fieldName}
                 />
               {/each}
-              <input class="input font-mono text-xs" data-testid="wizard-request-url" bind:value={wizardUrl} placeholder="request.url (any http(s))" />
-              <input class="input font-mono text-xs" data-testid="wizard-response-path" bind:value={wizardResponsePath} placeholder="response.translated_text_path" />
+              <input class="input font-mono text-xs" data-testid="wizard-request-url" bind:value={wizardUrl} placeholder={$_('ph.request_url')} />
+              <input class="input font-mono text-xs" data-testid="wizard-response-path" bind:value={wizardResponsePath} placeholder={$_('ph.response_path')} />
               {#if wizardItem.family === 'openai_compatible'}
-                <input class="input font-mono text-xs" data-testid="wizard-model" bind:value={wizardModel} placeholder="model" />
+                <input class="input font-mono text-xs" data-testid="wizard-model" bind:value={wizardModel} placeholder={$_('ph.model')} />
               {/if}
-              <button class="btn-primary" data-testid="wizard-key-next" disabled={wizardBusy} onclick={wizardBindKey}>Save key and continue</button>
+              <button class="btn-primary" data-testid="wizard-key-next" disabled={wizardBusy} onclick={wizardBindKey}>{$_('components.save_key_continue')}</button>
             {:else if wizardStep === 'test'}
               <input class="input text-xs" data-testid="wizard-test-text" bind:value={wizardTestText} />
               {#if wizardTestOut}<pre class="summary-json" data-testid="wizard-test-out">{wizardTestOut}</pre>{/if}
-              <button class="btn-primary" data-testid="wizard-test-next" disabled={wizardBusy} onclick={wizardQuickTest}>Run quick-test</button>
+              <button class="btn-primary" data-testid="wizard-test-next" disabled={wizardBusy} onclick={wizardQuickTest}>{$_('components.run_quick_test')}</button>
             {:else if wizardStep === 'enable'}
-              <button class="btn-primary" data-testid="wizard-enable-next" disabled={wizardBusy} onclick={wizardEnable}>Enable component</button>
+              <button class="btn-primary" data-testid="wizard-enable-next" disabled={wizardBusy} onclick={wizardEnable}>{$_('components.enable')}</button>
             {:else if wizardStep === 'route'}
-              <input class="input font-mono text-xs" data-testid="wizard-route-slot" bind:value={wizardSlot} placeholder="content_format slot" />
-              <button class="btn-primary" data-testid="wizard-route-next" disabled={wizardBusy} onclick={wizardRoute}>Bind global route</button>
+              <input class="input font-mono text-xs" data-testid="wizard-route-slot" bind:value={wizardSlot} placeholder={$_('ph.slot')} />
+              <button class="btn-primary" data-testid="wizard-route-next" disabled={wizardBusy} onclick={wizardRoute}>{$_('components.bind_route')}</button>
             {:else}
-              <p class="text-sm text-green-700" data-testid="wizard-done">Done. Use Tasks review when review_mode is on; otherwise worker callbacks WP directly.</p>
+              <p class="text-sm text-green-700" data-testid="wizard-done">{$_('components.done_hint')}</p>
             {/if}
           </div>
         {/if}
         {#if providerCatalog}
           <p class="hint">{providerCatalog.catalog_version || 'local'} · {providerCatalog.items.length} templates · offline={providerCatalog.offline ? 'yes' : 'no'}</p>
           {#if providerCatalog.items.length === 0}
-            <p class="hint">No provider templates found.</p>
+            <p class="hint">{$_('components.no_templates')}</p>
           {:else}
             <div class="overflow-x-auto">
               <table class="w-full text-sm">
                 <thead>
                   <tr class="text-left text-xs text-slate-500 border-b border-slate-100">
-                    <th class="py-2 pr-3">Name</th>
-                    <th class="py-2 pr-3">Vendor</th>
-                    <th class="py-2 pr-3">Evidence</th>
-                    <th class="py-2 pr-3">Source</th>
-                    <th class="py-2 text-right">Action</th>
+                    <th class="py-2 pr-3">{$_('common.name')}</th>
+                    <th class="py-2 pr-3">{$_('common.vendor')}</th>
+                    <th class="py-2 pr-3">{$_('common.evidence')}</th>
+                    <th class="py-2 pr-3">{$_('common.source')}</th>
+                    <th class="py-2 text-right">{$_('common.action')}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1877,7 +1883,7 @@
                           data-testid="open-provider-wizard"
                           data-entry-id={item.entry_id}
                           onclick={() => openProviderWizard(item)}
-                        >Setup wizard</button>
+                        >{$_('components.setup_wizard')}</button>
                         <button
                           class="btn"
                           disabled={providerCatalogInstalling === item.entry_id}
@@ -1893,54 +1899,48 @@
             </div>
           {/if}
         {:else if providerCatalogBusy}
-          <p class="hint">Loading provider catalog…</p>
+          <p class="hint">{$_('components.loading_catalog')}</p>
         {/if}
       </section>
     {:else if currentPage === 'integration_pack'}
       <section class="card space-y-4">
         <div>
-          <h3 class="section-title">Integration pack</h3>
-          <p class="hint">Move local sites, components, bindings, workflow, and provider configuration between clients.</p>
+          <h3 class="section-title">{$_('integration.title')}</h3>
+          <p class="hint">{$_('integration.desc')}</p>
         </div>
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div class="border border-slate-100 rounded-lg p-4 space-y-3">
-            <h4 class="font-medium">Export integration pack</h4>
-            <label class="block text-sm">
-              Export mode
-              <select class="input mt-1" bind:value={integrationExportMode}>
-                <option value="public">Public redacted export</option>
-                <option value="private">Private encrypted backup</option>
+            <h4 class="font-medium">{$_('integration.export')}</h4>
+            <label class="block text-sm">{$_('integration.export_mode')}<select class="input mt-1" bind:value={integrationExportMode}>
+                <option value="public">{$_('integration.public')}</option>
+                <option value="private">{$_('integration.private')}</option>
               </select>
             </label>
             {#if integrationExportMode === 'private'}
-              <input class="input" type="password" autocomplete="new-password" bind:value={integrationExportPassphrase} placeholder="Backup passphrase (8+ characters)" />
+              <input class="input" type="password" autocomplete="new-password" bind:value={integrationExportPassphrase} placeholder={$_('ph.backup_passphrase')} />
               <label class="checkbox-row">
-                <input type="checkbox" bind:checked={integrationConfirmPrivate} />
-                I understand this backup contains credentials.
-              </label>
-              <p class="text-xs text-amber-700">Private backups use AES-256-GCM; keep the passphrase separate.</p>
+                <input type="checkbox" bind:checked={integrationConfirmPrivate} />{$_('integration.understand')}</label>
+              <p class="text-xs text-amber-700">{$_('integration.aes_hint')}</p>
             {:else}
-              <p class="hint">Public exports redact credentials and keep imported components disabled until configured.</p>
+              <p class="hint">{$_('integration.redact_hint')}</p>
             {/if}
             <div class="flex gap-2">
               <button class="btn-primary" disabled={integrationExportBusy} onclick={exportIntegrationPackDesktop}>
                 {integrationExportBusy ? 'Exporting…' : 'Export pack'}
               </button>
-              <button class="btn" disabled={!integrationExportJson} onclick={downloadIntegrationPack}>Download JSON</button>
+              <button class="btn" disabled={!integrationExportJson} onclick={downloadIntegrationPack}>{$_('integration.download')}</button>
             </div>
             {#if integrationExportJson}
               <textarea class="input min-h-40 font-mono text-xs" readonly value={integrationExportJson}></textarea>
             {/if}
           </div>
           <div class="border border-slate-100 rounded-lg p-4 space-y-3">
-            <h4 class="font-medium">Preview and import</h4>
-            <p class="hint">Preview checks component references, provider URLs, workflow data, and conflicts before writing local state.</p>
-            <textarea class="input min-h-40 font-mono text-xs" bind:value={integrationImportJson} placeholder="Paste public or encrypted integration pack JSON"></textarea>
-            <input class="input" type="password" autocomplete="off" bind:value={integrationImportPassphrase} placeholder="Private pack passphrase (optional)" />
+            <h4 class="font-medium">{$_('integration.preview_import')}</h4>
+            <p class="hint">{$_('integration.preview_checks')}</p>
+            <textarea class="input min-h-40 font-mono text-xs" bind:value={integrationImportJson} placeholder={$_('ph.paste_pack')}></textarea>
+            <input class="input" type="password" autocomplete="off" bind:value={integrationImportPassphrase} placeholder={$_('ph.private_passphrase')} />
             <label class="checkbox-row">
-              <input type="checkbox" bind:checked={integrationOverwrite} />
-              Overwrite existing components and bindings
-            </label>
+              <input type="checkbox" bind:checked={integrationOverwrite} />{$_('integration.overwrite')}</label>
             <div class="flex gap-2">
               <button class="btn" disabled={integrationPreviewBusy || !integrationImportJson.trim()} onclick={previewIntegrationPackDesktop}>
                 {integrationPreviewBusy ? 'Checking…' : 'Preview'}
@@ -1958,7 +1958,7 @@
                 <p>Existing components: {Array.isArray(integrationPreview.overwrite_components) ? integrationPreview.overwrite_components.length : 0}</p>
                 <p>Blocked provider URLs: {Number(integrationPreview.blocked_provider_url_count || 0)}</p>
                 <p>Missing references: {Array.isArray(integrationPreview.missing_component_refs) ? integrationPreview.missing_component_refs.length : 0}</p>
-                {#if integrationPreview.workflow_valid === false}<p class="text-red-700">Workflow data is invalid</p>{/if}
+                {#if integrationPreview.workflow_valid === false}<p class="text-red-700">{$_('integration.workflow_invalid')}</p>{/if}
               </div>
             {/if}
           </div>
@@ -1968,8 +1968,8 @@
       <section class="card space-y-3">
         <div class="flex items-center justify-between gap-3 flex-wrap">
           <div>
-            <h3 class="section-title">Translation history</h3>
-            <p class="hint">Local SQLite records via `GET /api/translations` (no website control plane).</p>
+            <h3 class="section-title">{$_('history.title')}</h3>
+            <p class="hint">{$_('history.source_note')}</p>
           </div>
           <button class="btn" disabled={historyBusy} onclick={loadHistory}>
             {historyBusy ? 'Loading…' : 'Reload'}
@@ -1977,21 +1977,21 @@
         </div>
         <div class="flex gap-2 flex-wrap items-end">
           <label class="min-w-[10rem] grow">
-            <span class="label">Domain</span>
-            <input class="input mt-1" bind:value={historyDomain} placeholder="example.test" />
+            <span class="label">{$_('common.domain')}</span>
+            <input class="input mt-1" bind:value={historyDomain} placeholder={$_('ph.example_domain')} />
           </label>
           <label class="min-w-[8rem]">
-            <span class="label">Status</span>
+            <span class="label">{$_('common.status')}</span>
             <select class="input mt-1" bind:value={historyStatus}>
-              <option value="">Any</option>
-              <option value="success">success</option>
-              <option value="failed">failed</option>
+              <option value="">{$_('common.any')}</option>
+              <option value="success">{$_('history.success')}</option>
+              <option value="failed">{$_('history.failed')}</option>
               <option value="pending_callback">pending_callback</option>
             </select>
           </label>
           <label class="min-w-[10rem] grow">
-            <span class="label">Search</span>
-            <input class="input mt-1" bind:value={historySearch} placeholder="object / error text" />
+            <span class="label">{$_('common.search')}</span>
+            <input class="input mt-1" bind:value={historySearch} placeholder={$_('ph.object_error')} />
           </label>
           <button
             class="btn"
@@ -2000,20 +2000,18 @@
               historyPage = 1;
               loadHistory();
             }}
-          >
-            Apply
-          </button>
+          >{$_('common.apply')}</button>
         </div>
         {#if historySelected.size > 0}
           <div class="flex gap-2 items-center flex-wrap">
             <span class="hint">{historySelected.size} selected</span>
-            <button class="btn" disabled={historyBatchBusy} onclick={batchRetryHistory}>Batch retry</button>
-            <button class="btn" disabled={historyBatchBusy} onclick={batchDeleteHistory}>Batch delete</button>
+            <button class="btn" disabled={historyBatchBusy} onclick={batchRetryHistory}>{$_('history.batch_retry')}</button>
+            <button class="btn" disabled={historyBatchBusy} onclick={batchDeleteHistory}>{$_('history.batch_delete')}</button>
           </div>
         {/if}
         <p class="hint">Total: {historyTotal} · page {historyPage}</p>
         {#if historyRecords.length === 0}
-          <p class="hint">No translation records.</p>
+          <p class="hint">{$_('history.no_records')}</p>
         {:else}
           <div class="overflow-auto">
             <table class="w-full text-sm">
@@ -2026,12 +2024,12 @@
                       onchange={toggleHistorySelectAll}
                     />
                   </th>
-                  <th>Time</th>
-                  <th>Domain</th>
-                  <th>Object</th>
-                  <th>Lang</th>
-                  <th>Status</th>
-                  <th>Fields</th>
+                  <th>{$_('common.time')}</th>
+                  <th>{$_('common.domain')}</th>
+                  <th>{$_('common.object')}</th>
+                  <th>{$_('common.lang')}</th>
+                  <th>{$_('common.status')}</th>
+                  <th>{$_('common.fields')}</th>
                   <th></th>
                 </tr>
               </thead>
@@ -2053,9 +2051,7 @@
                     <td class="text-xs">{row.fields_count ?? 0}{#if row.failed_fields_count} / fail {row.failed_fields_count}{/if}</td>
                     <td>
                       {#if row.status === 'failed'}
-                        <button class="btn" disabled={historyBatchBusy} onclick={() => retryHistoryOne(row.id)}>
-                          Retry
-                        </button>
+                        <button class="btn" disabled={historyBatchBusy} onclick={() => retryHistoryOne(row.id)}>{$_('common.retry')}</button>
                       {/if}
                     </td>
                   </tr>
@@ -2071,9 +2067,7 @@
                 historyPage = Math.max(1, historyPage - 1);
                 loadHistory();
               }}
-            >
-              Prev
-            </button>
+            >{$_('common.prev')}</button>
             <button
               class="btn"
               disabled={historyBusy || historyPage * 20 >= historyTotal}
@@ -2081,9 +2075,7 @@
                 historyPage += 1;
                 loadHistory();
               }}
-            >
-              Next
-            </button>
+            >{$_('common.next')}</button>
           </div>
         {/if}
       </section>
@@ -2091,15 +2083,15 @@
       <section class="card space-y-3">
         <div class="flex items-center justify-between gap-3">
           <div>
-            <h3 class="section-title">Recent logs</h3>
-            <p class="hint">Proxied from embedded WebUI `POST /api/logs/recent`.</p>
+            <h3 class="section-title">{$_('logs.title')}</h3>
+            <p class="hint">{$_('logs.source_note')}</p>
           </div>
           <button class="btn" disabled={logsBusy} onclick={loadLogs}>
             {logsBusy ? 'Loading…' : 'Reload'}
           </button>
         </div>
         {#if logLines.length === 0}
-          <p class="hint">No log lines.</p>
+          <p class="hint">{$_('logs.no_lines')}</p>
         {:else}
           <pre class="summary-json max-h-96 overflow-auto">{logLines.join('\n')}</pre>
         {/if}
@@ -2107,7 +2099,7 @@
     {:else if currentPage === 'settings'}
       <section class="card max-w-lg space-y-3">
         <div class="flex items-center justify-between">
-          <h3 class="section-title">Version update</h3>
+          <h3 class="section-title">{$_('settings.version_update')}</h3>
           <button class="btn" disabled={updateChecking || updating} onclick={checkForUpdate}>
             {updateChecking ? 'Checking…' : 'Check for updates'}
           </button>
@@ -2144,7 +2136,7 @@
               {updating ? 'Updating…' : 'Update now'}
             </button>
           {:else}
-            <p class="text-sm text-slate-500">You are up to date.</p>
+            <p class="text-sm text-slate-500">{$_('settings.up_to_date')}</p>
           {/if}
         {/if}
       </section>
