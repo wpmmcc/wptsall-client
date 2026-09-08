@@ -136,7 +136,7 @@ jobs:
         run: |
           set -euo pipefail
           cat > "$RUNNER_TEMP/ota/serve.py" <<'PY'
-          import http.server, os, sys
+          import http.server, json, os, sys
           HTTP_DIR = os.environ["OTA_HTTP_DIR"]
           DATA = os.environ["OTA_RELEASES_DATA"]
           SIG = os.environ["OTA_RELEASES_SIG"]
@@ -151,7 +151,13 @@ jobs:
               self.wfile.write(body)
             def do_GET(self):
               if self.path == "/api/v1/client/releases":
-                self._raw(open(DATA, "rb").read(), "application/json")
+                # Same wire shape as the host pipeline and the local OTA
+                # suite (mock-release-server.py): the manifest data object
+                # wrapped in {"success":true,"data":...}. The updater
+                # extracts body["data"]; the .minisig covers the
+                # canonicalized inner data object, not this wrapper.
+                data = json.load(open(DATA, encoding="utf-8"))
+                self._raw(json.dumps({"success": True, "data": data}).encode(), "application/json")
               elif self.path == "/api/v1/client/releases.minisig":
                 self._raw(open(SIG, "rb").read(), "application/octet-stream")
               else:
@@ -169,7 +175,8 @@ jobs:
           echo $! > "$RUNNER_TEMP/ota/serve.pid"
           for _ in $(seq 1 20); do
             if curl -fsS "http://127.0.0.1:$OTA_SERVER_PORT/api/v1/client/releases" \
-              | grep -q client-wpplugin; then
+              -o "$RUNNER_TEMP/ota/ready.json" 2>/dev/null \
+              && grep -q client-wpplugin "$RUNNER_TEMP/ota/ready.json"; then
               echo "releases server up on $OTA_SERVER_PORT"; exit 0
             fi
             sleep 0.5

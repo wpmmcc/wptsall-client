@@ -78,10 +78,14 @@ jobs:
           ( cd "$RUNNER_TEMP/kit-stage/wptsall-client-webui" \
             && find . -type f -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS \
             && mv ../SHA256SUMS ./SHA256SUMS )
-          ( cd "$RUNNER_TEMP/kit-stage" \
-            && tar -czf "$RUNNER_TEMP/kit-webui-$plat.tar.gz" wptsall-client-webui )
+          # Create and read the tarball via relative paths: Windows tar treats
+          # "D:\..." absolute arguments as host:file remotes ("Cannot connect
+          # to D:"). Also avoid piping tar into head (SIGPIPE under pipefail).
+          kit="kit-webui-$plat.tar.gz"
+          ( cd "$RUNNER_TEMP/kit-stage" && tar -czf "../$kit" wptsall-client-webui )
           echo "kit layout:"
-          tar -tzf "$RUNNER_TEMP/kit-webui-$plat.tar.gz" | head -n 20
+          ( cd "$RUNNER_TEMP" && tar -tzf "$kit" > "$RUNNER_TEMP/kit-list.txt" )
+          head -n 20 "$RUNNER_TEMP/kit-list.txt"
           ( cd "$RUNNER_TEMP/kit-stage/wptsall-client-webui" && sha256sum -c SHA256SUMS >/dev/null \
             && echo 'SHA256SUMS verified' )
 
