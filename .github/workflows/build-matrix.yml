@@ -1,0 +1,174 @@
+name: Multi-OS build and package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Public-repo runner builds (the source is public, so GitHub-hosted runners
+# can compile it directly — no host cross-compile needed for these lanes).
+#
+# webui-build: release build of the core binary on each OS, a live loopback
+# smoke (/api/status), and a standard kit layout (bin + ui + version stamps +
+# SHA256SUMS) assembled and uploaded per platform. Signed production kits
+# still flow through the private host pipeline; this lane proves the source
+# tree builds, runs, and packages on every supported desktop OS.
+#
+# desktop-build: release build of the Tauri crate on each OS (compile gate;
+# native installer packaging remains fail-closed per CLIENT-PACKAGING
+# policy until each format has real tooling evidence).
+jobs:
+  webui-build:
+    name: WebUI release build + smoke + kit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    env:
+      SMOKE_PORT: '18123'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+
+      # The Rust core embeds frontend/dist at compile time (static_html.rs
+      # include_str!) — same contract as the CI unit-test job.
+      - name: Build WebUI frontend
+        working-directory: client-wpplugin/source/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-wpplugin/source
+
+      - name: Release build (core binary)
+        run: cargo build --release --bin wptsall-client --manifest-path client-wpplugin/source/Cargo.toml
+
+      - name: Assemble kit layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cat "$GITHUB_WORKSPACE/VERSION" | tr -d '[:space:]')"
+          plat="$(echo "$RUNNER_OS-$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]' \
+            | sed 's/macos/darwin/;s/x64/x86_64/')"
+          ext=''
+          if [ "$RUNNER_OS" = "Windows" ]; then ext='.exe'; fi
+          stage="$RUNNER_TEMP/kit-stage/wptsall-client-webui"
+          rm -rf "$RUNNER_TEMP/kit-stage"
+          mkdir -p "$stage/bin" "$stage/ui/webui"
+          cp "client-wpplugin/source/target/release/wptsall-client$ext" "$stage/bin/"
+          cp -r client-wpplugin/source/frontend/dist/. "$stage/ui/webui/"
+          echo "$version" > "$stage/VERSION"
+          echo "$version" > "$stage/VERSION-BINARY"
+          echo "$version" > "$stage/VERSION-WEBUI"
+          echo "$plat" > "$stage/PLATFORM.txt"
+          ( cd "$RUNNER_TEMP/kit-stage/wptsall-client-webui" \
+            && find . -type f -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS \
+            && mv ../SHA256SUMS ./SHA256SUMS )
+          ( cd "$RUNNER_TEMP/kit-stage" \
+            && tar -czf "$RUNNER_TEMP/kit-webui-$plat.tar.gz" wptsall-client-webui )
+          echo "kit layout:"
+          tar -tzf "$RUNNER_TEMP/kit-webui-$plat.tar.gz" | head -n 20
+          ( cd "$RUNNER_TEMP/kit-stage/wptsall-client-webui" && sha256sum -c SHA256SUMS >/dev/null \
+            && echo 'SHA256SUMS verified' )
+
+      - name: Live smoke (staged binary serves /api/status)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ext=''
+          if [ "$RUNNER_OS" = "Windows" ]; then ext='.exe'; fi
+          bin="$RUNNER_TEMP/kit-stage/wptsall-client-webui/bin/wptsall-client$ext"
+          home="$RUNNER_TEMP/webui-smoke"
+          rm -rf "$home" && mkdir -p "$home/data"
+          WPTSALL_WEB_UI=1 \
+          WPTSALL_WEB_UI_BIND="127.0.0.1:$SMOKE_PORT" \
+          WPTSALL_WEB_UI_PORT="$SMOKE_PORT" \
+          WPTSALL_DATA_DIR="$home/data" \
+          WPTSALL_DB_PATH="$home/wptsall.db" \
+          WPTSALL_LOG_FILE="$home/client.log" \
+          WPTSALL_INSTALL_ROOT="$RUNNER_TEMP/kit-stage/wptsall-client-webui" \
+            "$bin" > "$home/stdout.log" 2>&1 &
+          client_pid=$!
+          ready=0
+          for _ in $(seq 1 40); do
+            if curl -fsS "http://127.0.0.1:$SMOKE_PORT/api/status" > "$home/status.json" 2>/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "1" ]; then
+            echo "---- client stdout ----" ; cat "$home/stdout.log" || true
+            echo "---- client log ----" ; cat "$home/client.log" || true
+            echo "WebUI smoke failed to bind on $RUNNER_OS" >&2
+            exit 1
+          fi
+          grep -q '"success":true' "$home/status.json" || {
+            echo "unexpected /api/status payload:" >&2; cat "$home/status.json" >&2; exit 1;
+          }
+          echo "smoke-ok on $RUNNER_OS: $(head -c 200 "$home/status.json")"
+          kill "$client_pid" 2>/dev/null || true
+          wait "$client_pid" 2>/dev/null || true
+
+      - name: Upload kit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kit-webui-${{ matrix.os }}
+          path: ${{ runner.temp }}/kit-webui-*.tar.gz
+          if-no-files-found: error
+
+  desktop-build:
+    name: Desktop (Tauri) release build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+
+      # The desktop crate path-depends on the Rust core, which embeds the
+      # WebUI frontend dist at compile time — build it first.
+      - name: Build WebUI frontend
+        working-directory: client-wpplugin/source/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Tauri v2 Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            librsvg2-dev libayatana-appindicator3-dev libssl-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-desktop/src-tauri
+
+      - name: Release build (Tauri crate)
+        run: cargo build --release --manifest-path client-desktop/src-tauri/Cargo.toml

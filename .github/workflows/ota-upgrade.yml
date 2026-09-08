@@ -1,0 +1,365 @@
+name: Secure OTA upgrade
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# End-to-end secure OTA round on a runner, with fully ephemeral keys:
+# 1. generate a throwaway minisign keypair in-job;
+# 2. build the client with that public key embedded (build.rs
+#    WPTSALL_MINISIGN_PUBKEY — the production key never leaves the host);
+# 3. serve a signed releases manifest + signed kit from a local HTTP server;
+# 4. drive /api/update-check and /api/perform-update against the running
+#    client: positive self-replace round, then three negatives (missing kit
+#    signature, tampered kit, bad manifest signature).
+# Mirrors the private host OTA gate (run-ota-secure-suite.sh) with none of
+# its host secrets.
+jobs:
+  ota-secure:
+    name: Secure OTA round (ephemeral signing key)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+
+      - name: Build WebUI frontend
+        working-directory: client-wpplugin/source/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-wpplugin/source
+
+      - name: Install minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+          minisign -v
+
+      - name: Generate ephemeral signing keypair
+        run: |
+          set -euo pipefail
+          minisign -G -W -p "$RUNNER_TEMP/ota.pub" -s "$RUNNER_TEMP/ota.key"
+          # The pubkey file's RW... line is the pure base64 body that
+          # PublicKey::from_base64 expects (same shape as the pinned key).
+          pubkey="$(grep -m1 '^RW' "$RUNNER_TEMP/ota.pub")"
+          echo "embedded pubkey: $pubkey"
+          echo "WPTSALL_MINISIGN_PUBKEY=$pubkey" >> "$GITHUB_ENV"
+
+      - name: Release build with embedded ephemeral key
+        run: cargo build --release --bin wptsall-client --manifest-path client-wpplugin/source/Cargo.toml
+
+      - name: Assemble install root, kit, and signed release artifacts
+        run: |
+          set -euo pipefail
+          key="$RUNNER_TEMP/ota.key"
+          work="$RUNNER_TEMP/ota"
+          rm -rf "$work" && mkdir -p "$work/http" "$work/install/bin" "$work/install/ui/webui"
+          version="$(cat "$GITHUB_WORKSPACE/VERSION" | tr -d '[:space:]')"
+          plat="linux-$(uname -m)"
+
+          # Install root the client runs from (self-replace target).
+          cp client-wpplugin/source/target/release/wptsall-client "$work/install/bin/"
+          echo "$version" > "$work/install/VERSION-WEBUI"
+          cp -r client-wpplugin/source/frontend/dist/. "$work/install/ui/webui/"
+
+          # Binary kit exactly like the release layout: <kit_root>/bin/...
+          kit_root="wptsall-client-webui"
+          mkdir -p "$work/$kit_root/bin"
+          cp client-wpplugin/source/target/release/wptsall-client "$work/$kit_root/bin/"
+          echo "$version" > "$work/$kit_root/VERSION"
+          echo "$version" > "$work/$kit_root/VERSION-BINARY"
+          echo "$plat" > "$work/$kit_root/PLATFORM.txt"
+          kit="$work/http/kit-webui-$plat.tar.gz"
+          ( cd "$work" && tar -czf "$kit" "$kit_root" )
+          minisign -Sm "$kit" -s "$key" -x "$kit.minisig"
+
+          sums="$work/http/RELEASE-SHA256SUMS-webui.txt"
+          ( cd "$work/http" && sha256sum "$(basename "$kit")" > "$(basename "$sums")" )
+          minisign -Sm "$work/http/RELEASE-SHA256SUMS-webui.txt" -s "$key" \
+            -x "$work/http/RELEASE-SHA256SUMS-webui.txt.minisig"
+
+          # Releases manifest: raw data object, canonicalized and signed the
+          # same way the host pipeline signs it (sorted keys, compact JSON).
+          port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+          echo "OTA_SERVER_PORT=$port" >> "$GITHUB_ENV"
+          data="$work/releases-data.json"
+          python3 - "$data" "$port" <<'PY'
+          import json, sys
+          out, port = sys.argv[1], int(sys.argv[2])
+          data = {
+            "schema_version": 1,
+            "generated_at": "2026-09-08T00:00:00Z",
+            "products": {
+              "client-wpplugin": {
+                "latest_version": "99.0.0",
+                "min_supported_version": "2.0.0",
+                "release_notes_url": f"http://127.0.0.1:{port}/notes",
+                "download_url_template": f"http://127.0.0.1:{port}/kit-webui-linux-x86_64.tar.gz",
+                "signature_url_template": f"http://127.0.0.1:{port}/RELEASE-SHA256SUMS-webui.txt.minisig",
+                "mandatory": False,
+              }
+            },
+          }
+          json.dump(data, open(out, "w"), indent=2)
+          PY
+          canon="$work/releases-canonical.json"
+          python3 - "$data" "$canon" <<'PY'
+          import json, sys
+          def sortv(v):
+            if isinstance(v, dict): return {k: sortv(v[k]) for k in sorted(v)}
+            if isinstance(v, list): return [sortv(i) for i in v]
+            return v
+          raw = json.loads(open(sys.argv[1]).read())
+          open(sys.argv[2], "wb").write(json.dumps(
+            sortv(raw), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+          ).encode("utf-8"))
+          PY
+          minisign -Sm "$canon" -s "$key" -x "$work/releases-data.json.minisig"
+          ls -la "$work/http" "$work"
+
+      - name: Serve fake releases endpoint
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ota/serve.py" <<'PY'
+          import http.server, os, sys
+          HTTP_DIR = os.environ["OTA_HTTP_DIR"]
+          DATA = os.environ["OTA_RELEASES_DATA"]
+          SIG = os.environ["OTA_RELEASES_SIG"]
+          class H(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *a, **kw):
+              super().__init__(*a, directory=HTTP_DIR, **kw)
+            def _raw(self, body, ctype):
+              self.send_response(200)
+              self.send_header("Content-Type", ctype)
+              self.send_header("Content-Length", str(len(body)))
+              self.end_headers()
+              self.wfile.write(body)
+            def do_GET(self):
+              if self.path == "/api/v1/client/releases":
+                self._raw(open(DATA, "rb").read(), "application/json")
+              elif self.path == "/api/v1/client/releases.minisig":
+                self._raw(open(SIG, "rb").read(), "application/octet-stream")
+              else:
+                super().do_GET()
+            def log_message(self, *a):
+              pass
+          port = int(sys.argv[1])
+          http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+          PY
+          OTA_HTTP_DIR="$RUNNER_TEMP/ota/http" \
+          OTA_RELEASES_DATA="$RUNNER_TEMP/ota/releases-data.json" \
+          OTA_RELEASES_SIG="$RUNNER_TEMP/ota/releases-data.json.minisig" \
+            python3 "$RUNNER_TEMP/ota/serve.py" "$OTA_SERVER_PORT" \
+            > "$RUNNER_TEMP/ota/serve.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/ota/serve.pid"
+          for _ in $(seq 1 20); do
+            if curl -fsS "http://127.0.0.1:$OTA_SERVER_PORT/api/v1/client/releases" \
+              | grep -q client-wpplugin; then
+              echo "releases server up on $OTA_SERVER_PORT"; exit 0
+            fi
+            sleep 0.5
+          done
+          cat "$RUNNER_TEMP/ota/serve.log" || true
+          echo "releases server failed to start" >&2; exit 1
+
+      - name: Positive round - signed manifest + signed kit self-replace
+        run: |
+          set -euo pipefail
+          ota="$RUNNER_TEMP/ota"
+          home="$RUNNER_TEMP/ota/pos"
+          rm -rf "$home" && mkdir -p "$home/data"
+          ui_port=18131
+          before_mtime="$(stat -c %Y "$ota/install/bin/wptsall-client")"
+          WPTSALL_WEB_UI=1 \
+          WPTSALL_SERVER_BASE="http://127.0.0.1:$OTA_SERVER_PORT" \
+          WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
+          WPTSALL_WEB_UI_PORT="$ui_port" \
+          WPTSALL_DATA_DIR="$home/data" \
+          WPTSALL_DB_PATH="$home/wptsall.db" \
+          WPTSALL_LOG_FILE="$home/client.log" \
+          WPTSALL_INSTALL_ROOT="$ota/install" \
+            "$ota/install/bin/wptsall-client" > "$home/stdout.log" 2>&1 &
+          client_pid=$!
+          ready=0
+          for _ in $(seq 1 40); do
+            curl -fsS "http://127.0.0.1:$ui_port/api/status" >/dev/null 2>&1 && { ready=1; break; }
+            sleep 0.5
+          done
+          [ "$ready" = "1" ] || { cat "$home/stdout.log" "$home/client.log" 2>/dev/null || true; \
+            echo "client did not start (security gate must be active)" >&2; exit 1; }
+
+          check="$(curl -fsS "http://127.0.0.1:$ui_port/api/update-check")"
+          echo "update-check: $check"
+          echo "$check" | grep -q '"update_available":true' \
+            || { echo "expected update_available true" >&2; exit 1; }
+
+          code="$(curl -sS -o "$home/perform.json" -w '%{http_code}' -X POST \
+            "http://127.0.0.1:$ui_port/api/perform-update" || true)"
+          echo "perform-update HTTP $code: $(cat "$home/perform.json")"
+          grep -q '"success":true' "$home/perform.json" \
+            || { echo "secure perform-update did not succeed" >&2; exit 1; }
+
+          # Self-replace helper swaps the staged binary after the response:
+          # wait for the install-root binary mtime to move.
+          swapped=0
+          for _ in $(seq 1 60); do
+            now_mtime="$(stat -c %Y "$ota/install/bin/wptsall-client")"
+            if [ "$now_mtime" != "$before_mtime" ]; then swapped=1; break; fi
+            sleep 0.5
+          done
+          kill "$client_pid" 2>/dev/null || true
+          wait "$client_pid" 2>/dev/null || true
+          [ "$swapped" = "1" ] \
+            || { echo "self-replace did not swap the staged binary" >&2; exit 1; }
+
+          # The replaced binary must be runnable: cold start + status.
+          ui_port=18132
+          WPTSALL_WEB_UI=1 \
+          WPTSALL_SERVER_BASE="http://127.0.0.1:$OTA_SERVER_PORT" \
+          WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
+          WPTSALL_WEB_UI_PORT="$ui_port" \
+          WPTSALL_DATA_DIR="$home/data" \
+          WPTSALL_DB_PATH="$home/wptsall.db" \
+          WPTSALL_LOG_FILE="$home/client.log" \
+          WPTSALL_INSTALL_ROOT="$ota/install" \
+            "$ota/install/bin/wptsall-client" > "$home/stdout2.log" 2>&1 &
+          client_pid=$!
+          ready=0
+          for _ in $(seq 1 40); do
+            curl -fsS "http://127.0.0.1:$ui_port/api/status" >/dev/null 2>&1 && { ready=1; break; }
+            sleep 0.5
+          done
+          kill "$client_pid" 2>/dev/null || true
+          wait "$client_pid" 2>/dev/null || true
+          [ "$ready" = "1" ] || { cat "$home/stdout2.log" "$home/client.log" 2>/dev/null || true; \
+            echo "replaced binary failed to start" >&2; exit 1; }
+          echo "PASS: secure OTA positive (signed manifest + signed kit, self-replace verified)"
+
+      - name: Negative - missing kit signature must be rejected
+        run: |
+          set -euo pipefail
+          ota="$RUNNER_TEMP/ota"
+          rm -f "$ota/http/kit-webui-linux-x86_64.tar.gz.minisig" \
+                "$ota/http/RELEASE-SHA256SUMS-webui.txt.minisig"
+          home="$RUNNER_TEMP/ota/neg-nosig"; rm -rf "$home" && mkdir -p "$home/data"
+          ui_port=18133
+          WPTSALL_WEB_UI=1 \
+          WPTSALL_SERVER_BASE="http://127.0.0.1:$OTA_SERVER_PORT" \
+          WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
+          WPTSALL_WEB_UI_PORT="$ui_port" \
+          WPTSALL_DATA_DIR="$home/data" \
+          WPTSALL_DB_PATH="$home/wptsall.db" \
+          WPTSALL_LOG_FILE="$home/client.log" \
+          WPTSALL_INSTALL_ROOT="$ota/install" \
+            "$ota/install/bin/wptsall-client" > "$home/stdout.log" 2>&1 &
+          client_pid=$!
+          for _ in $(seq 1 40); do
+            curl -fsS "http://127.0.0.1:$ui_port/api/status" >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          curl -sS -o "$home/perform.json" -X POST "http://127.0.0.1:$ui_port/api/perform-update" || true
+          kill "$client_pid" 2>/dev/null || true; wait "$client_pid" 2>/dev/null || true
+          echo "neg missing-sig: $(cat "$home/perform.json")"
+          grep -q '"success":true' "$home/perform.json" \
+            && { echo "missing kit .minisig must not succeed" >&2; exit 1; }
+          echo "PASS: missing kit signature rejected"
+
+      - name: Negative - tampered kit must be rejected
+        run: |
+          set -euo pipefail
+          ota="$RUNNER_TEMP/ota"
+          minisign -Sm "$ota/http/kit-webui-linux-x86_64.tar.gz" -s "$RUNNER_TEMP/ota.key" \
+            -x "$ota/http/kit-webui-linux-x86_64.tar.gz.minisig"
+          minisign -Sm "$ota/http/RELEASE-SHA256SUMS-webui.txt" -s "$RUNNER_TEMP/ota.key" \
+            -x "$ota/http/RELEASE-SHA256SUMS-webui.txt.minisig"
+          python3 -c "
+          from pathlib import Path
+          p = Path('$ota/http/kit-webui-linux-x86_64.tar.gz')
+          b = bytearray(p.read_bytes())
+          b[64:96] = b'\xff' * 32
+          p.write_bytes(b)
+          "
+          home="$RUNNER_TEMP/ota/neg-badkit"; rm -rf "$home" && mkdir -p "$home/data"
+          ui_port=18134
+          WPTSALL_WEB_UI=1 \
+          WPTSALL_SERVER_BASE="http://127.0.0.1:$OTA_SERVER_PORT" \
+          WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
+          WPTSALL_WEB_UI_PORT="$ui_port" \
+          WPTSALL_DATA_DIR="$home/data" \
+          WPTSALL_DB_PATH="$home/wptsall.db" \
+          WPTSALL_LOG_FILE="$home/client.log" \
+          WPTSALL_INSTALL_ROOT="$ota/install" \
+            "$ota/install/bin/wptsall-client" > "$home/stdout.log" 2>&1 &
+          client_pid=$!
+          for _ in $(seq 1 40); do
+            curl -fsS "http://127.0.0.1:$ui_port/api/status" >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          curl -sS -o "$home/perform.json" -X POST "http://127.0.0.1:$ui_port/api/perform-update" || true
+          kill "$client_pid" 2>/dev/null || true; wait "$client_pid" 2>/dev/null || true
+          echo "neg tampered-kit: $(cat "$home/perform.json")"
+          grep -q '"success":true' "$home/perform.json" \
+            && { echo "tampered kit must not succeed" >&2; exit 1; }
+          echo "PASS: tampered kit rejected"
+
+      - name: Negative - bad releases manifest signature must be rejected
+        run: |
+          set -euo pipefail
+          ota="$RUNNER_TEMP/ota"
+          # Restore the good kit, then break the manifest signature.
+          ota_kit="$ota/http/kit-webui-linux-x86_64.tar.gz"
+          rm -f "$ota_kit"
+          kit_root="wptsall-client-webui"
+          ( cd "$RUNNER_TEMP/ota" && tar -czf "$ota_kit" "$kit_root" )
+          minisign -Sm "$ota_kit" -s "$RUNNER_TEMP/ota.key" -x "$ota_kit.minisig"
+          ( cd "$ota/http" && sha256sum "$(basename "$ota_kit")" > RELEASE-SHA256SUMS-webui.txt )
+          minisign -Sm "$ota/http/RELEASE-SHA256SUMS-webui.txt" -s "$RUNNER_TEMP/ota.key" \
+            -x "$ota/http/RELEASE-SHA256SUMS-webui.txt.minisig"
+          printf 'untrusted\n' > "$ota/releases-data.json.minisig"
+          home="$RUNNER_TEMP/ota/neg-badmanifest"; rm -rf "$home" && mkdir -p "$home/data"
+          ui_port=18135
+          WPTSALL_WEB_UI=1 \
+          WPTSALL_SERVER_BASE="http://127.0.0.1:$OTA_SERVER_PORT" \
+          WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
+          WPTSALL_WEB_UI_PORT="$ui_port" \
+          WPTSALL_DATA_DIR="$home/data" \
+          WPTSALL_DB_PATH="$home/wptsall.db" \
+          WPTSALL_LOG_FILE="$home/client.log" \
+          WPTSALL_INSTALL_ROOT="$ota/install" \
+            "$ota/install/bin/wptsall-client" > "$home/stdout.log" 2>&1 &
+          client_pid=$!
+          for _ in $(seq 1 40); do
+            curl -fsS "http://127.0.0.1:$ui_port/api/status" >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          check_code="$(curl -sS -o "$home/check.json" -w '%{http_code}' \
+            "http://127.0.0.1:$ui_port/api/update-check" || true)"
+          kill "$client_pid" 2>/dev/null || true; wait "$client_pid" 2>/dev/null || true
+          echo "neg bad-manifest HTTP $check_code: $(cat "$home/check.json" 2>/dev/null || true)"
+          if [ "$check_code" = "200" ] && grep -q '"success":true' "$home/check.json" 2>/dev/null; then
+            echo "bad releases.minisig must not yield a successful update-check" >&2
+            exit 1
+          fi
+          echo "PASS: bad releases manifest signature rejected"
+
+      - name: Stop releases server
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/ota/serve.pid" ]; then
+            kill "$(cat "$RUNNER_TEMP/ota/serve.pid")" 2>/dev/null || true
+          fi
