@@ -1,0 +1,118 @@
+[package]
+name = "wptsall-client"
+version = "2.1.0"
+edition = "2021"
+
+[[bin]]
+name = "wptsall-client"
+path = "src/main.rs"
+
+[lib]
+name = "wptsall_client"
+path = "src/lib.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
+aws-credential-types = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["sigv4a", "http-1x", "rt-tokio"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+aws-smithy-runtime = { version = "1", default-features = false, features = ["client", "tls-rustls", "rt-tokio"] }
+aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x"] }
+bytes = "1"
+async-trait = "0.1"
+base64 = "0.22"
+hkdf = "0.12"
+jsonwebtoken = "9"
+md5-digest = { package = "md-5", version = "0.10" }
+# `blocking` is used only by the synchronous Vault credential resolver.  It
+# keeps secret resolution available to both sync and async configuration paths
+# without introducing a nested Tokio runtime.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "socks", "multipart", "blocking"] }
+url = "2"
+rsa = "0.9"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+hmac = "0.12"
+md5 = "0.7"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+extism = "1"
+open = "5"
+wptsall-i18n = { path = "../../libs/i18n-rs" }
+client-runtime-core = { path = "../../libs/client-runtime-core" }
+wptsall-client-security = { path = "../../libs/wptsall-client-security" }
+
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Lab / day-to-day local builds: much faster 2nd/3rd compiles than fat LTO release.
+# Keep incremental + thin LTO; still stripped. Use for E2E/Lab; ship with --release.
+[profile.release-lab]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
+strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[package.metadata.deb]
+name = "wptsall-client"
+maintainer = "WPMM <info@wpmm.cc>"
+depends = ""
+section = "utils"
+assets = [
+  ["target/release/wptsall-client", "usr/bin/", "755"],
+  ["deploy/wptsall-client-webui.package.service", "lib/systemd/user/wptsall-client-webui.service", "644"],
+]
+
+[[test]]
+name = "component_template_mock_task_flow"
+path = "../../tests/modules/client-wpplugin/unit/component_template_mock_task_flow.rs"
+
+[[test]]
+name = "sign_e2e"
+path = "../../tests/modules/client-wpplugin/unit/sign_e2e.rs"
+
+[[test]]
+name = "wp_core_source_component_flow"
+path = "../../tests/modules/client-wpplugin/unit/wp_core_source_component_flow.rs"
+
+[[test]]
+name = "wp_translation_providers_roundtrip"
+path = "../../tests/modules/client-wpplugin/unit/wp_translation_providers_roundtrip.rs"
+
+[[test]]
+name = "idempotency_callback"
+path = "../../tests/modules/client-wpplugin/unit/idempotency_callback.rs"
+
+[[test]]
+name = "worker_loop"
+path = "../../tests/modules/client-wpplugin/unit/worker_loop.rs"
+
+[[test]]
+name = "discoverer_endpoints"
+path = "../../tests/modules/client-wpplugin/unit/discoverer_endpoints.rs"
+
+[[test]]
+name = "webui_route_matrix"
+path = "../../tests/modules/client-wpplugin/unit/webui_route_matrix.rs"
+

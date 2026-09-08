@@ -1,0 +1,26 @@
+[package]
+name = "client-runtime-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "client_runtime_core"
+path = "src/lib.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+base64 = "0.22"
+hkdf = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["process", "fs", "io-util"] }
+uuid = { version = "1", features = ["v4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rsa = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

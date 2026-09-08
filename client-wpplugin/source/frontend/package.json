@@ -1,0 +1,44 @@
+{
+  "name": "wptsall-client-ui",
+  "version": "2.1.0",
+  "private": true,
+  "type": "module",
+  "browserslist": [
+    "> 1%",
+    "last 2 versions",
+    "not dead",
+    "not IE 11"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test:unit": "node ./node_modules/vitest/vitest.mjs run --config vitest.config.ts",
+    "test:unit:watch": "node ./node_modules/vitest/vitest.mjs --config vitest.config.ts",
+    "test:playwright:local": "cd ../../../wp-plugin/tests/e2e/playwright && npx playwright test -c playwright.client-local-ui.config.ts",
+    "test:playwright:server": "bash ../../../wp-plugin/tests/e2e/run-playwright-support-client-server.sh",
+    "test:playwright:mock": "cd ../../../wp-plugin/tests/e2e/playwright && npx playwright test -c playwright.client-mock-support.config.ts",
+    "test:playwright:live-mock": "bash ../../../wp-plugin/tests/e2e/run-playwright-provider-live-mock.sh",
+    "test:e2e:official-templates": "bash ../../../wp-plugin/tests/e2e/run-playwright-support-client-server.sh support-client-server/component-template-test.spec.ts"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.2",
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/svelte": "^5.3.1",
+    "jsdom": "^26.1.0",
+    "svelte": "^5.0.0",
+    "svelte-check": "^4.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^6.0.0",
+    "vite-plugin-singlefile": "^2.0.0",
+    "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "lucide-svelte": "^0.469.0",
+    "svelte-i18n": "^4.0.1"
+  }
+}

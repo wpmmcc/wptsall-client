@@ -1,0 +1,373 @@
+use super::*;
+
+// Serialize all tests that read/write the process-global LOG_ENABLED / LOG_MIN_LEVEL.
+// Without this, parallel test threads can corrupt each other's expected state.
+static GLOBAL_LOG_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard: restores LOG_ENABLED and LOG_MIN_LEVEL when dropped.
+struct LogStateGuard {
+    prev_enabled: bool,
+    prev_level: &'static str,
+}
+impl Drop for LogStateGuard {
+    fn drop(&mut self) {
+        set_log_enabled(self.prev_enabled);
+        set_log_min_level(self.prev_level);
+        // Close any test log writer to avoid leaking into other tests.
+        let mut g = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        *g = None;
+    }
+}
+
+/// Acquires the global log lock, snapshots current state, applies (enabled, level),
+/// and returns a tuple of (MutexGuard, LogStateGuard) that restores state on drop.
+fn acquire_log_state(
+    enabled: bool,
+    level: &str,
+) -> (std::sync::MutexGuard<'static, ()>, LogStateGuard) {
+    let guard = GLOBAL_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let state = LogStateGuard {
+        prev_enabled: get_log_enabled(),
+        prev_level: get_log_min_level_str(),
+    };
+    set_log_enabled(enabled);
+    set_log_min_level(level);
+    // Reset any existing log writer so tests don't interfere with each other.
+    {
+        let mut g = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        *g = None;
+    }
+    (guard, state)
+}
+
+// -----------------------------------------------------------------------
+// level_to_u8 — pure function, no global state
+// -----------------------------------------------------------------------
+
+#[test]
+fn level_to_u8_debug() {
+    assert_eq!(level_to_u8("debug"), 0);
+}
+
+#[test]
+fn level_to_u8_info() {
+    assert_eq!(level_to_u8("info"), 1);
+}
+
+#[test]
+fn level_to_u8_warn() {
+    assert_eq!(level_to_u8("warn"), 2);
+}
+
+#[test]
+fn level_to_u8_warning_alias() {
+    assert_eq!(level_to_u8("warning"), 2);
+}
+
+#[test]
+fn level_to_u8_error() {
+    assert_eq!(level_to_u8("error"), 3);
+}
+
+#[test]
+fn level_to_u8_unknown_defaults_to_info() {
+    assert_eq!(level_to_u8("trace"), 1);
+}
+
+#[test]
+fn level_to_u8_empty_defaults_to_info() {
+    assert_eq!(level_to_u8(""), 1);
+}
+
+// -----------------------------------------------------------------------
+// get_log_min_level_str round-trips — touches global state
+// -----------------------------------------------------------------------
+
+#[test]
+fn min_level_round_trips_debug() {
+    let (_lock, _state) = acquire_log_state(true, "debug");
+    assert_eq!(get_log_min_level_str(), "debug");
+}
+
+#[test]
+fn min_level_round_trips_info() {
+    let (_lock, _state) = acquire_log_state(true, "info");
+    assert_eq!(get_log_min_level_str(), "info");
+}
+
+#[test]
+fn min_level_round_trips_warn() {
+    let (_lock, _state) = acquire_log_state(true, "warn");
+    assert_eq!(get_log_min_level_str(), "warn");
+}
+
+#[test]
+fn min_level_round_trips_error() {
+    let (_lock, _state) = acquire_log_state(true, "error");
+    assert_eq!(get_log_min_level_str(), "error");
+}
+
+#[test]
+fn min_level_warning_alias_returns_warn() {
+    // "warning" maps to u8=2, which get_log_min_level_str returns as "warn"
+    let (_lock, _state) = acquire_log_state(true, "warning");
+    assert_eq!(get_log_min_level_str(), "warn");
+}
+
+// -----------------------------------------------------------------------
+// get_log_enabled toggle — touches global state
+// -----------------------------------------------------------------------
+
+#[test]
+fn log_enabled_toggle() {
+    let (_lock, _state) = acquire_log_state(false, "info");
+    assert!(!get_log_enabled());
+    set_log_enabled(true);
+    assert!(get_log_enabled());
+}
+
+// -----------------------------------------------------------------------
+// log_event: disabled → no write
+// -----------------------------------------------------------------------
+
+#[test]
+fn log_event_disabled_skips_write() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("disabled.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(false, "debug");
+    log_event(&log_str, "info", "should.not.appear", serde_json::json!({}))
+        .expect("disabled log_event should return Ok");
+
+    // File must not exist or be empty
+    assert!(
+        !log_path.exists() || std::fs::read_to_string(&log_path).unwrap().is_empty(),
+        "log file should be empty when logging is disabled"
+    );
+}
+
+// -----------------------------------------------------------------------
+// log_event: level filtering
+// -----------------------------------------------------------------------
+
+#[test]
+fn log_event_level_below_min_skipped() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("below_min.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "warn");
+    // "info" (1) < "warn" (2) — should be skipped
+    log_event(&log_str, "info", "should.be.skipped", serde_json::json!({})).expect("ok");
+
+    // Flush to ensure any buffered data is written
+    flush_log();
+
+    assert!(
+        !log_path.exists() || std::fs::read_to_string(&log_path).unwrap().is_empty(),
+        "info event should be filtered when min_level=warn"
+    );
+}
+
+#[test]
+fn log_event_level_at_min_written() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("at_min.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "warn");
+    log_event(&log_str, "warn", "at.min.level", serde_json::json!({})).expect("ok");
+    flush_log();
+
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    assert!(
+        content.contains("at.min.level"),
+        "warn event should be written when min_level=warn"
+    );
+}
+
+#[test]
+fn log_event_level_above_min_written() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("above_min.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "warn");
+    log_event(&log_str, "error", "above.min.level", serde_json::json!({})).expect("ok");
+    // error level is flushed immediately, but call flush_log for safety
+    flush_log();
+
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    assert!(
+        content.contains("above.min.level"),
+        "error event should be written when min_level=warn"
+    );
+}
+
+#[test]
+fn log_event_debug_written_when_min_debug() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("debug_min.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "debug");
+    log_event(&log_str, "debug", "debug.event", serde_json::json!({})).expect("ok");
+    flush_log();
+
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    assert!(
+        content.contains("debug.event"),
+        "debug event should be written when min_level=debug"
+    );
+}
+
+#[test]
+fn log_event_debug_skipped_when_min_info() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("debug_skipped.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "info");
+    log_event(&log_str, "debug", "debug.skipped", serde_json::json!({})).expect("ok");
+    flush_log();
+
+    assert!(
+        !log_path.exists() || std::fs::read_to_string(&log_path).unwrap().is_empty(),
+        "debug event should be filtered when min_level=info"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Existing tests — now wrapped with the global lock so they are safe
+// when other tests temporarily mutate LOG_ENABLED / LOG_MIN_LEVEL
+// -----------------------------------------------------------------------
+
+#[test]
+fn session_token_prefix_short_token() {
+    assert_eq!(session_token_prefix("abc"), "abc");
+}
+
+#[test]
+fn session_token_prefix_long_token() {
+    let token = "abcdefghijklmnopqrstuvwxyz";
+    assert_eq!(session_token_prefix(token), "abcdefghijkl");
+}
+
+#[test]
+fn session_token_prefix_exactly_12() {
+    assert_eq!(session_token_prefix("123456789012"), "123456789012");
+}
+
+#[test]
+fn snippet_short_string() {
+    let s = "hello world";
+    assert_eq!(snippet(s), "hello world");
+}
+
+#[test]
+fn snippet_long_string_truncated() {
+    let s = "x".repeat(300);
+    let result = snippet(&s);
+    assert!(result.ends_with("..."));
+    assert!(result.len() < 230);
+}
+
+#[test]
+fn mask_email_normal() {
+    assert_eq!(mask_email("alice@example.com"), "a***e@example.com");
+}
+
+#[test]
+fn mask_email_short_local() {
+    assert_eq!(mask_email("ab@example.com"), "ab***@example.com");
+}
+
+#[test]
+fn mask_email_single_char_local() {
+    assert_eq!(mask_email("a@example.com"), "a***@example.com");
+}
+
+#[test]
+fn unix_ts_returns_nonzero() {
+    let ts = unix_ts();
+    assert!(
+        ts > 1_000_000_000,
+        "timestamp should be recent epoch: {}",
+        ts
+    );
+}
+
+#[test]
+fn log_event_writes_to_file() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("test.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    // Acquire lock + guarantee enabled state so this test is not affected
+    // by other tests that temporarily disable logging.
+    let (_lock, _state) = acquire_log_state(true, "info");
+    log_event(
+        &log_str,
+        "info",
+        "test.event",
+        serde_json::json!({"key": "value"}),
+    )
+    .expect("log_event should succeed");
+    flush_log();
+
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    assert!(content.contains("test.event"));
+    assert!(content.contains("info"));
+}
+
+#[test]
+fn log_rotation_creates_backup() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("rotate.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "info");
+    init_log_file(&log_str).expect("init");
+
+    // Write enough data to trigger rotation (just over MAX_LOG_SIZE)
+    // We simulate this by directly setting file_bytes high.
+    {
+        let mut guard = LOG_WRITER.lock().unwrap();
+        if let Some(lw) = guard.as_mut() {
+            lw.file_bytes = MAX_LOG_SIZE; // trigger rotation on next write
+        }
+    }
+
+    log_event(&log_str, "error", "after.rotation", serde_json::json!({}))
+        .expect("should rotate and write");
+    flush_log();
+
+    // Backup .1 should exist
+    let backup1 = format!("{}.1", log_str);
+    assert!(
+        Path::new(&backup1).exists(),
+        "backup .1 should exist after rotation"
+    );
+
+    // New log file should contain the post-rotation event
+    let content = std::fs::read_to_string(&log_path).expect("read new log");
+    assert!(content.contains("after.rotation"));
+}
+
+#[test]
+fn error_level_flushes_immediately() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("error_flush.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "info");
+    log_event(&log_str, "error", "critical.error", serde_json::json!({})).expect("ok");
+
+    // Should be flushed immediately without calling flush_log()
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    assert!(
+        content.contains("critical.error"),
+        "error events should be flushed immediately"
+    );
+}

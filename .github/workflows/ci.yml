@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core-unit:
+    name: cargo test --lib --bins (Rust core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+      # The Rust core embeds frontend/dist at compile time (static_html.rs
+      # include_str!) — same contract as the monorepo's `--with-ui` builds.
+      - name: Build WebUI frontend
+        working-directory: client-wpplugin/source/frontend
+        run: |
+          npm ci
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-wpplugin/source
+      # --lib --bins only: the crate's [[test]] integration targets point at
+      # the private monorepo test framework and are intentionally not part of
+      # this public tree (see OPEN-SOURCE-PUBLISH-FLOW §4).
+      - name: Run core unit tests
+        run: cargo test --lib --bins --manifest-path client-wpplugin/source/Cargo.toml
+
+  webui-frontend:
+    name: WebUI frontend (vitest + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client-wpplugin/source/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+      - run: npm ci
+      - run: npm run test:unit
+      - run: npm run build
+
+  desktop-frontend:
+    name: Desktop frontend (vitest + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client-desktop/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-desktop/frontend/package-lock.json
+      - run: npm ci
+      - run: npm run test
+      - run: npm run build
+
+  desktop-check:
+    name: Desktop cargo check (Tauri v2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+      # The desktop crate path-depends on the Rust core, which embeds
+      # frontend/dist at compile time — build the WebUI frontend first.
+      - name: Build WebUI frontend
+        working-directory: client-wpplugin/source/frontend
+        run: |
+          npm ci
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Tauri v2 Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            librsvg2-dev libayatana-appindicator3-dev libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-desktop/src-tauri
+      - name: cargo check (desktop crate + path deps)
+        run: cargo check --manifest-path client-desktop/src-tauri/Cargo.toml

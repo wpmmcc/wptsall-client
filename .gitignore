@@ -1,0 +1,29 @@
+# WPTSALL Client public repo — source-only; keep build outputs, local runtime
+# state and secrets out of git.
+target/
+node_modules/
+dist/
+test-results/
+playwright-report/
+
+# Local runtime state created only if you run a built client from this checkout
+client-wpplugin/source/config/
+client-wpplugin/source/data/
+client-wpplugin/source/logs/
+client-wpplugin/source/runtime/
+client-desktop/frontend/config/
+client-desktop/frontend/data/
+client-desktop/frontend/logs/
+client-desktop/frontend/runtime/
+client-desktop/src-tauri/config/
+
+# Secrets — never commit
+**/*.env
+!**/*.env.example
+!**/.env.test.example
+*.pem
+*.key
+*.p12
+.DS_Store
+*.log
+*.pid
