@@ -81,6 +81,35 @@ pub fn parse_sha256sums(content: &str, filename: &str) -> Option<String> {
     None
 }
 
+/// Fail-closed pre-flight: the self-replace helper is fire-and-forget with
+/// its output discarded, so a permission failure inside it (root-owned
+/// install dir, read-only mount, wrong user) would silently no-op while the
+/// HTTP response already said "restarting". Verify up front that the
+/// directory holding the current binary is writable by the effective user —
+/// `rename(2)` needs directory write permission, not file write permission —
+/// by creating and removing a probe file.
+///
+/// The returned error message starts with `install dir not writable:` so
+/// wire layers can surface a distinct error code.
+fn ensure_replace_dir_writable(current_binary: &Path) -> Result<()> {
+    let Some(dir) = current_binary.parent() else {
+        anyhow::bail!("install dir not writable: current binary {} has no parent directory", current_binary.display());
+    };
+    let probe = dir.join(format!(".wptsall-replace-probe-{}", uuid::Uuid::new_v4()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => anyhow::bail!(
+            "install dir not writable: {} — cannot self-replace the running binary \
+             (rename needs directory write permission; fix ownership/permissions or \
+             reinstall to a user-writable prefix): {e}",
+            dir.display()
+        ),
+    }
+}
+
 /// Self-replace the running binary with platform-appropriate service management.
 ///
 /// Spawns a fire-and-forget helper process that:
@@ -91,12 +120,16 @@ pub fn parse_sha256sums(content: &str, filename: &str) -> Option<String> {
 /// 5. Starts the service again
 ///
 /// The function returns immediately after spawning the helper — the HTTP
-/// handler should return 200 right away.
+/// handler should return 200 right away. Permission viability is checked
+/// BEFORE spawning (see [`ensure_replace_dir_writable`]) so an unwritable
+/// install directory fails closed instead of silently keeping the old binary.
 pub fn perform_self_replace(
     service_name: &str,
     current_binary: &Path,
     new_binary: &Path,
 ) -> Result<()> {
+    ensure_replace_dir_writable(current_binary)?;
+
     let cur = current_binary.display();
     let new = new_binary.display();
 
@@ -556,6 +589,83 @@ abc123def456  wptsall-client-2.1.0-x86_64-unknown-linux-gnu\n\
             .contains("checksum mismatch"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-replace permission semantics (2026-09-09). The helper is
+    // fire-and-forget with discarded output, so permission viability must
+    // be proven BEFORE spawning: fail closed on an unwritable install dir,
+    // and pin that the happy path actually swaps + chmods.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn perform_self_replace_fails_closed_on_unwritable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir()
+            .join(format!("wptsall-test-selfreplace-ro-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cur = bin.join("wptsall-client");
+        std::fs::write(&cur, b"old").unwrap();
+        let new = root.join("new-bin");
+        std::fs::write(&new, b"new").unwrap();
+
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let err = perform_self_replace("wptsall-selftest-ro", &cur, &new).unwrap_err();
+        assert!(
+            err.to_string().starts_with("install dir not writable:"),
+            "must fail closed with the stable prefix, got: {err}"
+        );
+
+        // Cleanup needs the write bit back.
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        // Neither file moved.
+        assert_eq!(std::fs::read(&cur).unwrap(), b"old");
+        assert_eq!(std::fs::read(&new).unwrap(), b"new");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perform_self_replace_swaps_binary_and_marks_executable() {
+        // End-to-end helper round on a writable directory: the detached
+        // helper must actually move the new binary over the old path and
+        // mark it executable (the runner OTA lane asserts the same via
+        // mtime; this pins it at unit level without systemd — the
+        // systemctl calls fail harmlessly under `|| true`).
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir()
+            .join(format!("wptsall-test-selfreplace-ok-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cur = bin.join("wptsall-client");
+        std::fs::write(&cur, b"old-binary").unwrap();
+        let new = root.join("new-bin");
+        std::fs::write(&new, b"new-binary").unwrap();
+
+        perform_self_replace("wptsall-selftest-ok", &cur, &new).unwrap();
+
+        let mut swapped = false;
+        for _ in 0..40 {
+            if std::fs::read(&cur).map(|b| b == b"new-binary").unwrap_or(false) {
+                swapped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        assert!(swapped, "helper must move the new binary over the old path");
+
+        let mode = std::fs::metadata(&cur).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "replaced binary must be executable (mode {mode:o})");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     // -----------------------------------------------------------------------

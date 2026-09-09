@@ -1357,7 +1357,15 @@ async fn handle_perform_update(
     ) {
         update_flag.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = tokio::fs::remove_file(&tmp_binary).await;
-        return write_error_response(socket, "SELF_REPLACE_FAILED", &format!("{:#}", e)).await;
+        // The runtime-core pre-flight marks unwritable install directories
+        // with a stable prefix so the wire can carry a distinct code (the
+        // generic spawn failure stays SELF_REPLACE_FAILED).
+        let code = if format!("{e:#}").starts_with("install dir not writable:") {
+            "INSTALL_DIR_NOT_WRITABLE"
+        } else {
+            "SELF_REPLACE_FAILED"
+        };
+        return write_error_response(socket, code, &format!("{:#}", e)).await;
     }
 
     // Success — service will restart shortly

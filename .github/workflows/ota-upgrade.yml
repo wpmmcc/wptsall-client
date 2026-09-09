@@ -15,8 +15,11 @@ concurrency:
 #    WPTSALL_MINISIGN_PUBKEY — the production key never leaves the host);
 # 3. serve a signed releases manifest + signed kit from a local HTTP server;
 # 4. drive /api/update-check and /api/perform-update against the running
-#    client: positive self-replace round, then three negatives (missing kit
-#    signature, tampered kit, bad manifest signature).
+#    client: positive self-replace round, three negatives (missing kit
+#    signature, tampered kit, bad manifest signature), a permission
+#    negative (read-only install dir must fail closed with
+#    INSTALL_DIR_NOT_WRITABLE and leave the binary untouched), and a
+#    recovery round (writable dir swaps the binary again).
 # Mirrors the private host OTA gate (run-ota-secure-suite.sh) with none of
 # its host secrets.
 jobs:
@@ -363,6 +366,91 @@ jobs:
             exit 1
           fi
           echo "PASS: bad releases manifest signature rejected"
+
+      - name: Negative - read-only install dir must fail closed (OTA permission pre-flight)
+        run: |
+          set -euo pipefail
+          ota="$RUNNER_TEMP/ota"
+          # The bad-manifest step broke releases-data.json.minisig; restore a
+          # valid signature over the canonical manifest so update-check works
+          # and the only failure cause in this round is the directory mode.
+          minisign -Sm "$ota/releases-canonical.json" -s "$RUNNER_TEMP/ota.key" \
+            -x "$ota/releases-data.json.minisig"
+          chmod 0555 "$ota/install/bin"
+          before_sha="$(sha256sum "$ota/install/bin/wptsall-client" | awk '{print $1}')"
+          home="$RUNNER_TEMP/ota/neg-rodir"; rm -rf "$home" && mkdir -p "$home/data"
+          ui_port=18136
+          WPTSALL_WEB_UI=1 \
+          WPTSALL_SERVER_BASE="http://127.0.0.1:$OTA_SERVER_PORT" \
+          WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
+          WPTSALL_WEB_UI_PORT="$ui_port" \
+          WPTSALL_DATA_DIR="$home/data" \
+          WPTSALL_DB_PATH="$home/wptsall.db" \
+          WPTSALL_LOG_FILE="$home/client.log" \
+          WPTSALL_INSTALL_ROOT="$ota/install" \
+            "$ota/install/bin/wptsall-client" > "$home/stdout.log" 2>&1 &
+          client_pid=$!
+          ready=0
+          for _ in $(seq 1 40); do
+            curl -fsS "http://127.0.0.1:$ui_port/api/status" >/dev/null 2>&1 && { ready=1; break; }
+            sleep 0.5
+          done
+          [ "$ready" = "1" ] || { cat "$home/stdout.log" 2>/dev/null || true; \
+            echo "client did not start from read-only dir (exec bit must remain)" >&2; exit 1; }
+          curl -sS -o "$home/perform.json" -X POST "http://127.0.0.1:$ui_port/api/perform-update" || true
+          kill "$client_pid" 2>/dev/null || true; wait "$client_pid" 2>/dev/null || true
+          echo "neg readonly-dir: $(cat "$home/perform.json")"
+          grep -q '"success":true' "$home/perform.json" \
+            && { echo "read-only install dir must not report a successful update" >&2; exit 1; }
+          grep -q 'INSTALL_DIR_NOT_WRITABLE' "$home/perform.json" \
+            || { echo "must surface the INSTALL_DIR_NOT_WRITABLE error code" >&2; exit 1; }
+          after_sha="$(sha256sum "$ota/install/bin/wptsall-client" | awk '{print $1}')"
+          [ "$before_sha" = "$after_sha" ] \
+            || { echo "read-only install dir must leave the binary byte-identical" >&2; exit 1; }
+          chmod 0755 "$ota/install/bin"
+          echo "PASS: read-only install dir fails closed (INSTALL_DIR_NOT_WRITABLE, binary untouched)"
+
+      - name: Recovery - writable dir self-replace swaps the binary
+        run: |
+          set -euo pipefail
+          ota="$RUNNER_TEMP/ota"
+          before_mtime="$(stat -c %Y "$ota/install/bin/wptsall-client")"
+          home="$RUNNER_TEMP/ota/pos-recovery"; rm -rf "$home" && mkdir -p "$home/data"
+          ui_port=18137
+          WPTSALL_WEB_UI=1 \
+          WPTSALL_SERVER_BASE="http://127.0.0.1:$OTA_SERVER_PORT" \
+          WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
+          WPTSALL_WEB_UI_PORT="$ui_port" \
+          WPTSALL_DATA_DIR="$home/data" \
+          WPTSALL_DB_PATH="$home/wptsall.db" \
+          WPTSALL_LOG_FILE="$home/client.log" \
+          WPTSALL_INSTALL_ROOT="$ota/install" \
+            "$ota/install/bin/wptsall-client" > "$home/stdout.log" 2>&1 &
+          client_pid=$!
+          ready=0
+          for _ in $(seq 1 40); do
+            curl -fsS "http://127.0.0.1:$ui_port/api/status" >/dev/null 2>&1 && { ready=1; break; }
+            sleep 0.5
+          done
+          [ "$ready" = "1" ] || { cat "$home/stdout.log" "$home/client.log" 2>/dev/null || true; \
+            echo "client did not start" >&2; exit 1; }
+          code="$(curl -sS -o "$home/perform.json" -w '%{http_code}' -X POST \
+            "http://127.0.0.1:$ui_port/api/perform-update" || true)"
+          echo "recovery perform-update HTTP $code: $(cat "$home/perform.json")"
+          grep -q '"success":true' "$home/perform.json" \
+            || { echo "recovery: perform-update must succeed after chmod 0755" >&2; exit 1; }
+          kill "$client_pid" 2>/dev/null || true; wait "$client_pid" 2>/dev/null || true
+          swapped=0
+          for _ in $(seq 1 60); do
+            now_mtime="$(stat -c %Y "$ota/install/bin/wptsall-client")"
+            if [ "$now_mtime" != "$before_mtime" ]; then swapped=1; break; fi
+            sleep 0.5
+          done
+          [ "$swapped" = "1" ] \
+            || { echo "recovery: self-replace must swap the binary once writable" >&2; exit 1; }
+          file "$ota/install/bin/wptsall-client" | grep -qi ELF \
+            || { echo "recovery: swapped binary must be ELF" >&2; exit 1; }
+          echo "PASS: recovery self-replace swaps the binary after permissions are restored"
 
       - name: Stop releases server
         if: always()
