@@ -6,6 +6,13 @@
 
 WPTSALL Client ist der Begleit-Client zum WordPress-Plugin WPMMCC ATS. Er läuft auf deinem Rechner — als lokale Web-UI oder als native Desktop-App —, speichert jede Einstellung in einer lokalen Datenbank, verbindet sich mit einem Gerätetoken direkt mit deinem eigenen WordPress und steuert jeden HTTP(S)-Übersetzungsanbieter, den du konfigurierst. Ohne Konto, ohne Lizenz, ohne Cloud-Abhängigkeit.
 
+## Links
+- Project website — https://www.wpmm.cc/
+- Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
+- WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
+- Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
+- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+
 ## Funktionen
 - Zwei Produkte, ein Kern — lokale WebUI auf 127.0.0.1:8977 und native Desktop-App (Tauri) mit demselben Rust-Kern
 - Local-first — Sites, Anbieter, Komponenten und Regeln liegen in deiner lokalen Datenbank, nie in der Cloud

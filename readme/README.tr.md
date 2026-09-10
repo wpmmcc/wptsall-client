@@ -6,6 +6,13 @@
 
 WPTSALL Client, WPMMCC ATS WordPress eklentisinin companion istemcisidir. Makinenizde çalışır — yerel bir web arayüzü ya da yerel bir masaüstü uygulaması olarak — her ayarı yerel bir veritabanında tutar, bir cihaz token'ı ile kendi WordPress'inize doğrudan bağlanır ve yapılandırdığınız herhangi bir HTTP(S) çeviri sağlayıcısını yönetir. Hesap yok, lisans yok, bulut bağımlılığı yok.
 
+## Links
+- Project website — https://www.wpmm.cc/
+- Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
+- WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
+- Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
+- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+
 ## Özellikler
 - İki ürün, tek çekirdek — 127.0.0.1:8977 üzerindeki yerel WebUI ve yerel masaüstü uygulaması (Tauri) aynı Rust çekirdeğini paylaşır
 - Yerel-öncelik — site, sağlayıcı, bileşen ve kurallar yerel veritabanınızda yaşar, asla bulutta değil

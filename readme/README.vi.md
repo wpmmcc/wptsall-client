@@ -6,6 +6,13 @@
 
 WPTSALL Client là client đi kèm của plugin WordPress WPMMCC ATS. Nó chạy trên máy của bạn — dưới dạng giao diện web cục bộ hoặc ứng dụng desktop gốc — lưu mọi cấu hình trong cơ sở dữ liệu cục bộ, kết nối trực tiếp tới WordPress của bạn bằng token thiết bị, và điều khiển bất kỳ nhà cung cấp dịch HTTP(S) nào bạn cấu hình. Không tài khoản, không giấy phép, không phụ thuộc cloud.
 
+## Links
+- Project website — https://www.wpmm.cc/
+- Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
+- WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
+- Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
+- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+
 ## Tính năng
 - Hai sản phẩm, một lõi — WebUI cục bộ tại 127.0.0.1:8977 và ứng dụng desktop gốc (Tauri) dùng chung lõi Rust
 - Local-first — site, nhà cung cấp, thành phần và quy tắc nằm trong CSDL cục bộ, không bao giờ trên cloud

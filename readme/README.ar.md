@@ -6,6 +6,13 @@
 
 WPTSALL Client هو العميل المرافق لإضافة WPMMCC ATS لووردبريس. يعمل على جهازك — بواجهة ويب محلية أو تطبيق سطح مكتب أصلي — ويحفظ كل الإعدادات في قاعدة بيانات محلية، ويتصل مباشرة بووردبريس الخاص بك برمز جهاز، ويشغّل أي مزوّد ترجمة HTTP(S) تضبطه. دون حساب أو ترخيص أو اعتماد على السحابة.
 
+## Links
+- Project website — https://www.wpmm.cc/
+- Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
+- WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
+- Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
+- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+
 ## الميزات
 - منتجان ونواة واحدة — واجهة ويب محلية على 127.0.0.1:8977 وتطبيق سطح مكتب أصلي (Tauri) يتشاركان نواة Rust نفسها
 - محلي أولاً — المواقع والمزوّدون والمكونات والقواعد تبقى في قاعدتك المحلية، لا في السحابة أبدًا

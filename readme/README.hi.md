@@ -6,6 +6,13 @@
 
 WPTSALL Client, WPMMCC ATS WordPress प्लगइन का साथी क्लाइंट है। यह आपकी मशीन पर चलता है — स्थानीय वेब UI या नेटिव डेस्कटॉप ऐप के रूप में — हर सेटिंग स्थानीय डेटाबेस में रखता है, डिवाइस टोकन से आपके WordPress से सीधे जुड़ता है, और आपके विन्यस्त किसी भी HTTP(S) अनुवाद प्रोवाइडर को चलाता है। बिना खाते, बिना लाइसेंस, बिना क्लाउड निर्भरता।
 
+## Links
+- Project website — https://www.wpmm.cc/
+- Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
+- WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
+- Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
+- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+
 ## विशेषताएँ
 - दो उत्पाद, एक कोर — स्थानीय WebUI (127.0.0.1:8977) और नेटिव Desktop ऐप (Tauri) एक ही Rust कोर साझा करते हैं
 - स्थानीय-प्रथम — साइट, प्रोवाइडर, कंपोनेंट और नियम आपके स्थानीय डेटाबेस में रहते हैं, कभी क्लाउड में नहीं

@@ -6,6 +6,13 @@
 
 WPTSALL Client 是 WPMMCC ATS WordPress 外掛的配套用戶端。它運行在你的機器上——可以是本地 WebUI,也可以是原生桌面應用——所有設定保存在本地資料庫,使用裝置級權杖直連你自己的 WordPress,並驅動你設定的任意 HTTP(S) 翻譯廠商。無需帳號、無需授權、不依賴雲端。
 
+## 相關連結
+- 專案官網 — https://www.wpmm.cc/
+- 文件與使用說明(English / 簡體中文)— https://www.wpmm.cc/docs/
+- WPMMCC ATS 外掛(WordPress.org)— https://wordpress.org/plugins/wpmmcc-ats/
+- 外掛原始碼儲存庫 — https://github.com/wpmmcc/wpmmcc-ats
+- 已簽署 kit 與安裝器 — https://github.com/wpmmcc/wptsall-client-releases
+
 ## 功能
 - 雙產品同核心——本地 WebUI(127.0.0.1:8977)與原生 Desktop 應用(Tauri)共享同一 Rust 核心
 - 本地優先——站台、廠商、元件、規則都保存在本地資料庫,絕不上雲
