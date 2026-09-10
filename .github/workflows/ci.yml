@@ -87,11 +87,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Tauri v2 Linux build dependencies
         run: |
-          # Runner images ship a google-chrome apt source whose dl.google.com
-          # index intermittently hash-mismatches; nothing installed here needs
-          # it, so drop the list before update to keep apt deterministic.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome*.list
-          sudo apt-get update
+          # The runner image's google-chrome apt source (any file format,
+          # list or deb822) intermittently hash-mismatches on dl.google.com
+          # and kills apt-get update; nothing installed here needs it.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* || true
+          sudo sed -i '/dl\.google\.com/d' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update || true
           sudo apt-get install -y --no-install-recommends \
             libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
             librsvg2-dev libayatana-appindicator3-dev libssl-dev
