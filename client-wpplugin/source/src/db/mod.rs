@@ -209,6 +209,14 @@ mod tests {
             let p = path_str.clone();
             handles.push(std::thread::spawn(move || {
                 let conn = open_db(&p).expect("per-thread open_db (DDL + WAL)");
+                // Saturated CI runners can blow past rusqlite's default 5s
+                // busy_timeout under bursty IO (observed: DatabaseBusy on the
+                // v2.1.3 tag run). This test proves WAL integrity — every
+                // write lands — not that 5s specifically always suffices;
+                // the default itself is pinned by
+                // open_db_busy_timeout_default_provides_bounded_wait.
+                conn.busy_timeout(std::time::Duration::from_secs(30))
+                    .expect("raise test busy_timeout");
                 for i in 0..INSERTS {
                     conn.execute(
                         "INSERT INTO concurrent_probe (thread_id, seq) VALUES (?1, ?2)",
