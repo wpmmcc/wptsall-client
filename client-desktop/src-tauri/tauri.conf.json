@@ -19,7 +19,11 @@
         "minWidth": 900,
         "minHeight": 600,
         "center": true,
-        "visible": true
+        "visible": true,
+        "resizable": true,
+        "minimizable": true,
+        "maximizable": true,
+        "decorations": true
       }
     ],
     "trayIcon": {

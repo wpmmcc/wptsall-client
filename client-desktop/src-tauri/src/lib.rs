@@ -25,6 +25,16 @@ pub fn run() {
         // window-state plugin; state file lives in the app data dir).
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
+            // Pin the brand icon for taskbars/status areas.
+            //
+            // Bundled installs get the icon via the .desktop entry + hicolor
+            // theme. Unbundled / `cargo run` launches have no desktop file, so
+            // taskbars fall back to the window icon — and on Linux Tauri's
+            // `set_icon` path (tao → gtk_window_set_icon) does not reliably
+            // populate `_NET_WM_ICON`, so set it on the GTK window directly.
+            // Windows/macOS taskbars use the exe/bundle icon resource instead.
+            pin_window_icon(app);
+
             // Phase 5: security bootstrap for desktop client.
             // Only an explicit true value skips security; `WPTSALL_SKIP_SECURITY=0`
             // must keep the production verification gate active.
@@ -117,4 +127,54 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running application");
+}
+
+/// Pin the brand icon on the main window so taskbars/status areas show it
+/// even when the app runs unbundled (no .desktop entry → the window icon is
+/// the fallback). Covers two paths:
+/// - Tauri `set_icon` (Windows runtime window icon; Linux path goes through
+///   tao's GTK wrapper).
+/// - Direct GTK calls (same gtk 0.18 as tauri-runtime-wry): window icon +
+///   GdkWindow icon list, applied on realize when needed.
+/// Verified caveat (GNOME Wayland + XWayland, GTK 3.24, 2026-09-11): none of
+/// the GTK paths populate `_NET_WM_ICON` there, so unbundled runs still show
+/// a generic taskbar icon on GNOME — see examples/icon_probe.rs. Bundled
+/// installs are unaffected: the Tauri bundler ships the .desktop entry and
+/// hicolor icons, which is what GNOME/KDE taskbars actually read.
+fn pin_window_icon(app: &tauri::App) {
+    let Some(main) = app.get_webview_window("main") else {
+        return;
+    };
+    match tauri::image::Image::from_bytes(include_bytes!("../icons/128x128.png")) {
+        Ok(icon) => {
+            if let Err(e) = main.set_icon(icon) {
+                tracing::warn!("main window icon: {e:#}");
+            }
+        }
+        Err(e) => tracing::warn!("main window icon decode: {e:#}"),
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::gdk_pixbuf::Pixbuf;
+        use gtk::prelude::{GtkWindowExt, WidgetExt};
+
+        let png: &[u8] = include_bytes!("../icons/128x128.png");
+        let (Ok(gtk_window), Ok(pixbuf)) = (main.gtk_window(), Pixbuf::from_read(png)) else {
+            tracing::warn!("brand icon: gtk window or pixbuf unavailable");
+            return;
+        };
+        gtk_window.set_icon(Some(&pixbuf));
+        match gtk_window.window() {
+            Some(gdk_window) => gdk_window.set_icon_list(&[pixbuf]),
+            None => {
+                gtk_window.connect_realize(move |w| {
+                    if let Some(gdk_window) = w.window() {
+                        let pixbuf = pixbuf.clone();
+                        gdk_window.set_icon_list(&[pixbuf]);
+                    }
+                });
+            }
+        }
+    }
 }

@@ -1111,6 +1111,22 @@
     }
   }
 
+  // The embedded agent starts asynchronously with the window; the first
+  // boot load can race it even with the proxy-side connect retries. Retry
+  // the initial load briefly so the user sees the app booting (loading
+  // state) instead of a red "service unavailable" banner that sticks until
+  // a manual refresh.
+  async function bootLoadAll() {
+    const maxAttempts = 5;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await loadAll();
+      if (!globalError) return;
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+    }
+  }
+
   async function navigateTo(pageId: string) {
     currentPage = pageId;
     if (pageId === 'credentials') {
@@ -1388,7 +1404,7 @@
 
   onMount(() => {
     initializeI18n();
-    void loadAll();
+    void bootLoadAll();
     void loadProviderCatalog();
   });
 </script>

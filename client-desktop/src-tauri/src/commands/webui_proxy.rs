@@ -64,11 +64,45 @@ pub(super) async fn request_json(
     if let Some(body) = body {
         request = request.json(&body);
     }
+    let built = request
+        .build()
+        .map_err(|err| format!("desktop agent request build at {url}: {err:#}"))?;
 
-    let response = request
-        .send()
-        .await
-        .map_err(|err| format!("desktop agent unavailable at {url}: {err:#}"))?;
+    // The embedded agent starts asynchronously while the window renders
+    // immediately, so the very first commands can race the listener. Retry
+    // briefly on connect-stage failures (agent not listening YET) before
+    // reporting "desktop agent unavailable" — this keeps the boot sequence
+    // green without hiding genuinely-down agents (non-connect errors and
+    // the final attempt still surface immediately).
+    let connect_retries = if path == "/api/worker/run-once" { 0 } else { 5 };
+    let mut response = None;
+    let mut last_err: Option<reqwest::Error> = None;
+    for attempt in 0..=connect_retries {
+        let exec = built
+            .try_clone()
+            .ok_or_else(|| format!("desktop agent request body not replayable at {url}"))?;
+        match client.execute(exec).await {
+            Ok(r) => {
+                response = Some(r);
+                break;
+            }
+            Err(err) => {
+                let is_connect = err.is_connect();
+                last_err = Some(err);
+                if !is_connect || attempt == connect_retries {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    }
+    let response = match response {
+        Some(r) => r,
+        None => {
+            let err = last_err.expect("send failed without an error");
+            return Err(format!("desktop agent unavailable at {url}: {err:#}"));
+        }
+    };
     let status = response.status();
     let payload = response
         .json::<Value>()

@@ -8471,6 +8471,7 @@ dependencies = [
  "anyhow",
  "client-runtime-core",
  "directories",
+ "gtk",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
