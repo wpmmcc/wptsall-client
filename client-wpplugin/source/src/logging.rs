@@ -88,9 +88,39 @@ pub(crate) fn unix_ts() -> u64 {
         .unwrap_or(0)
 }
 
+/// Millisecond-resolution epoch (audit 3.3: seconds-only ts could not order
+/// near-simultaneous events). Emitted alongside the seconds `ts` field so
+/// existing readers keep working.
+pub(crate) fn unix_ts_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[allow(dead_code)]
 pub(crate) fn elapsed_ms(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Metadata header line for a fresh log file (audit 3.3 / matrix P2: log
+/// excerpts must self-identify version/os/arch without server access).
+/// Emitted as a regular JSON line with event `log_file_header` so every
+/// existing JSON-lines consumer renders it without special casing.
+fn log_file_header_line() -> String {
+    let entry = json!({
+        "ts": unix_ts(),
+        "ts_ms": unix_ts_ms(),
+        "level": "info",
+        "event": "log_file_header",
+        "detail": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "pid": std::process::id(),
+        }
+    });
+    format!("{}\n", entry)
 }
 
 /// Open (or reopen) the log file and store a buffered writer in the global slot.
@@ -101,13 +131,24 @@ fn open_log_writer(log_file: &str) -> anyhow::Result<()> {
         .open(log_file)
         .with_context(|| format!("open log file failed: {}", log_file))?;
     let file_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let writer = BufWriter::new(file);
+    let mut writer = BufWriter::new(file);
+    // Fresh file (first init or right after rotation): lead with the metadata
+    // header. Written directly so it bypasses level gating; it is metadata,
+    // not a loggable event.
+    let mut header_bytes = 0u64;
+    if file_bytes == 0 {
+        let header = log_file_header_line();
+        header_bytes = header.len() as u64;
+        // Best-effort: a failed header write must not block ordinary logging.
+        let _ = writer.write_all(header.as_bytes());
+        let _ = writer.flush();
+    }
     let mut guard = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(LogWriter {
         writer,
         path: log_file.to_string(),
         pending_bytes: 0,
-        file_bytes,
+        file_bytes: file_bytes + header_bytes,
     });
     Ok(())
 }
@@ -138,10 +179,16 @@ fn rotate_log(path: &str) -> anyhow::Result<()> {
     if Path::new(&oldest).exists() {
         let _ = fs::remove_file(&oldest);
     }
-    // Current → .1
+    // Current → .1. On Windows a viewer/AV tool holding the file open makes
+    // rename fail (sharing violation, os error 5) and rotation would then
+    // fail for the process lifetime; fall back to copy+truncate so size
+    // bounds still apply (audit 3.2, Windows rotation lock risk).
     let backup1 = format!("{}.1", path);
-    fs::rename(path, &backup1)
-        .with_context(|| format!("rotate log failed: {} → {}", path, backup1))?;
+    if fs::rename(path, &backup1).is_err() {
+        let _ = fs::copy(path, &backup1);
+        fs::File::create(path)
+            .with_context(|| format!("rotate log failed (truncate fallback): {}", path))?;
+    }
     Ok(())
 }
 
@@ -163,6 +210,7 @@ pub(crate) fn log_event(
     let detail = redact_value_for_log(detail);
     let entry = json!({
         "ts": unix_ts(),
+        "ts_ms": unix_ts_ms(),
         "level": level,
         "event": event,
         "detail": detail

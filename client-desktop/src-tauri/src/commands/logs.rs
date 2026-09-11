@@ -42,7 +42,9 @@ fn map_log_lines(data: &Value) -> Vec<LogEntry> {
 
 /// Map one parsed JSON log line to the frontend LogEntry shape.
 fn map_json_log_entry(entry: Value) -> LogEntry {
-    let timestamp = match entry.get("ts") {
+    // Prefer the millisecond field (audit 3.3): near-simultaneous events
+    // stay distinguishable; older lines only carry the seconds `ts`.
+    let timestamp = match entry.get("ts_ms").or_else(|| entry.get("ts")) {
         Some(serde_json::Value::Number(n)) => n.to_string(),
         Some(serde_json::Value::String(s)) => s.clone(),
         _ => String::new(),

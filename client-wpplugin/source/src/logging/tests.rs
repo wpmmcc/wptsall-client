@@ -495,3 +495,113 @@ fn log_event_persists_redacted_detail_only() {
     assert!(!content.contains("raw-key"), "raw key must never hit disk");
     assert!(!content.contains("k:key@"), "url userinfo must never hit disk");
 }
+
+// ---------------------------------------------------------------------------
+// Millisecond timestamps + file metadata header (audit 3.3, v2.1.4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unix_ts_ms_carries_millisecond_resolution() {
+    let secs = unix_ts();
+    let ms = unix_ts_ms();
+    assert!(ms >= secs * 1000, "ts_ms must be at least ts seconds in ms: {ms} vs {secs}");
+    assert!(ms < (secs + 5) * 1000, "ts_ms must stay in the same second window: {ms} vs {secs}");
+}
+
+#[test]
+fn log_event_entries_carry_ts_ms_alongside_ts() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("ts_ms.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "info");
+    log_event(&log_str, "info", "ts.field.check", serde_json::json!({})).expect("ok");
+    flush_log();
+
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    let entry_line = content
+        .lines()
+        .find(|l| l.contains("ts.field.check"))
+        .expect("event line present");
+    let entry: serde_json::Value = serde_json::from_str(entry_line).expect("line is JSON");
+    let ts = entry["ts"].as_u64().expect("ts is u64 seconds");
+    let ts_ms = entry["ts_ms"].as_u64().expect("ts_ms is u64 milliseconds");
+    assert!(ts_ms >= ts * 1000 && ts_ms < (ts + 2) * 1000, "ts_ms consistent with ts");
+}
+
+#[test]
+fn fresh_log_file_leads_with_metadata_header() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("header.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "info");
+    init_log_file(&log_str).expect("init");
+    flush_log();
+
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    let first_line = content.lines().next().expect("header line present");
+    let header: serde_json::Value =
+        serde_json::from_str(first_line).expect("header must be a JSON line");
+    assert_eq!(header["event"], "log_file_header");
+    assert_eq!(header["level"], "info");
+    assert_eq!(header["detail"]["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        header["detail"]["os"].as_str().is_some_and(|s| !s.is_empty()),
+        "os metadata present"
+    );
+    assert!(
+        header["detail"]["arch"].as_str().is_some_and(|s| !s.is_empty()),
+        "arch metadata present"
+    );
+    assert!(header["detail"]["pid"].as_u64().is_some(), "pid metadata present");
+}
+
+#[test]
+fn header_is_not_duplicated_on_reopen() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("header_once.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "info");
+    init_log_file(&log_str).expect("init 1");
+    init_log_file(&log_str).expect("init 2 (reopen)");
+    flush_log();
+
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    let headers = content
+        .lines()
+        .filter(|l| l.contains("log_file_header"))
+        .count();
+    assert_eq!(headers, 1, "reopen on a non-empty file must not write another header");
+}
+
+#[test]
+fn rotate_log_falls_back_to_truncate_when_rename_is_blocked() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("rotate_blocked.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    // Synthetic fixture content; no real credentials.
+    std::fs::write(&log_path, "content-content-content\n").expect("seed log");
+
+    // Block the current→.1 rename the way Windows viewers/AV do. The chain
+    // shift must be unable to clear the .1 slot first:
+    //   .1 = dir   → final rename(file → dir) fails with EISDIR/ENOTDIR
+    //   .2 = file  → i=1 rename(dir .1 → file .2) fails, .1 stays pinned
+    //   .3 = dir   → i=2 rename(file .2 → dir .3) fails, .2 stays pinned
+    std::fs::create_dir(format!("{}.1", log_str)).expect("dir at .1");
+    std::fs::write(format!("{}.2", log_str), "pin").expect("file pin at .2");
+    std::fs::create_dir(format!("{}.3", log_str)).expect("dir pin at .3");
+
+    // Must not error even though the rename path is blocked: the
+    // copy+truncate fallback keeps size bounds enforceable.
+    rotate_log(&log_str).expect("rotate falls back instead of failing");
+
+    let truncated_len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(1);
+    assert_eq!(truncated_len, 0, "fallback must truncate the live file");
+
+    let _ = std::fs::remove_dir(format!("{}.1", log_str));
+    let _ = std::fs::remove_file(format!("{}.2", log_str));
+    let _ = std::fs::remove_dir(format!("{}.3", log_str));
+}
