@@ -26,6 +26,11 @@ WPTSALL Client 是 WPMMCC ATS WordPress 插件的配套客户端。它运行在�
 - 插件签发的设备级令牌与路由密钥（route secret）
 - 一个翻译厂商端点（任意 HTTP(S) API）
 
+## 默认端口
+- WebUI 默认监听 127.0.0.1:8977 —— 仅本机回环，绝不暴露到网络
+- 8977 未被 IANA 注册，并避开常见服务与开发端口（3306、5432、6379、8080、9000、9200 等），冲突概率很低
+- 若端口已被占用，启动会报 bind web ui failed —— 设置 WPTSALL_WEB_UI_PORT 或 WPTSALL_WEB_UI_BIND 换用其他端口后重启服务
+
 ## 安装
 1. 从 https://github.com/wpmmcc/wptsall-client-releases 获取已签名 kit 或安装程序
 2. 或从源码构建：在 client-wpplugin/source 内执行 cargo build --release（WebUI 二进制），或在 client-desktop 内使用 Tauri 工具链（Desktop 应用）

@@ -26,6 +26,11 @@ WPTSALL Client là client đi kèm của plugin WordPress WPMMCC ATS. Nó chạy
 - Token thiết bị và route secret do plugin cấp
 - Một endpoint nhà cung cấp dịch (bất kỳ API HTTP(S) nào)
 
+## Cổng mặc định
+- WebUI mặc định lắng nghe trên 127.0.0.1:8977 — chỉ trên loopback cục bộ, không bao giờ mở ra mạng
+- Cổng 8977 chưa được IANA đăng ký và tránh các cổng dịch vụ/phát triển phổ biến (3306, 5432, 6379, 8080, 9000, 9200…), nên xung đột hiếm khi xảy ra
+- Nếu cổng đã bị chiếm, khởi động sẽ lỗi bind web ui failed — đặt WPTSALL_WEB_UI_PORT hoặc WPTSALL_WEB_UI_BIND sang cổng khác rồi khởi động lại dịch vụ
+
 ## Cài đặt
 1. Lấy kit có chữ ký hoặc trình cài đặt tại https://github.com/wpmmcc/wptsall-client-releases
 2. Hoặc build từ mã nguồn: cargo build --release trong client-wpplugin/source (binary WebUI), hoặc chuỗi công cụ Tauri trong client-desktop (ứng dụng desktop)

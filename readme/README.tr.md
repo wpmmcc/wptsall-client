@@ -26,6 +26,11 @@ WPTSALL Client, WPMMCC ATS WordPress eklentisinin companion istemcisidir. Makine
 - Eklentinin verdiği bir cihaz token'ı ve route secret
 - Bir çeviri sağlayıcı uç noktası (herhangi bir HTTP(S) API)
 
+## Varsayılan port
+- WebUI varsayılan olarak 127.0.0.1:8977 adresini dinler — yalnızca yerel geri döngü üzerinde, ağınızla asla paylaşılmaz
+- 8977, IANA'ya kayıtlı değildir ve yaygın servis/geliştirme portlarından (3306, 5432, 6379, 8080, 9000, 9200…) kaçınır; çakışmalar nadirdir
+- Port zaten kullanımdaysa başlatma bind web ui failed ile başarısız olur — WPTSALL_WEB_UI_PORT veya WPTSALL_WEB_UI_BIND ile başka bir port ayarlayıp servisi yeniden başlatın
+
 ## Kurulum
 1. https://github.com/wpmmcc/wptsall-client-releases adresinden imzalı kit ya da yükleyici alın
 2. Ya da kaynaktan derleyin: client-wpplugin/source içinde cargo build --release (WebUI ikili dosyası) veya client-desktop içinde Tauri araç zinciri (masaüstü uygulaması)

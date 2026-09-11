@@ -26,6 +26,11 @@ WPTSALL Client는 WPMMCC ATS WordPress 플러그인의 클라이언트입니다.
 - 플러그인이 발급한 기기 토큰과 route secret
 - 번역 제공자 엔드포인트(아무 HTTP(S) API)
 
+## 기본 포트
+- WebUI는 기본적으로 127.0.0.1:8977에서 수신합니다 —— 로컬 루프백 전용이며 네트워크에 노출되지 않습니다
+- 8977은 IANA에 등록되지 않았고 흔한 서비스·개발 포트(3306, 5432, 6379, 8080, 9000, 9200 등)도 피하므로 충돌 가능성이 낮습니다
+- 포트가 이미 사용 중이면 시작 시 bind web ui failed 오류가 발생합니다 —— WPTSALL_WEB_UI_PORT 또는 WPTSALL_WEB_UI_BIND로 다른 포트를 지정하고 서비스를 다시 시작하세요
+
 ## 설치
 1. https://github.com/wpmmcc/wptsall-client-releases 에서 서명된 kit 또는 설치 프로그램 받기
 2. 또는 소스에서 빌드: client-wpplugin/source에서 cargo build --release(WebUI 바이너리), client-desktop에서 Tauri 도구 체인(Desktop 앱)

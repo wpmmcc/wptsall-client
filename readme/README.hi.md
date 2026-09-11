@@ -26,6 +26,11 @@ WPTSALL Client, WPMMCC ATS WordPress प्लगइन का साथी क�
 - प्लगइन जारी किया डिवाइस टोकन और route secret
 - एक अनुवाद प्रोवाइडर एंडपॉइंट (कोई भी HTTP(S) API)
 
+## डिफ़ॉल्ट पोर्ट
+- WebUI डिफ़ॉल्ट रूप से 127.0.0.1:8977 पर सुनती है —— केवल लोकल लूपबैक पर, आपके नेटवर्क पर कभी खुली नहीं
+- 8977, IANA में पंजीकृत नहीं है और आम सेवा/डेवलपमेंट पोर्ट (3306, 5432, 6379, 8080, 9000, 9200…) से बचता है, इसलिए टकराव दुर्लभ हैं
+- यदि पोर्ट पहले से व्यस्त है, तो स्टार्टअप bind web ui failed के साथ विफल होता है —— WPTSALL_WEB_UI_PORT या WPTSALL_WEB_UI_BIND में दूसरा पोर्ट सेट करें और सेवा पुनः आरंभ करें
+
 ## स्थापना
 1. https://github.com/wpmmcc/wptsall-client-releases से हस्ताक्षरित kit या इंस्टॉलर लें
 2. या स्रोत से बिल्ड करें: client-wpplugin/source में cargo build --release (WebUI बाइनरी), या client-desktop में Tauri टूलचेन (Desktop ऐप)

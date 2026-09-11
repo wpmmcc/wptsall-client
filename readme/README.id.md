@@ -26,6 +26,11 @@ WPTSALL Client adalah klien pendamping plugin WordPress WPMMCC ATS. Ia berjalan 
 - Token perangkat dan route secret yang diterbitkan plugin
 - Endpoint penyedia terjemahan (API HTTP(S) apa pun)
 
+## Port bawaan
+- WebUI secara bawaan mendengarkan di 127.0.0.1:8977 — hanya pada loopback lokal, tidak pernah terbuka ke jaringan
+- 8977 tidak terdaftar di IANA dan menghindari port layanan/pengembangan umum (3306, 5432, 6379, 8080, 9000, 9200…), sehingga konflik jarang terjadi
+- Jika port sudah dipakai, startup gagal dengan bind web ui failed — atur WPTSALL_WEB_UI_PORT atau WPTSALL_WEB_UI_BIND ke port lain lalu mulai ulang layanan
+
 ## Instalasi
 1. Ambil kit bertanda tangan atau installer di https://github.com/wpmmcc/wptsall-client-releases
 2. Atau bangun dari sumber: cargo build --release di dalam client-wpplugin/source (biner WebUI), atau toolchain Tauri di dalam client-desktop (aplikasi desktop)

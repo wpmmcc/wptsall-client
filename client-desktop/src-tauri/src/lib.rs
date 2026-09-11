@@ -21,6 +21,9 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_notification::init())
+        // Persist window size/position across restarts (per the tauri
+        // window-state plugin; state file lives in the app data dir).
+        .plugin(tauri_plugin_window_state::Builder::default().build())
         .setup(|app| {
             // Phase 5: security bootstrap for desktop client.
             // Only an explicit true value skips security; `WPTSALL_SKIP_SECURITY=0`
