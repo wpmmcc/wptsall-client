@@ -66,7 +66,7 @@
       {#if testFileModal.result}
         <div class="mt-4 p-3 bg-green-50 border border-green-200 rounded-lg">
           <div class="text-xs font-medium text-green-700 mb-2">
-            {$_('file_test.success')}（{testFileModal.result.elapsed_ms}ms）
+            {$_('file_test.success', { values: { elapsed_ms: testFileModal.result.elapsed_ms } })}
           </div>
           {#if testFileModal.result.translated_ref}
             <div class="text-xs text-green-600 mb-1">

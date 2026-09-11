@@ -623,7 +623,7 @@
 {#if $status?.domains?.length}
   <div class="bg-white border border-gray-200 rounded-xl overflow-hidden">
     <div class="px-5 py-3 border-b border-gray-100">
-      <h3 class="font-medium text-gray-900 text-sm">{$_('overview.authorized_domains')}（{$status.domains.length}）</h3>
+      <h3 class="font-medium text-gray-900 text-sm">{$_('overview.authorized_domains', { values: { count: $status.domains.length } })}</h3>
     </div>
     <table class="w-full text-sm">
       <thead>

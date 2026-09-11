@@ -4,23 +4,50 @@ import zhCN from './locales/zh-CN.json';
 import sharedEn from '../../../locales/en.json';
 import sharedZhCN from '../../../locales/zh-CN.json';
 
-function unflatten(input: Record<string, string>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
+/** Structural match for svelte-i18n's LocaleDictionary (not exported by the package). */
+interface LocaleDict {
+  [key: string]: string | LocaleDict | (string | LocaleDict)[] | null;
+}
+
+function unflatten(input: Record<string, string>): LocaleDict {
+  const out: LocaleDict = {};
   for (const [key, value] of Object.entries(input)) {
     const parts = key.split('.');
-    let cur: Record<string, unknown> = out;
+    let cur: LocaleDict = out;
     for (let i = 0; i < parts.length - 1; i++) {
       const p = parts[i];
       if (typeof cur[p] !== 'object' || cur[p] === null) cur[p] = {};
-      cur = cur[p] as Record<string, unknown>;
+      cur = cur[p] as LocaleDict;
     }
     cur[parts[parts.length - 1]] = value;
   }
   return out;
 }
 
-const enDict = { ...unflatten(sharedEn as Record<string, string>), ...en };
-const zhCNDict = { ...unflatten(sharedZhCN as Record<string, string>), ...zhCN };
+function isPlainDict(value: unknown): value is LocaleDict {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Deep-merge page dictionaries over the shared dictionary. A shallow spread
+ * would replace whole top-level sections (e.g. `components`), wiping
+ * shared-only keys inside them and leaving raw i18n keys in the UI.
+ */
+function deepMerge(base: LocaleDict, override: LocaleDict): LocaleDict {
+  const out: LocaleDict = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    const baseValue = out[key];
+    if (isPlainDict(baseValue) && isPlainDict(value)) {
+      out[key] = deepMerge(baseValue, value);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+const enDict = deepMerge(unflatten(sharedEn as Record<string, string>), en as unknown as LocaleDict);
+const zhCNDict = deepMerge(unflatten(sharedZhCN as Record<string, string>), zhCN as unknown as LocaleDict);
 
 // Debug: store the dicts so we can inspect them from playwright
 if (typeof window !== 'undefined') {
