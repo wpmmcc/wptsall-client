@@ -1,4 +1,5 @@
 use std::env;
+use std::path::PathBuf;
 
 pub(crate) const DEFAULT_LOG_FILE: &str = "./logs/wptsall-client.log";
 pub(crate) const DEFAULT_COMPONENT_BINDINGS_FILE: &str = "./config/component-bindings.json";
@@ -93,10 +94,133 @@ pub(crate) fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Persistent-state path resolution (BUG-RT-01 remediation, v2.1.3)
+// ---------------------------------------------------------------------------
+// The DEFAULT_* paths above are CWD-relative ("./runtime", "./logs",
+// "./config"). That is correct for source-tree/dev runs but broken for GUI
+// launches (macOS Finder/Launchpad starts apps with CWD "/", a read-only
+// volume; Windows shortcuts without a start-in folder may start in
+// System32) and scattered for service installs (systemd user units default
+// to CWD $HOME, so the WebUI service littered ~/runtime, ~/logs, ~/config).
+//
+// Fix: service installers and the Desktop shell set WPTSALL_DATA_DIR; every
+// persistent default below then resolves under it, keeping the legacy
+// sub-layout (runtime/, logs/, config/) intact. Priority per key:
+//   1. explicit per-key env override (tests, e2e slots, power users)
+//   2. WPTSALL_DATA_DIR subpath (service / desktop installs)
+//   3. legacy CWD-relative default (dev terminal runs, unchanged)
+
+/// Base directory for persistent state, when configured.
+pub(crate) fn data_dir() -> Option<PathBuf> {
+    match env::var("WPTSALL_DATA_DIR") {
+        Ok(value) if !value.trim().is_empty() => Some(PathBuf::from(value.trim())),
+        _ => None,
+    }
+}
+
+/// Resolve one persistent path with the documented priority order.
+pub(crate) fn resolve_data_path(env_key: &str, data_subpath: &str, legacy_default: &str) -> String {
+    if let Ok(value) = env::var(env_key) {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Some(dir) = data_dir() {
+        return dir.join(data_subpath).to_string_lossy().into_owned();
+    }
+    legacy_default.to_string()
+}
+
+pub(crate) fn db_path() -> String {
+    resolve_data_path("WPTSALL_DB_PATH", "runtime/wptsall.db", "./runtime/wptsall.db")
+}
+
+pub(crate) fn log_file_path() -> String {
+    resolve_data_path("WPTSALL_LOG_FILE", "logs/wptsall-client.log", DEFAULT_LOG_FILE)
+}
+
+pub(crate) fn component_bindings_file() -> String {
+    resolve_data_path(
+        "WPTSALL_COMPONENT_BINDINGS_FILE",
+        "config/component-bindings.json",
+        DEFAULT_COMPONENT_BINDINGS_FILE,
+    )
+}
+
+pub(crate) fn domain_token_bindings_file() -> String {
+    resolve_data_path(
+        "WPTSALL_DOMAIN_TOKEN_BINDINGS_FILE",
+        "config/domain-token-bindings.json",
+        DEFAULT_DOMAIN_TOKEN_BINDINGS_FILE,
+    )
+}
+
+pub(crate) fn task_type_component_bindings_file() -> String {
+    resolve_data_path(
+        "WPTSALL_TASK_TYPE_COMPONENT_BINDINGS_FILE",
+        "config/task-type-component-bindings.json",
+        DEFAULT_TASK_TYPE_COMPONENT_BINDINGS_FILE,
+    )
+}
+
+pub(crate) fn rule_component_bindings_file() -> String {
+    resolve_data_path(
+        "WPTSALL_RULE_COMPONENT_BINDINGS_FILE",
+        "config/rule-component-bindings.json",
+        DEFAULT_RULE_COMPONENT_BINDINGS_FILE,
+    )
+}
+
+pub(crate) fn vendor_keys_file() -> String {
+    resolve_data_path(
+        "WPTSALL_VENDOR_KEYS_FILE",
+        "config/vendor-keys.json",
+        DEFAULT_VENDOR_KEYS_FILE,
+    )
+}
+
+pub(crate) fn vendor_oauth_file() -> String {
+    resolve_data_path(
+        "WPTSALL_VENDOR_OAUTH_FILE",
+        "config/vendor-oauth.json",
+        DEFAULT_VENDOR_OAUTH_FILE,
+    )
+}
+
+pub(crate) fn proxy_profiles_file() -> String {
+    resolve_data_path(
+        "WPTSALL_PROXY_PROFILES_FILE",
+        "config/proxy-profiles.json",
+        DEFAULT_PROXY_PROFILES_FILE,
+    )
+}
+
+pub(crate) fn components_local_file() -> String {
+    resolve_data_path(
+        "WPTSALL_COMPONENTS_LOCAL_FILE",
+        "config/components.json",
+        DEFAULT_COMPONENTS_LOCAL_FILE,
+    )
+}
+
+pub(crate) fn provider_catalog_file() -> String {
+    resolve_data_path(
+        "WPTSALL_PROVIDER_CATALOG_FILE",
+        "config/provider-catalog.json",
+        DEFAULT_PROVIDER_CATALOG_FILE,
+    )
+}
+
 /// Session-token compatibility file. E2E slots override this path so OAuth
 /// state cannot leak through the shared client source working directory.
 pub(crate) fn session_token_file() -> String {
-    env_or("WPTSALL_SESSION_TOKEN_FILE", DEFAULT_SESSION_TOKEN_FILE)
+    resolve_data_path(
+        "WPTSALL_SESSION_TOKEN_FILE",
+        "runtime/session-token.enc",
+        DEFAULT_SESSION_TOKEN_FILE,
+    )
 }
 
 pub(crate) fn env_u64(key: &str, default: u64) -> u64 {
@@ -179,9 +303,62 @@ mod tests {
 
     #[test]
     fn env_u64_returns_default_when_unset() {
-        let key = "WPTSALL_TEST_U64_NONEXISTENT_KEY_12345";
+        let key = "**************************************";
         env::remove_var(key);
         assert_eq!(env_u64(key, 42), 42);
+    }
+
+    /// Path resolution shares process-global env vars with other tests, so
+    /// hold the shared test-env lock for the whole test and restore values.
+    #[test]
+    fn resolve_data_path_priority_env_then_data_dir_then_legacy() {
+        let lock = crate::db::test_env_lock();
+        let _lock_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        const DATA_DIR_KEY: &str = "WPTSALL_DATA_DIR";
+        const DB_KEY: &str = "WPTSALL_DB_PATH";
+
+        struct RestoreEnv(&'static str, Option<String>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.1.as_deref() {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
+            }
+        }
+        let _data_restore = RestoreEnv(DATA_DIR_KEY, std::env::var(DATA_DIR_KEY).ok());
+        let _db_restore = RestoreEnv(DB_KEY, std::env::var(DB_KEY).ok());
+
+        // 1. Legacy: nothing set → CWD-relative default (dev behavior unchanged).
+        std::env::remove_var(DATA_DIR_KEY);
+        std::env::remove_var(DB_KEY);
+        assert_eq!(db_path(), "./runtime/wptsall.db");
+
+        // 2. Data dir set, no explicit override → subpath under data dir
+        //    (service/desktop installs; BUG-RT-01 remediation).
+        let tmp = std::env::temp_dir()
+            .join(format!("wptsall-test-datadir-{}", std::process::id()));
+        std::env::set_var(DATA_DIR_KEY, tmp.to_string_lossy().to_string());
+        assert_eq!(
+            db_path(),
+            tmp.join("runtime/wptsall.db").to_string_lossy().to_string()
+        );
+        assert_eq!(
+            log_file_path(),
+            tmp.join("logs/wptsall-client.log").to_string_lossy().to_string()
+        );
+
+        // 3. Explicit per-key env wins over data dir (tests, e2e slots).
+        std::env::set_var(DB_KEY, "/tmp/explicit-wptsall.db");
+        assert_eq!(db_path(), "/tmp/explicit-wptsall.db");
+
+        // 4. Blank values are treated as unset, not as an override.
+        std::env::set_var(DB_KEY, "   ");
+        assert_eq!(
+            db_path(),
+            tmp.join("runtime/wptsall.db").to_string_lossy().to_string()
+        );
     }
 
     #[test]

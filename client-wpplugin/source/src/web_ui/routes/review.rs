@@ -587,7 +587,7 @@ pub(super) async fn handle_item_retranslate(
         state,
         &selected_component_id,
         item.editable_overrides.as_ref(),
-        &crate::config::env_or("WPTSALL_LOG_FILE", crate::config::DEFAULT_LOG_FILE),
+        &crate::config::log_file_path(),
     )
     .await
     {
@@ -743,7 +743,7 @@ pub(super) async fn handle_item_retranslate(
         Some(&task_type_bindings),
         Some(&rule_bindings),
         &worker_config,
-        &crate::config::env_or("WPTSALL_LOG_FILE", crate::config::DEFAULT_LOG_FILE),
+        &crate::config::log_file_path(),
     )
     .await;
 
@@ -779,7 +779,7 @@ pub(super) async fn handle_item_retranslate(
         &idempotency_key,
         Some(route_secret.as_str()),
         &translated_path,
-        &crate::config::env_or("WPTSALL_LOG_FILE", crate::config::DEFAULT_LOG_FILE),
+        &crate::config::log_file_path(),
     )
     .await
     {
@@ -1093,7 +1093,7 @@ pub(super) async fn handle_item_resubmit(
         guard.device_id.clone()
     };
     let worker_config = crate::worker::build_worker_config(&device_id);
-    let log_file = crate::config::env_or("WPTSALL_LOG_FILE", crate::config::DEFAULT_LOG_FILE);
+    let log_file = crate::config::log_file_path();
     let callback_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
 
     let sync_result = sync_item_to_wp_for_review(
@@ -1266,7 +1266,7 @@ pub(super) async fn handle_item_approve(
         guard.device_id.clone()
     };
     let worker_config = crate::worker::build_worker_config(&device_id);
-    let log_file = crate::config::env_or("WPTSALL_LOG_FILE", crate::config::DEFAULT_LOG_FILE);
+    let log_file = crate::config::log_file_path();
     let callback_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
 
     let sync_result = sync_item_to_wp_for_review(
@@ -1356,7 +1356,7 @@ pub(super) async fn handle_items_batch_approve(
     };
 
     let worker_config = crate::worker::build_worker_config(&device_id);
-    let log_file = crate::config::env_or("WPTSALL_LOG_FILE", crate::config::DEFAULT_LOG_FILE);
+    let log_file = crate::config::log_file_path();
     let callback_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     let wp_client_token_fallback = crate::config::env_or("WPTSALL_WP_CLIENT_TOKEN", "");
 

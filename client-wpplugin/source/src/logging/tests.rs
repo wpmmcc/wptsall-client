@@ -400,3 +400,98 @@ fn error_level_flushes_immediately() {
         "error events should be flushed immediately"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Central log redaction (BUG-LOG-02, v2.1.3)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn redact_value_for_log_redacts_sensitive_keys_at_any_depth() {
+    let detail = serde_json::json!({
+        "component": "mock",
+        "nested": {
+            "api_key": "sk-live-123",
+            "meta": { "Authorization": "Bearer abc", "keep": "ok" }
+        },
+        "items": [
+            { "token": "t1", "name": "n1" },
+            { "name": "n2" }
+        ],
+        "count": 5
+    });
+
+    let redacted = redact_value_for_log(detail);
+
+    assert_eq!(redacted["nested"]["api_key"], "[REDACTED]");
+    assert_eq!(redacted["nested"]["meta"]["Authorization"], "[REDACTED]");
+    assert_eq!(redacted["nested"]["meta"]["keep"], "ok");
+    assert_eq!(redacted["items"][0]["token"], "[REDACTED]");
+    assert_eq!(redacted["items"][0]["name"], "n1");
+    assert_eq!(redacted["component"], "mock");
+    assert_eq!(redacted["count"], 5);
+
+    let rendered = redacted.to_string();
+    assert!(!rendered.contains("sk-live-123"), "raw api key must not survive");
+    assert!(!rendered.contains("Bearer abc"), "raw bearer token must not survive");
+}
+
+#[test]
+fn redact_string_for_log_scrubs_bearer_and_url_userinfo() {
+    let header = "Authorization header: Bearer eyJhbGciOi.9301 sent; retry later";
+    let out = redact_string_for_log(header);
+    assert!(out.contains("Bearer [REDACTED]"), "bearer token redacted: {out}");
+    assert!(!out.contains("eyJhbGciOi.9301"));
+    assert!(out.contains("retry later"), "surrounding text kept: {out}");
+
+    let url = "fetch https://user:pass@example.com/path?token=abc&x=1 done";
+    let out = redact_string_for_log(url);
+    assert!(out.contains("https://[REDACTED]@example.com"), "userinfo redacted: {out}");
+    assert!(out.contains("token=[REDACTED]"), "query token redacted: {out}");
+    assert!(!out.contains("pass@"));
+    assert!(out.contains("&x=1"));
+    assert!(out.contains("done"));
+}
+
+#[test]
+fn redact_string_for_log_handles_quoted_values() {
+    let s = r#"config token="abc-secret" more"#;
+    let out = redact_string_for_log(s);
+    assert!(out.contains(r#"token="[REDACTED]""#), "quoted value redacted in place: {out}");
+    assert!(!out.contains("abc-secret"));
+    assert!(out.contains("more"));
+}
+
+#[test]
+fn redact_string_for_log_preserves_plain_and_multibyte_strings() {
+    for s in [
+        "task 12 finished",
+        "событие задача",
+        "a/b?c=d",
+        "no credentials here",
+    ] {
+        assert_eq!(redact_string_for_log(s), s);
+    }
+}
+
+#[test]
+fn log_event_persists_redacted_detail_only() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let log_path = dir.path().join("redact.log");
+    let log_str = log_path.to_string_lossy().to_string();
+
+    let (_lock, _state) = acquire_log_state(true, "info");
+    log_event(
+        &log_str,
+        "info",
+        "component.request",
+        serde_json::json!({ "url": "https://k:key@host/x", "api_key": "raw-key", "ok": 1 }),
+    )
+    .expect("ok");
+    // info-level events are buffered; flush before reading.
+    flush_log();
+
+    let content = std::fs::read_to_string(&log_path).expect("read log");
+    assert!(content.contains("[REDACTED]"), "redaction marker present: {content}");
+    assert!(!content.contains("raw-key"), "raw key must never hit disk");
+    assert!(!content.contains("k:key@"), "url userinfo must never hit disk");
+}

@@ -15,8 +15,7 @@ pub(crate) fn save_proxy_profiles_doc(conn: &Connection, doc: &ProxyProfilesDoc)
 }
 
 pub(crate) fn migrate_proxy_profiles_from_json(conn: &Connection) -> Result<()> {
-    let path = std::env::var("WPTSALL_PROXY_PROFILES_FILE")
-        .unwrap_or_else(|_| crate::config::DEFAULT_PROXY_PROFILES_FILE.to_string());
+    let path = crate::config::proxy_profiles_file();
     if std::path::Path::new(&path).exists() {
         let doc = crate::bindings::load_proxy_profiles(&path)?;
         save_proxy_profiles_doc(conn, &doc)?;

@@ -165,27 +165,15 @@ pub async fn run_web_ui(
     ensure_web_ui_storage_mode();
     let bind_addr_env = web_ui_effective_bind_addr();
     let worker_loop_poll_seconds = env_u64("WPTSALL_POLL_SECONDS", 20).max(1);
-    let log_file = env_or("WPTSALL_LOG_FILE", DEFAULT_LOG_FILE);
-    let component_bindings_path = env_or(
-        "WPTSALL_COMPONENT_BINDINGS_FILE",
-        "./config/component-bindings.json",
-    );
-    let domain_token_bindings_path = env_or(
-        "WPTSALL_DOMAIN_TOKEN_BINDINGS_FILE",
-        DEFAULT_DOMAIN_TOKEN_BINDINGS_FILE,
-    );
-    let task_type_component_bindings_path = env_or(
-        "WPTSALL_TASK_TYPE_COMPONENT_BINDINGS_FILE",
-        DEFAULT_TASK_TYPE_COMPONENT_BINDINGS_FILE,
-    );
-    let rule_component_bindings_path = env_or(
-        "WPTSALL_RULE_COMPONENT_BINDINGS_FILE",
-        DEFAULT_RULE_COMPONENT_BINDINGS_FILE,
-    );
+    let log_file = crate::config::log_file_path();
+    let component_bindings_path = crate::config::component_bindings_file();
+    let domain_token_bindings_path = crate::config::domain_token_bindings_file();
+    let task_type_component_bindings_path = crate::config::task_type_component_bindings_file();
+    let rule_component_bindings_path = crate::config::rule_component_bindings_file();
     init_log_file(&log_file)?;
 
     // Open SQLite database and run one-time JSON migration
-    let db_path = env_or("WPTSALL_DB_PATH", "./runtime/wptsall.db");
+    let db_path = crate::config::db_path();
     let db_conn = crate::db::open_db(&db_path).context("Failed to open SQLite database")?;
     crate::db::migrate_from_json_if_needed(&db_conn).ok();
 
@@ -494,10 +482,7 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
     let component_runtime_enabled = env_bool("WPTSALL_COMPONENT_RUNTIME", true);
     let component_id_override = env_or("WPTSALL_COMPONENT_ID", "");
     let component_prefer_ids = parse_csv_env("WPTSALL_COMPONENT_PREFER_IDS");
-    let component_bindings_path = env_or(
-        "WPTSALL_COMPONENT_BINDINGS_FILE",
-        "./config/component-bindings.json",
-    );
+    let component_bindings_path = crate::config::component_bindings_file();
     let mut worker_config = crate::worker::build_worker_config(&device_id);
     // Override review_mode from DB (Web UI toggle takes priority over env var)
     {
@@ -561,7 +546,7 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
             ));
         }
 
-        let db_path = env_or("WPTSALL_DB_PATH", "./runtime/wptsall.db");
+        let db_path = crate::config::db_path();
         let pending_callback_store = Arc::new(Mutex::new(PendingCallbackStore::open(&db_path)?));
 
         let signing_key_from_db = if use_server_control_plane {

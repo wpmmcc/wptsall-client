@@ -157,6 +157,10 @@ pub(crate) fn log_event(
     if level_to_u8(level) < LOG_MIN_LEVEL.load(Ordering::Relaxed) {
         return Ok(());
     }
+    // Central recursive redaction at the boundary (BUG-LOG-02): whatever a
+    // caller passes — nested objects, arrays, or free-form strings carrying
+    // bearer tokens / URL credentials — is sanitized before it can reach disk.
+    let detail = redact_value_for_log(detail);
     let entry = json!({
         "ts": unix_ts(),
         "level": level,
@@ -292,6 +296,137 @@ pub(crate) fn mask_email(email: &str) -> String {
     let first = &local[0..1];
     let last = &local[local.len() - 1..];
     format!("{}***{}@{}", first, last, domain)
+}
+
+// ---------------------------------------------------------------------------
+// Central log redaction (BUG-LOG-02, v2.1.3)
+// ---------------------------------------------------------------------------
+// Mirror of the WP plugin's wptsall_redact_log_value(): every value crossing
+// the log_event() boundary is sanitized here, so a caller that passes an
+// api_key/secret/token/authorization field — nested at any depth — can never
+// persist the raw credential to disk. Free-form strings additionally get
+// Bearer-token and URL-userinfo scrubbing.
+
+/// Key names (case-insensitive, substring match) whose values are replaced
+/// wholesale with `[REDACTED]`.
+fn is_sensitive_log_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k.contains("token")
+        || k.contains("secret")
+        || k.contains("password")
+        || k.contains("passwd")
+        || k.contains("api_key")
+        || k.contains("apikey")
+        || k.contains("credential")
+        || k.contains("authorization")
+        || k.contains("private_key")
+        || k.contains("bearer")
+}
+
+/// Recursively redact a JSON value destined for the log file.
+fn redact_value_for_log(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, val)| {
+                    if is_sensitive_log_key(&key) {
+                        (key, Value::String("[REDACTED]".to_string()))
+                    } else {
+                        (key, redact_value_for_log(val))
+                    }
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(redact_value_for_log).collect()),
+        Value::String(s) => Value::String(redact_string_for_log(&s)),
+        other => other,
+    }
+}
+
+/// Redact credential-shaped substrings inside free-form string values:
+/// `Bearer <token>` headers, `scheme://user:pass@host` URL userinfo, and
+/// `token=…`-style query/assignment fragments with sensitive keys.
+fn redact_string_for_log(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+
+    let bearer = "bearer ";
+    let needles: [&str; 8] = [
+        "token=", "secret=", "password=", "passwd=", "api_key=", "apikey=", "access_key=",
+        "authorization=",
+    ];
+
+    while i < bytes.len() {
+        let rest_lower = &lower[i..];
+
+        if rest_lower.starts_with(bearer) {
+            let after = bearer.len();
+            let span = credential_span(&input[i + after..], &['"', '\'', ',', ';']);
+            out.push_str("Bearer [REDACTED]");
+            i += after + span;
+            continue;
+        }
+
+        if rest_lower.starts_with("://") {
+            let after = 3;
+            let userinfo = &input[i + after..];
+            let at = userinfo.find('@');
+            let slash = userinfo.find('/');
+            if matches!(at, Some(a) if slash.map_or(true, |s| a < s)) {
+                let a = at.unwrap();
+                out.push_str("://[REDACTED]@");
+                i += after + a + 1;
+                continue;
+            }
+        }
+
+        if let Some(needle) = needles.iter().find(|n| rest_lower.starts_with(*n)) {
+            let after = needle.len();
+            // A value may be quoted (`token="abc"`, `token='abc'`): keep the
+            // quotes, redact between them.
+            let value_start = i + after;
+            let quote = if input[value_start..].starts_with('"') {
+                '"'
+            } else if input[value_start..].starts_with('\'') {
+                '\''
+            } else {
+                '\0'
+            };
+            let scan_from = if quote != '\0' { value_start + 1 } else { value_start };
+            let span = if quote != '\0' {
+                credential_span(&input[scan_from..], &[quote, '\n'])
+            } else {
+                credential_span(&input[scan_from..], &['"', '\'', '&', '}', ' ', '\n'])
+            };
+            out.push_str(&input[i..i + after]);
+            if quote != '\0' {
+                out.push(quote);
+            }
+            out.push_str("[REDACTED]");
+            let mut next = scan_from + span;
+            if quote != '\0' && input.as_bytes().get(next) == Some(&(quote as u8)) {
+                out.push(quote);
+                next += 1;
+            }
+            i = next;
+            continue;
+        }
+
+        // Copy one full UTF-8 character (scans below stay on char boundaries).
+        let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+        out.push_str(&input[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Length of the credential run starting at `s`, ending at any of the
+/// terminator characters (or end of input).
+fn credential_span(s: &str, terminators: &[char]) -> usize {
+    s.find(|c: char| terminators.contains(&c) || c.is_whitespace())
+        .unwrap_or(s.len())
 }
 
 #[cfg(test)]

@@ -142,10 +142,7 @@ fn decrypt_private_backup(data: &[u8], passphrase: Option<&str>) -> anyhow::Resu
 }
 
 fn provider_catalog_path() -> String {
-    crate::config::env_or(
-        "WPTSALL_PROVIDER_CATALOG_FILE",
-        crate::config::DEFAULT_PROVIDER_CATALOG_FILE,
-    )
+    crate::config::provider_catalog_file()
 }
 
 fn env_flag(name: &str) -> bool {

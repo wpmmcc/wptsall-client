@@ -5,7 +5,6 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::auth::{request_json, request_json_encrypted, UpstreamApiError};
-use crate::config::env_or;
 use crate::logging::{log_event, snippet, unix_ts};
 use crate::types::{ApiResponse, OAuthTokenData, WebUiRuntimeControl, WebUiState};
 use crate::web_ui::{fetch_components_for_session, fetch_domains_for_session};
@@ -130,7 +129,7 @@ pub(super) async fn handle_logout(
         }
     }
 
-    let db_path = env_or("WPTSALL_DB_PATH", "./runtime/wptsall.db");
+    let db_path = crate::config::db_path();
     crate::oauth::clear_cached_token_db(&db_path);
     let _ = std::fs::remove_file(crate::config::session_token_file());
 
@@ -361,7 +360,7 @@ pub(super) async fn handle_oauth_callback(
     };
 
     let session_token = token_resp.session_token.clone();
-    let db_path = env_or("WPTSALL_DB_PATH", "./runtime/wptsall.db");
+    let db_path = crate::config::db_path();
     crate::oauth::write_cached_token_db(&db_path, &session_token);
     {
         let mut guard = state.lock().await;

@@ -7,7 +7,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 fn with_runtime_conn<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    let db_path = crate::config::env_or("WPTSALL_DB_PATH", "./runtime/wptsall.db");
+    let db_path = crate::config::db_path();
     let conn = crate::db::open_db(&db_path)?;
     let _ = crate::db::migrate_from_json_if_needed(&conn);
     f(&conn)
@@ -122,8 +122,7 @@ pub(crate) fn save_runtime_rule_component_bindings_doc(
 
 // Migration: reads JSON files and imports to db (called once on first startup)
 pub(crate) fn migrate_component_bindings_from_json(conn: &Connection) -> Result<()> {
-    let path = std::env::var("WPTSALL_COMPONENT_BINDINGS_FILE")
-        .unwrap_or_else(|_| crate::config::DEFAULT_COMPONENT_BINDINGS_FILE.to_string());
+    let path = crate::config::component_bindings_file();
     if std::path::Path::new(&path).exists() {
         let doc = crate::bindings::load_component_bindings(&path)?;
         save_component_bindings_doc(conn, &doc)?;
@@ -132,8 +131,7 @@ pub(crate) fn migrate_component_bindings_from_json(conn: &Connection) -> Result<
 }
 
 pub(crate) fn migrate_domain_token_bindings_from_json(conn: &Connection) -> Result<()> {
-    let path = std::env::var("WPTSALL_DOMAIN_TOKEN_BINDINGS_FILE")
-        .unwrap_or_else(|_| crate::config::DEFAULT_DOMAIN_TOKEN_BINDINGS_FILE.to_string());
+    let path = crate::config::domain_token_bindings_file();
     if std::path::Path::new(&path).exists() {
         let doc = crate::bindings::load_domain_token_bindings(&path)?;
         save_domain_token_bindings_doc(conn, &doc)?;
@@ -142,8 +140,7 @@ pub(crate) fn migrate_domain_token_bindings_from_json(conn: &Connection) -> Resu
 }
 
 pub(crate) fn migrate_task_type_bindings_from_json(conn: &Connection) -> Result<()> {
-    let path = std::env::var("WPTSALL_TASK_TYPE_COMPONENT_BINDINGS_FILE")
-        .unwrap_or_else(|_| crate::config::DEFAULT_TASK_TYPE_COMPONENT_BINDINGS_FILE.to_string());
+    let path = crate::config::task_type_component_bindings_file();
     if std::path::Path::new(&path).exists() {
         let doc = crate::bindings::load_task_type_component_bindings(&path)?;
         save_task_type_component_bindings_doc(conn, &doc)?;
@@ -152,8 +149,7 @@ pub(crate) fn migrate_task_type_bindings_from_json(conn: &Connection) -> Result<
 }
 
 pub(crate) fn migrate_rule_bindings_from_json(conn: &Connection) -> Result<()> {
-    let path = std::env::var("WPTSALL_RULE_COMPONENT_BINDINGS_FILE")
-        .unwrap_or_else(|_| crate::config::DEFAULT_RULE_COMPONENT_BINDINGS_FILE.to_string());
+    let path = crate::config::rule_component_bindings_file();
     if std::path::Path::new(&path).exists() {
         let doc = crate::bindings::load_rule_component_bindings(&path)?;
         save_rule_component_bindings_doc(conn, &doc)?;

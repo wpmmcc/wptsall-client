@@ -161,10 +161,7 @@ pub(crate) async fn load_component_runtimes(
     // the existing file-based path is used as before.
     signing_key_override: Option<&str>,
 ) -> anyhow::Result<ComponentRuntimeRegistry> {
-    let components_local_path = crate::config::env_or(
-        "WPTSALL_COMPONENTS_LOCAL_FILE",
-        crate::config::DEFAULT_COMPONENTS_LOCAL_FILE,
-    );
+    let components_local_path = crate::config::components_local_file();
     let mut local_doc = load_local_components_runtime_doc(&components_local_path);
 
     let server_target_ids: Option<BTreeSet<String>> = target_component_ids.map(|ids| {

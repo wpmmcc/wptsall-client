@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 fn with_runtime_conn<T>(f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-    let db_path = crate::config::env_or("WPTSALL_DB_PATH", "./runtime/wptsall.db");
+    let db_path = crate::config::db_path();
     let conn = crate::db::open_db(&db_path)?;
     let _ = crate::db::migrate_from_json_if_needed(&conn);
     f(&conn)
@@ -30,8 +30,7 @@ pub(crate) fn save_runtime_local_components_doc(doc: &ComponentsLocalDoc) -> Res
 }
 
 pub(crate) fn migrate_local_components_from_json(conn: &Connection) -> Result<()> {
-    let path = std::env::var("WPTSALL_COMPONENTS_LOCAL_FILE")
-        .unwrap_or_else(|_| crate::config::DEFAULT_COMPONENTS_LOCAL_FILE.to_string());
+    let path = crate::config::components_local_file();
     if std::path::Path::new(&path).exists() {
         let doc = crate::bindings::load_components_local(&path)?;
         save_local_components_doc(conn, &doc)?;

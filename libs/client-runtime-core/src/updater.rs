@@ -110,40 +110,64 @@ fn ensure_replace_dir_writable(current_binary: &Path) -> Result<()> {
     }
 }
 
-/// Self-replace the running binary with platform-appropriate service management.
+/// Self-replace the running binary with platform-appropriate restart handling.
 ///
-/// Spawns a fire-and-forget helper process that:
-/// 1. Waits briefly for the current process to return the HTTP response
-/// 2. Stops the service (systemd / launchd / none on Windows)
-/// 3. Moves the new binary over the old one
-/// 4. Marks it executable (Unix only)
-/// 5. Starts the service again
+/// `is_desktop` selects the restart mode:
+/// - WebUI service (`false`): the binary runs under systemd (Linux) or
+///   launchd (macOS) as `service_name`, so the helper stops the service,
+///   swaps the binary, and starts the service again. On Windows the restarted
+///   process is launched hidden and inherits this process's environment
+///   (including `WPTSALL_WEB_UI=1`).
+/// - Desktop GUI (`true`): there is no service. After the swap the helper
+///   relaunches the binary directly — visible window on Windows, `open` on
+///   the .app bundle on macOS, detached `nohup` on Linux. `-WindowStyle
+///   Hidden` must NOT be used for a GUI app (BUG-UPD-02: invisible ghost).
+///
+/// Platform swap mechanics:
+/// - Unix: `mv -f` over the running binary is safe (the old inode stays
+///   mapped until exit).
+/// - Windows: a running .exe cannot be overwritten (ERROR_SHARING_VIOLATION,
+///   BUG-UPD-01) but it CAN be renamed. The helper renames the running exe to
+///   `<exe>.old`, moves the new one into place with a retry loop (AV scanners
+///   can hold files briefly), restarts, then deletes the `.old` copy. If the
+///   move keeps failing it rolls the old binary back. Output goes to
+///   `wptsall-update.log` next to the binary because the helper's
+///   stdout/stderr are discarded.
 ///
 /// The function returns immediately after spawning the helper — the HTTP
-/// handler should return 200 right away. Permission viability is checked
-/// BEFORE spawning (see [`ensure_replace_dir_writable`]) so an unwritable
-/// install directory fails closed instead of silently keeping the old binary.
+/// handler should return 200 right away (and exit the process; see the
+/// webui/desktop callers). Permission viability is checked BEFORE spawning
+/// (see [`ensure_replace_dir_writable`]) so an unwritable install directory
+/// fails closed instead of silently keeping the old binary.
 pub fn perform_self_replace(
     service_name: &str,
     current_binary: &Path,
     new_binary: &Path,
+    is_desktop: bool,
 ) -> Result<()> {
     ensure_replace_dir_writable(current_binary)?;
 
-    let cur = current_binary.display();
-    let new = new_binary.display();
-
     #[cfg(target_os = "linux")]
     {
-        // Rename-over a running ELF is OK (old inode stays mapped). systemd unit
-        // is optional — install-webui.sh creates `wptsall-client.service`.
+        // Rename-over a running ELF is OK (old inode stays mapped). The
+        // systemd unit is optional — install-webui.sh creates
+        // `wptsall-client.service`; the desktop has no unit, so stop/start
+        // are harmless no-ops there and the restart is a detached relaunch.
+        let cur = current_binary.display();
+        let new = new_binary.display();
+        let restart = if is_desktop {
+            format!("(nohup \"{cur}\" >/dev/null 2>&1 &) >/dev/null 2>&1")
+        } else {
+            format!("systemctl --user start {svc} >/dev/null 2>&1 || true", svc = service_name)
+        };
         let script = format!(
             "sleep 0.5; \
              systemctl --user stop {svc} >/dev/null 2>&1 || true; \
-             mv -f {new} {cur}; \
-             chmod +x {cur}; \
-             systemctl --user start {svc} >/dev/null 2>&1 || true",
+             mv -f \"{new}\" \"{cur}\"; \
+             chmod +x \"{cur}\"; \
+             {restart}",
             svc = service_name,
+            restart = restart,
         );
         std::process::Command::new("/usr/bin/env")
             .args(["sh", "-c", &script])
@@ -156,16 +180,42 @@ pub fn perform_self_replace(
 
     #[cfg(target_os = "macos")]
     {
-        // launchctl label matches the plist filename (without .plist).
-        // Step: stop agent → wait for process to exit → replace binary → start agent.
+        // launchctl label matches the plist filename (without .plist); only
+        // the WebUI install has one. The desktop restarts via `open` on the
+        // .app bundle (three levels up from the executable inside
+        // Contents/MacOS) when the binary actually lives in one, falling back
+        // to a detached relaunch for raw binaries. Note: replacing a binary
+        // inside a signed .app invalidates the bundle signature — distribute
+        // desktop updates through signed installers when that matters.
+        let cur = current_binary.display();
+        let new = new_binary.display();
+        let mut app_dir = current_binary.to_path_buf();
+        for _ in 0..3 {
+            app_dir.pop();
+        }
+        let app_bundle = app_dir.extension().map(|ext| ext == "app").unwrap_or(false)
+            && app_dir.is_dir();
+        let restart = if is_desktop {
+            if app_bundle {
+                format!("open \"{}\"", app_dir.display())
+            } else {
+                format!("(nohup \"{cur}\" >/dev/null 2>&1 &)")
+            }
+        } else {
+            format!(
+                "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{svc}.plist",
+                svc = service_name
+            )
+        };
         let script = format!(
             "sleep 0.5 && \
              launchctl bootout gui/$(id -u)/{svc} 2>/dev/null; \
              sleep 1 && \
-             mv -f {new} {cur} && \
-             chmod +x {cur} && \
-             launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{svc}.plist",
+             mv -f \"{new}\" \"{cur}\" && \
+             chmod +x \"{cur}\" && \
+             {restart}",
             svc = service_name,
+            restart = restart,
         );
         std::process::Command::new("/usr/bin/env")
             .args(["sh", "-c", &script])
@@ -178,19 +228,67 @@ pub fn perform_self_replace(
 
     #[cfg(target_os = "windows")]
     {
-        // Windows allows replacing a running .exe (unlike Unix where the file is
-        // locked by the kernel). We rename the old exe aside, move the new one in,
-        // then start a detached process that cleans up and restarts.
+        // A running .exe is locked for write/delete, but renaming it is
+        // allowed. The legacy script moved the new binary straight over the
+        // running exe and failed 100% of the time with ERROR_SHARING_VIOLATION
+        // (BUG-UPD-01). Sequence here: rename running exe aside → move the
+        // new one in (retry loop) → restart → delete the .old copy; rollback
+        // restores the old binary if the move keeps failing. Everything is
+        // logged to wptsall-update.log next to the binary because the
+        // helper's stdout/stderr are discarded.
         let cur_str = current_binary.to_string_lossy();
         let new_str = new_binary.to_string_lossy();
-        let old_name = format!("{}.old", cur_str);
+        let old_str = format!("{cur_str}.old");
+        let old_leaf = current_binary
+            .file_name()
+            .map(|leaf| format!("{}.old", leaf.to_string_lossy()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("current binary {} has no file name", current_binary.display())
+            })?;
+        let log_path = current_binary
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("wptsall-update.log")
+            .to_string_lossy()
+            .into_owned();
 
-        // PowerShell script: replace binary, then restart the service process.
+        // GUI restart must be visible (BUG-UPD-02); the WebUI service restart
+        // stays hidden and inherits this process's environment (which carries
+        // WPTSALL_WEB_UI=1 from the service/shortcut that started us).
+        let restart = if is_desktop {
+            format!("Start-Process -FilePath '{cur_str}'")
+        } else {
+            format!("Start-Process -FilePath '{cur_str}' -WindowStyle Hidden")
+        };
+
         let ps = format!(
-            "Start-Sleep -Milliseconds 500; \
-             Move-Item -Force '{old_name}' '{cur_str}' -ErrorAction SilentlyContinue; \
-             Move-Item -Force '{new_str}' '{cur_str}'; \
-             Start-Process -FilePath '{cur_str}' -WindowStyle Hidden",
+            "$ErrorActionPreference = 'Continue'; \
+             $log = '{log}'; \
+             try {{ \
+                 Start-Sleep -Milliseconds 500; \
+                 if (Test-Path -LiteralPath '{old_str}') {{ \
+                     Remove-Item -LiteralPath '{old_str}' -Force -ErrorAction SilentlyContinue; \
+                 }}; \
+                 Rename-Item -LiteralPath '{cur_str}' -NewName '{old_leaf}' -ErrorAction Stop; \
+                 $moved = $false; \
+                 for ($i = 0; $i -lt 10 -and -not $moved; $i++) {{ \
+                     try {{ \
+                         Move-Item -LiteralPath '{new_str}' -Destination '{cur_str}' -ErrorAction Stop; \
+                         $moved = $true; \
+                     }} catch {{ Start-Sleep -Milliseconds 500 }} \
+                 }}; \
+                 if (-not $moved) {{ throw 'move of new binary failed after retries' }}; \
+                 {restart}; \
+                 Start-Sleep -Seconds 2; \
+                 Remove-Item -LiteralPath '{old_str}' -Force -ErrorAction SilentlyContinue; \
+                 'self-replace ok' | Out-File -FilePath $log -Append; \
+             }} catch {{ \
+                 Move-Item -LiteralPath '{old_str}' -Destination '{cur_str}' -Force -ErrorAction SilentlyContinue; \
+                 ('self-replace failed: ' + ($_ | Out-String)) | Out-File -FilePath $log -Append; \
+                 {restart}; \
+             }}",
+            log = log_path,
+            restart = restart,
         );
         std::process::Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
@@ -203,7 +301,7 @@ pub fn perform_self_replace(
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
-        let _ = (service_name, cur, new);
+        let _ = (service_name, is_desktop);
         anyhow::bail!("self-replace is not supported on this platform");
     }
 
@@ -616,7 +714,7 @@ abc123def456  wptsall-client-2.1.0-x86_64-unknown-linux-gnu\n\
         perms.set_mode(0o555);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let err = perform_self_replace("wptsall-selftest-ro", &cur, &new).unwrap_err();
+        let err = perform_self_replace("wptsall-selftest-ro", &cur, &new, false).unwrap_err();
         assert!(
             err.to_string().starts_with("install dir not writable:"),
             "must fail closed with the stable prefix, got: {err}"
@@ -651,7 +749,7 @@ abc123def456  wptsall-client-2.1.0-x86_64-unknown-linux-gnu\n\
         let new = root.join("new-bin");
         std::fs::write(&new, b"new-binary").unwrap();
 
-        perform_self_replace("wptsall-selftest-ok", &cur, &new).unwrap();
+        perform_self_replace("wptsall-selftest-ok", &cur, &new, false).unwrap();
 
         let mut swapped = false;
         for _ in 0..40 {

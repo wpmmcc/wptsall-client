@@ -26,8 +26,7 @@ pub(crate) fn save_vendor_oauth_doc(conn: &Connection, doc: &VendorOAuthDoc) -> 
 }
 
 pub(crate) fn migrate_vendor_keys_from_json(conn: &Connection) -> Result<()> {
-    let path = std::env::var("WPTSALL_VENDOR_KEYS_FILE")
-        .unwrap_or_else(|_| crate::config::DEFAULT_VENDOR_KEYS_FILE.to_string());
+    let path = crate::config::vendor_keys_file();
     if std::path::Path::new(&path).exists() {
         let doc = crate::bindings::load_vendor_keys(&path)?;
         save_vendor_keys_doc(conn, &doc)?;
@@ -36,8 +35,7 @@ pub(crate) fn migrate_vendor_keys_from_json(conn: &Connection) -> Result<()> {
 }
 
 pub(crate) fn migrate_vendor_oauth_from_json(conn: &Connection) -> Result<()> {
-    let path = std::env::var("WPTSALL_VENDOR_OAUTH_FILE")
-        .unwrap_or_else(|_| crate::config::DEFAULT_VENDOR_OAUTH_FILE.to_string());
+    let path = crate::config::vendor_oauth_file();
     if std::path::Path::new(&path).exists() {
         let doc = crate::bindings::load_vendor_oauth(&path)?;
         save_vendor_oauth_doc(conn, &doc)?;

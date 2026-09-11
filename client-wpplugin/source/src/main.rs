@@ -67,6 +67,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // `--webui`: explicit CLI mode switch used by the Windows startup
+    // shortcut (BUG-INS-02). A .lnk cannot carry environment variables, so
+    // the installer passes this flag instead of relying on WPTSALL_WEB_UI=1
+    // being present in the launching context.
+    if std::env::args().any(|arg| arg == "--webui") {
+        std::env::set_var("WPTSALL_WEB_UI", "1");
+    }
+
     if env_bool("WPTSALL_WEB_UI", false) {
         return web_ui::run_web_ui(shutdown_token, start_time).await;
     }

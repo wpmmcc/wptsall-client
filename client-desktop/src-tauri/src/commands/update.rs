@@ -41,7 +41,7 @@ pub async fn check_for_update() -> Result<UpdateCheckResult, String> {
 }
 
 #[tauri::command]
-pub async fn perform_update() -> Result<PerformUpdateResult, String> {
+pub async fn perform_update(app: tauri::AppHandle) -> Result<PerformUpdateResult, String> {
     if UPDATE_IN_PROGRESS.swap(true, Ordering::Relaxed) {
         return Err("an update is already in progress".into());
     }
@@ -136,13 +136,29 @@ pub async fn perform_update() -> Result<PerformUpdateResult, String> {
     };
 
     let current_exe = std::env::current_exe().map_err(|e| format!("current_exe: {e:#}"))?;
+    // Desktop mode (is_desktop = true): no service manager exists, so the
+    // helper relaunches the GUI visibly (no -WindowStyle Hidden) after the
+    // swap — see runtime-core perform_self_replace (BUG-UPD-02/03).
     if let Err(e) = client_runtime_core::updater::perform_self_replace(
         "wptsall-desktop",
         &current_exe,
         &new_bin,
+        true,
     ) {
         let _ = std::fs::remove_file(&new_bin);
         return Err(format!("self-replace: {e:#}"));
+    }
+
+    // The swap only completes once this process exits (on Windows the helper
+    // renames the running exe aside; on Unix the old inode stays mapped and
+    // the relaunch would race the still-running app). Exit shortly after the
+    // response reaches the frontend; the helper restarts the new version.
+    {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            app.exit(0);
+        });
     }
 
     std::mem::forget(_guard);

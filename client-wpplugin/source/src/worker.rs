@@ -105,7 +105,7 @@ pub async fn run_worker_cli(shutdown_token: CancellationToken) -> anyhow::Result
 // ---------------------------------------------------------------------------
 
 async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<()> {
-    let db_path = env_or("WPTSALL_DB_PATH", "./runtime/wptsall.db");
+    let db_path = crate::config::db_path();
     let device_id = if let Ok(id) = std::env::var("WPTSALL_DEVICE_ID") {
         id
     } else {
@@ -118,33 +118,18 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
             Err(_) => Uuid::new_v4().to_string(),
         }
     };
-    let domain_token_bindings_path = env_or(
-        "WPTSALL_DOMAIN_TOKEN_BINDINGS_FILE",
-        DEFAULT_DOMAIN_TOKEN_BINDINGS_FILE,
-    );
+    let domain_token_bindings_path = crate::config::domain_token_bindings_file();
     let poll_seconds = env_u64("WPTSALL_POLL_SECONDS", 20).max(1);
     let one_shot = env_bool("WPTSALL_ONESHOT", false);
     let component_runtime_enabled = env_bool("WPTSALL_COMPONENT_RUNTIME", true);
     let component_id_override = env_or("WPTSALL_COMPONENT_ID", "");
     let component_prefer_ids = parse_csv_env("WPTSALL_COMPONENT_PREFER_IDS");
-    let component_bindings_path = env_or(
-        "WPTSALL_COMPONENT_BINDINGS_FILE",
-        "./config/component-bindings.json",
-    );
-    let components_local_path = env_or(
-        "WPTSALL_COMPONENTS_LOCAL_FILE",
-        DEFAULT_COMPONENTS_LOCAL_FILE,
-    );
-    let task_type_component_bindings_path = env_or(
-        "WPTSALL_TASK_TYPE_COMPONENT_BINDINGS_FILE",
-        DEFAULT_TASK_TYPE_COMPONENT_BINDINGS_FILE,
-    );
-    let rule_component_bindings_path = env_or(
-        "WPTSALL_RULE_COMPONENT_BINDINGS_FILE",
-        crate::config::DEFAULT_RULE_COMPONENT_BINDINGS_FILE,
-    );
+    let component_bindings_path = crate::config::component_bindings_file();
+    let components_local_path = crate::config::components_local_file();
+    let task_type_component_bindings_path = crate::config::task_type_component_bindings_file();
+    let rule_component_bindings_path = crate::config::rule_component_bindings_file();
     let worker_config = build_worker_config(&device_id);
-    let log_file = env_or("WPTSALL_LOG_FILE", DEFAULT_LOG_FILE);
+    let log_file = crate::config::log_file_path();
     let log_export_path = env_or("WPTSALL_LOG_EXPORT_PATH", "");
     apply_log_settings_from_db(&db_path);
     init_log_file(&log_file)?;
@@ -504,7 +489,7 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
             server_base
         );
     }
-    let db_path = env_or("WPTSALL_DB_PATH", "./runtime/wptsall.db");
+    let db_path = crate::config::db_path();
     let device_id = if let Ok(id) = std::env::var("WPTSALL_DEVICE_ID") {
         id
     } else {
@@ -518,33 +503,18 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
         }
     };
     let wp_client_token_fallback = env_or("WPTSALL_WP_CLIENT_TOKEN", "");
-    let domain_token_bindings_path = env_or(
-        "WPTSALL_DOMAIN_TOKEN_BINDINGS_FILE",
-        DEFAULT_DOMAIN_TOKEN_BINDINGS_FILE,
-    );
+    let domain_token_bindings_path = crate::config::domain_token_bindings_file();
     let poll_seconds = env_u64("WPTSALL_POLL_SECONDS", 20).max(1);
     let one_shot = env_bool("WPTSALL_ONESHOT", false);
     let component_runtime_enabled = env_bool("WPTSALL_COMPONENT_RUNTIME", true);
     let component_id_override = env_or("WPTSALL_COMPONENT_ID", "");
     let component_prefer_ids = parse_csv_env("WPTSALL_COMPONENT_PREFER_IDS");
-    let component_bindings_path = env_or(
-        "WPTSALL_COMPONENT_BINDINGS_FILE",
-        "./config/component-bindings.json",
-    );
-    let components_local_path = env_or(
-        "WPTSALL_COMPONENTS_LOCAL_FILE",
-        DEFAULT_COMPONENTS_LOCAL_FILE,
-    );
-    let task_type_component_bindings_path = env_or(
-        "WPTSALL_TASK_TYPE_COMPONENT_BINDINGS_FILE",
-        DEFAULT_TASK_TYPE_COMPONENT_BINDINGS_FILE,
-    );
-    let rule_component_bindings_path = env_or(
-        "WPTSALL_RULE_COMPONENT_BINDINGS_FILE",
-        crate::config::DEFAULT_RULE_COMPONENT_BINDINGS_FILE,
-    );
+    let component_bindings_path = crate::config::component_bindings_file();
+    let components_local_path = crate::config::components_local_file();
+    let task_type_component_bindings_path = crate::config::task_type_component_bindings_file();
+    let rule_component_bindings_path = crate::config::rule_component_bindings_file();
     let worker_config = build_worker_config(&device_id);
-    let log_file = env_or("WPTSALL_LOG_FILE", DEFAULT_LOG_FILE);
+    let log_file = crate::config::log_file_path();
     let log_export_path = env_or("WPTSALL_LOG_EXPORT_PATH", "");
     let proxy_pool = {
         let config_dir = Path::new(&component_bindings_path)
