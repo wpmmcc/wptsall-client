@@ -37,25 +37,26 @@ WPTSALL Client هو العميل المرافق لإضافة WPMMCC ATS لوور
 3. شغّل العامل مرة واحدة — يستلم دفعة ويترجمها ويكتب النتائج
 
 ## البيانات المحلية والخصوصية
-تبقى كل الإعدادات وحالة المهام على جهازك (SQLite مع ملفات محلية). يتواصل العميل فقط مع موقع ووردبريس الذي ضبطته ونقطة نهاية المزوّد التي اخترتها.
+تبقى كل الإعدادات وحالة المهام على جهازك (SQLite مع ملفات محلية). يتواصل العميل فقط مع موقع ووردبريس الذي ضبطته ونقطة نهاية المزوّد التي اخترتها. سجل التصحيح معطّل افتراضيًا؛ وتتيح صفحة الإعدادات تشغيل أو إيقاف السجلات المحلية أثناء التشغيل.
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## التحديث
+- افتح الإعدادات في WebUI واستخدم فحص التحديثات — يتم تنزيل الإصدارات الجديدة كحزم kit موقّعة وتطبيقها في مكانها
+- يتم التحقق من كل حزمة kit بدقة قبل استبدال أي ملف: توقيع minisign ومجموع تدقيق SHA-256، مع حماية ضد الرجوع إلى إصدار أقدم. يُعاد تشغيل الخدمة تلقائيًا بعدها؛ وفي نظام Windows يُستبدل الملف الثنائي المشغّل بأمان مع إمكانية التراجع عند الفشل
+- بديل يدوي: نزّل أحدث مثبت من https://github.com/wpmmcc/wptsall-client-releases وشغّله فوق التثبيت الحالي
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## إلغاء التثبيت
+- تتوفر أدوات إلغاء التثبيت لكل منتج ومنصة في مستودع الإصدارات: uninstall-webui.sh / uninstall-desktop.sh (Linux وmacOS) وملفات .ps1 المقابلة (Windows)
+- توقف أداة إلغاء التثبيت خدمة الخلفية وتزيلها (وحدة مستخدم systemd أو LaunchAgent أو خدمة Windows)، واختصارات سطر الأوامر ودليل التثبيت
+- يتم الاحتفاظ ببياناتك (قاعدة بيانات SQLite المحلية، التكوين، السجلات) افتراضيًا. أضف --purge-data (Linux/macOS) أو -PurgeData (Windows) لحذفها أيضًا
+- إذا كان لديك كل من WebUI وتطبيق Desktop، يُحتفظ بدليل التثبيت المشترك ما لم تُمرر أيضًا --purge-shared
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## المكونات مفتوحة المصدر
+- نواة Rust — مكتبات tokio وreqwest (عبر rustls TLS) وserde/serde_json وrusqlite مع SQLite مدمج، وaes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken للتشفير، وaws-sdk-s3 للمزودين المتوافقين مع S3، وextism لتشغيل مكونات WASM
+- تطبيق Desktop — إطار Tauri 2 (واجهة أصلية تعتمد على webview النظام)
+- واجهة Web UI — مكتبات Svelte 5 وVite وTailwind CSS وsvelte-i18n وأيقونات lucide
+- أمان التحديثات — توقيعات minisign وملف SHA256SUMS موقّع
+- القوائم الكاملة بالإصدارات المثبتة موجودة في Cargo.toml وfrontend/package.json؛ وتصدر جميع المكونات بتراخيص متوافقة مع GPL-2.0-or-later مثل MIT وApache-2.0 وISC
+
 ## Languages
 واجهة العميل تأتي مع تعريبها الخاص. هذا README متوفر بـ16 لغة — انظر الجدول أعلاه. المساهمات بلغات أخرى مرحب بها.
 

@@ -37,25 +37,26 @@ WPTSALL Client は WPMMCC ATS WordPress プラグインの companion クライ�
 3. Worker を1回実行 — バッチを取得、翻訳、書き戻し
 
 ## ローカルデータとプライバシー
-設定もタスク状態もすべてあなたのマシンに置かれます(SQLite + ローカルファイル)。クライアントが通信するのは、設定した WordPress サイトと選んだ翻訳プロバイダーのエンドポイントだけです。
+設定もタスク状態もすべてあなたのマシンに置かれます（SQLite＋ローカルファイル）。クライアントが通信するのは、設定した WordPress サイトと選んだ翻訳プロバイダーのエンドポイントだけです。デバッグログはデフォルトでオフです。設定ページから実行時にローカルログのオン/オフを切り替えられます。
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## アップデート
+- WebUI の設定画面を開き、アップデート確認を使用してください — 新バージョンは署名済み kit としてダウンロードされ、その場で適用されます
+- すべての kit は置き換え前に minisign 署名と SHA-256 チェックサムで検証され、ロールバック防止機能も備えています。更新完了後はサービスが自動再起動します。Windows では実行中のバイナリを安全に置き換え、失敗した場合はロールバックします
+- 手動での代替手段：https://github.com/wpmmcc/wptsall-client-releases から最新のインストーラーをダウンロードし、既存のインストールに上書き実行してください
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## アンインストール
+- 各製品・プラットフォーム向けのアンインストーラーは releases リポジトリで提供されています：uninstall-webui.sh / uninstall-desktop.sh（Linux、macOS）および対応する .ps1 スクリプト（Windows）
+- アンインストーラーはバックグラウンドサービス（systemd ユーザーユニット、LaunchAgent、Windows サービス）、コマンドラインショートカット、インストールディレクトリを停止・削除します
+- ローカルの SQLite データベース、設定、ログなどのデータはデフォルトで保持されます。これらも削除する場合は --purge-data（Linux/macOS）または -PurgeData（Windows）を追加してください
+- WebUI と Desktop アプリの両方をインストールしている場合、--purge-shared も渡さない限り共有インストールディレクトリは保持されます
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## オープンソースコンポーネント
+- Rust コア — tokio、reqwest（rustls TLS）、serde/serde_json、rusqlite（組み込み SQLite）、暗号用 aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken、S3 互換プロバイダー用 aws-sdk-s3、WASM コンポーネントランタイム extism
+- Desktop アプリ — Tauri 2（システム webview を使用するネイティブシェル）
+- Web UI — Svelte 5、Vite、Tailwind CSS、svelte-i18n、lucide アイコン
+- アップデートセキュリティ — minisign 署名と署名済み SHA256SUMS
+- バージョン固定の完全なリストは Cargo.toml および frontend/package.json に記載されています。すべてのコンポーネントは本プロジェクトの GPL-2.0-or-later と互換性のある MIT / Apache-2.0 / ISC ライセンス下で提供されています
+
 ## Languages
 クライアント UI は独自のローカライズを同梱。この README は16言語で利用できます — 上部の表を参照。さらなる言語の貢献を歓迎します。
 

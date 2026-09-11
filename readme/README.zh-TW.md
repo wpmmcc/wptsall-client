@@ -39,23 +39,24 @@ WPTSALL Client 是 WPMMCC ATS WordPress 外掛的配套用戶端。它運行在�
 ## 本地資料與隱私
 全部設定與任務狀態都留在你的機器上(SQLite + 本地檔案)。用戶端只會與你設定的 WordPress 站台和翻譯廠商端點通訊。除錯日誌預設關閉;可在設定頁運行時開啟或關閉本地日誌。
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## 更新
+- 開啟 WebUI 的設定頁面使用更新檢查——新版本將下載為已簽署 kit 並原地套用更新
+- 在替換任何檔案前均經過嚴格驗證:minisign 簽名與 SHA-256 總和檢查碼,並具備防回滾機制。更新完成後服務自動重啟;在 Windows 上執行中二進位檔案會被安全替換,更新失敗自動復原
+- 手動替代方案:從 https://github.com/wpmmcc/wptsall-client-releases 下載最新安裝程式並覆蓋安裝
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## 解除安裝
+- 各產品與平台的解除安裝指令碼均可在 releases 儲存庫取得:uninstall-webui.sh / uninstall-desktop.sh(Linux、macOS)以及對應的 .ps1 指令碼(Windows)
+- 解除安裝指令碼會自動停止並移除背景服務(systemd 使用者單元、LaunchAgent 或 Windows 服務)、命令列捷徑以及安裝目錄
+- 你的資料(本地 SQLite 資料庫、設定與記錄)預設保留。如需連同資料一併清理,可追加 --purge-data(Linux/macOS)或 -PurgeData(Windows)參數
+- 若同時安裝了 WebUI 與 Desktop 桌面版,共用安裝目錄預設保留,除非同時傳入 --purge-shared 參數
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## 開源元件
+- Rust 核心——tokio、reqwest(rustls TLS)、serde/serde_json、rusqlite(內建 SQLite)、aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken 加密庫、適用於 S3 相容廠商的 aws-sdk-s3、WASM 元件執行環境 extism
+- Desktop 應用——Tauri 2(呼叫系統原生 webview 的輕量外殼)
+- Web UI——Svelte 5、Vite、Tailwind CSS、svelte-i18n 與 lucide 圖示庫
+- 更新安全——minisign 簽名與簽署的 SHA256SUMS
+- 完整鎖定版本清單見 Cargo.toml 與 frontend/package.json;所有元件均以相容於 GPL-2.0-or-later 的 MIT / Apache-2.0 / ISC 等授權釋出
+
 ## Languages
 用戶端 UI 自帶本地化。本 README 提供 16 種語言——見頂部語言表。歡迎貢獻更多語言。
 

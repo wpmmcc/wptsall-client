@@ -37,25 +37,26 @@ WPTSALL Client adalah klien pendamping plugin WordPress WPMMCC ATS. Ia berjalan 
 3. Jalankan Worker sekali — ia mengambil satu batch, menerjemahkan, dan menulis hasilnya kembali
 
 ## Data lokal & privasi
-Semua konfigurasi dan status tugas tetap di mesin Anda (SQLite plus berkas lokal). Klien hanya berkomunikasi dengan situs WordPress yang Anda konfigurasi dan endpoint penyedia yang Anda pilih.
+Semua konfigurasi dan status tugas tetap di mesin Anda (SQLite plus berkas lokal). Klien hanya berkomunikasi dengan situs WordPress yang Anda konfigurasi dan endpoint penyedia yang Anda pilih. Pencatatan debug dimatikan secara default; halaman Pengaturan dapat mengaktifkan atau menonaktifkan pencatatan lokal saat runtime.
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## Pembaruan
+- Buka Pengaturan di WebUI dan gunakan pemeriksaan pembaruan — versi baru diunduh sebagai kit bertanda tangan dan diterapkan langsung di tempat
+- Setiap kit diverifikasi sebelum file diganti: tanda tangan minisign ditambah checksum SHA-256, dengan perlindungan anti-rollback. Layanan dimulai ulang secara otomatis setelahnya; di Windows biner yang sedang berjalan diganti dengan aman, dengan rollback jika pembaruan gagal
+- Alternatif manual: unduh penginstal terbaru dari https://github.com/wpmmcc/wptsall-client-releases dan jalankan di atas instalasi yang ada
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## Copot Pemasangan
+- Pencopot pemasangan untuk setiap produk dan platform tersedia di repositori rilis: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) dan skrip .ps1 yang cocok (Windows)
+- Pencopot pemasangan menghentikan dan menghapus layanan latar belakang (unit pengguna systemd, LaunchAgent, atau layanan Windows), pintasan baris perintah, dan direktori instalasi
+- Data Anda — basis data SQLite lokal, konfigurasi, dan log — disimpan secara default. Tambahkan --purge-data (Linux/macOS) atau -PurgeData (Windows) untuk menghapusnya juga
+- Jika Anda memiliki WebUI dan aplikasi Desktop, direktori instalasi bersama tetap dipertahankan kecuali Anda juga menyertakan opsi --purge-shared
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## Komponen sumber terbuka
+- Inti Rust — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite dengan SQLite bawaan, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken untuk kriptografi, aws-sdk-s3 untuk penyedia yang kompatibel dengan S3, extism sebagai runtime komponen WASM
+- Aplikasi Desktop — Tauri 2 (shell native menggunakan webview sistem)
+- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n dan ikon lucide
+- Keamanan pembaruan — tanda tangan minisign dan SHA256SUMS bertanda tangan
+- Daftar lengkap versi terkunci ada di Cargo.toml dan frontend/package.json; setiap komponen dilisensikan di bawah lisensi gaya MIT / Apache-2.0 / ISC yang kompatibel dengan GPL-2.0-or-later proyek ini
+
 ## Languages
 Antarmuka klien membawa pelokalannya sendiri. README ini tersedia dalam 16 bahasa — lihat tabel di atas. Kontribusi bahasa lain diterima dengan senang hati.
 

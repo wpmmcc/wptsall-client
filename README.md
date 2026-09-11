@@ -56,6 +56,7 @@ All configuration and task state stay on your machine (SQLite plus local files).
 - Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
 - Update security — minisign signatures and signed SHA256SUMS
 - Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+
 ## Languages
 The client UI ships its own localization. This README is available in 16 languages — see the table at the top. Contributions for further languages are welcome.
 

@@ -37,25 +37,26 @@ WPTSALL Client, WPMMCC ATS WordPress eklentisinin companion istemcisidir. Makine
 3. Worker'ı bir kez çalıştırın — bir toplu işi alır, çevirir ve sonuçları geri yazar
 
 ## Yerel veriler ve gizlilik
-Tüm yapılandırma ve görev durumu makinenizde kalır (SQLite artı yerel dosyalar). İstemci yalnızca yapılandırdığınız WordPress sitesi ve seçtiğiniz sağlayıcı uç noktasıyla iletişim kurar.
+Tüm yapılandırma ve görev durumu makinenizde kalır (SQLite artı yerel dosyalar). İstemci yalnızca yapılandırdığınız WordPress sitesi ve seçtiğiniz sağlayıcı uç noktasıyla iletişim kurar. Hata ayıklama günlükleri varsayılan olarak kapalıdır; Ayarlar sayfası çalışma zamanında yerel günlük kaydını açıp kapatabilir.
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## Güncelleme
+- WebUI'de Ayarlar'ı açın ve güncelleme kontrolünü kullanın — yeni sürümler imzalı kit'ler olarak indirilir ve yerinde uygulanır
+- Her kit herhangi bir dosya değiştirilmeden önce doğrulanır: minisign imzası ve SHA-256 sağlama toplamı ile geri alma koruması. Hizmet sonrasında otomatik olarak yeniden başlar; Windows'ta çalışan ikili dosya güvenli bir şekilde değiştirilir ve güncelleme başarısız olursa geri alınır
+- Manuel alternatif: https://github.com/wpmmcc/wptsall-client-releases adresinden en son yükleyiciyi indirin ve mevcut kurulumun üzerine çalıştırın
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## Kaldırma
+- Her ürün ve platform için kaldırıcılar releases deposunda mevcuttur: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) ve eşleşen .ps1 komut dosyaları (Windows)
+- Kaldırıcı, arka plan hizmetini (systemd kullanıcı birimi, LaunchAgent veya Windows hizmeti), komut satırı kısayollarını ve kurulum dizinini durdurur ve kaldırır
+- Verileriniz — yerel SQLite veritabanı, yapılandırma ve günlükler — varsayılan olarak saklanır. Bunları da kaldırmak için --purge-data (Linux/macOS) veya -PurgeData (Windows) ekleyin
+- Hem WebUI hem de Desktop uygulamasına sahipseniz, --purge-shared seçeneğini de geçmediğiniz sürece paylaşılan kurulum dizini korunur
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## Açık kaynaklı bileşenler
+- Rust çekirdeği — tokio, reqwest (rustls TLS), serde/serde_json, dahili SQLite ile rusqlite, kripto için aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken, S3 uyumlu sağlayıcılar için aws-sdk-s3, WASM bileşen çalışma zamanı extism
+- Desktop uygulaması — Tauri 2 (sistem webview'ını kullanan yerel kabuk)
+- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n ve lucide simgeleri
+- Güncelleme güvenliği — minisign imzaları ve imzalı SHA256SUMS
+- Sürümleri sabitlenmiş tam listeler Cargo.toml ve frontend/package.json içinde yer alır; her bileşen bu projenin GPL-2.0-or-later lisansıyla uyumlu MIT / Apache-2.0 / ISC tarzı lisanslarla dağıtılır
+
 ## Languages
 İstemci arayüzü kendi yerelleştirmesiyle gelir. Bu README 16 dilde mevcuttur — üstteki tabloya bakın. Daha fazla dil için katkılar memnuniyetle karşılanır.
 

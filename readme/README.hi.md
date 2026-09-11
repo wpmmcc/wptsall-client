@@ -37,25 +37,26 @@ WPTSALL Client, WPMMCC ATS WordPress प्लगइन का साथी क�
 3. Worker एक बार चलाएँ — यह बैच लेता है, अनुवाद करता है और परिणाम लिखता है
 
 ## स्थानीय डेटा और गोपनीयता
-सारी विन्यास और कार्य स्थिति आपकी मशीन पर रहती है (SQLite + स्थानीय फ़ाइलें)। क्लाइंट केवल आपके विन्यस्त WordPress साइट और चुने गए प्रोवाइडर एंडपॉइंट से संवाद करता है।
+सारी विन्यास और कार्य स्थिति आपकी मशीन पर रहती है (SQLite + स्थानीय फ़ाइलें)। क्लाइंट केवल आपके विन्यस्त WordPress साइट और चुने गए प्रोवाइडर एंडपॉइंट से संवाद करता है। डिबग लॉगिंग डिफ़ॉल्ट रूप से बंद है; सेटिंग्स पृष्ठ से रनटाइम पर स्थानीय लॉगिंग चालू या बंद की जा सकती है।
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## अपडेट करना
+- WebUI में सेटिंग्स खोलें और अपडेट जांच का उपयोग करें — नए संस्करण हस्ताक्षरित kit के रूप में डाउनलोड होते हैं और उसी स्थान पर लागू होते हैं
+- फ़ाइलों को बदलने से पहले प्रत्येक kit को सत्यापित किया जाता है: minisign हस्ताक्षर और SHA-256 चेकसम, साथ ही एंटी-रोलबैक सुरक्षा। इसके बाद सेवा स्वतः पुनरारंभ होती है; Windows पर चल रही बाइनरी सुरक्षित रूप से बदल दी जाती है और विफलता पर स्वतः रोलबैक होता है
+- मैन्युअल विकल्प: https://github.com/wpmmcc/wptsall-client-releases से नवीनतम इंस्टॉलर डाउनलोड करें और मौजूदा इंस्टॉलेशन पर चलाएं
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## अनइंस्टॉल करना
+- प्रत्येक उत्पाद और प्लेटफ़ॉर्म के अनइंस्टॉलर रिलीज़ रिपॉज़िटरी में उपलब्ध हैं: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) और संबंधित .ps1 स्क्रिप्ट (Windows)
+- अनइंस्टॉलर बैकग्राउंड सर्विस (systemd यूजर यूनिट, LaunchAgent या Windows सर्विस), कमांड-लाइन शॉर्टकट और इंस्टॉल डायरेक्टरी को रोकता और हटाता है
+- आपका डेटा — स्थानीय SQLite डेटाबेस, कॉन्फ़िगरेशन और लॉग — डिफ़ॉल्ट रूप से सुरक्षित रहता है। इसे भी हटाने के लिए --purge-data (Linux/macOS) या -PurgeData (Windows) जोड़ें
+- यदि आपके पास WebUI और Desktop ऐप दोनों हैं, तो साझा इंस्टॉल डायरेक्टरी सुरक्षित रहती है जब तक कि आप --purge-shared भी पास न करें
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## ओपन-सोर्स घटक
+- Rust कोर — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite बंडल SQLite सहित, क्रिप्टोग्राफी के लिए aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken, S3-संगत प्रोवाइडर के लिए aws-sdk-s3, WASM घटक रनटाइम extism
+- Desktop ऐप — Tauri 2 (सिस्टम वेबव्यू का उपयोग करने वाला नेटिव शेल)
+- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n और lucide आइकन
+- अपडेट सुरक्षा — minisign हस्ताक्षर और हस्ताक्षरित SHA256SUMS
+- संस्करण-पिन की गई पूरी सूची Cargo.toml और frontend/package.json में है; प्रत्येक घटक GPL-2.0-or-later संगत MIT / Apache-2.0 / ISC लाइसेंस के तहत जारी किया गया है
+
 ## Languages
 क्लाइंट UI अपना स्थानीयकरण साथ लाता है। यह README 16 भाषाओं में उपलब्ध है — शीर्ष की तालिका देखें। अधिक भाषाओं के योगदान का स्वागत है।
 

@@ -37,25 +37,26 @@ WPTSALL Client — клиент-компаньон плагина WPMMCC ATS д�
 3. Запустите Worker один раз — он заберёт партию, переведёт и запишет результаты
 
 ## Локальные данные и приватность
-Все настройки и состояние задач остаются на вашей машине (SQLite плюс локальные файлы). Клиент обменивается данными только с настроенным сайтом WordPress и выбранным эндпоинтом провайдера.
+Все настройки и состояние задач остаются на вашей машине (SQLite плюс локальные файлы). Клиент обменивается данными только с настроенным сайтом WordPress и выбранным эндпоинтом провайдера. Отладочные журналы по умолчанию отключены; на странице настроек можно включать и отключать локальные журналы во время работы.
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## Обновление
+- Откройте «Настройки» в WebUI и воспользуйтесь проверкой обновлений — новые версии загружаются в виде подписанных kit-ов и применяются на месте
+- Каждый kit проверяется перед заменой файлов: подпись minisign и контрольная сумма SHA-256 с защитой от отката. После этого служба перезапускается автоматически; в Windows работающий бинарный файл заменяется безопасно с откатом при ошибке
+- Ручная альтернатива: загрузите последний установщик с https://github.com/wpmmcc/wptsall-client-releases и запустите его поверх существующей установки
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## Удаление
+- Программы удаления для каждого продукта и платформы доступны в репозитории релизов: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) и соответствующие скрипты .ps1 (Windows)
+- Деинсталлятор останавливает и удаляет фоновую службу (пользовательский юнит systemd, LaunchAgent или службу Windows), ярлыки командной строки и каталог установки
+- Ваши данные — локальная база данных SQLite, конфигурация и журналы — по умолчанию сохраняются. Добавьте --purge-data (Linux/macOS) или -PurgeData (Windows), чтобы удалить и их
+- Если установлены и WebUI, и настольное приложение Desktop, общий каталог установки сохраняется, если не указан флаг --purge-shared
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## Компоненты с открытым исходным кодом
+- Ядро Rust — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite со встроенным SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken для криптографии, aws-sdk-s3 для S3-совместимых провайдеров, extism как среда выполнения компонентов WASM
+- Настольное приложение Desktop — Tauri 2 (нативная оболочка на системном webview)
+- Веб-интерфейс Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n и иконки lucide
+- Безопасность обновлений — подписи minisign и подписанные SHA256SUMS
+- Полные списки зафиксированных версий находятся в Cargo.toml и frontend/package.json; каждый компонент распространяется под совместимой с GPL-2.0-or-later лицензией MIT / Apache-2.0 / ISC
+
 ## Languages
 Интерфейс клиента поставляется со своей локализацией. Этот README доступен на 16 языках — см. таблицу наверху. Взносы с другими языками приветствуются.
 

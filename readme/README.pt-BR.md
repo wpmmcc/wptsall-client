@@ -37,25 +37,26 @@ WPTSALL Client é o cliente complementar do plugin WordPress WPMMCC ATS. Ele rod
 3. Rode o worker uma vez — ele pega um lote, traduz e escreve os resultados de volta
 
 ## Dados locais e privacidade
-Toda a configuração e o estado das tarefas ficam na sua máquina (SQLite mais arquivos locais). O cliente só conversa com o site WordPress que você configurou e o endpoint do provedor que escolheu.
+Toda a configuração e o estado das tarefas ficam na sua máquina (SQLite mais arquivos locais). O cliente só conversa com o site WordPress que você configurou e o endpoint do provedor que escolheu. O registro de depuração fica desativado por padrão; a página Configurações permite ativar ou desativar os logs locais em tempo de execução.
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## Atualização
+- Abra Configurações na WebUI e use a verificação de atualizações — novas versões são baixadas como kits assinados e aplicadas no local
+- Cada kit é verificado antes de substituir qualquer arquivo: assinatura minisign mais soma de verificação SHA-256, com proteção anti-rollback. O serviço reinicia automaticamente depois; no Windows o binário em execução é substituído com segurança, com reversão se a atualização falhar
+- Alternativa manual: baixe o instalador mais recente em https://github.com/wpmmcc/wptsall-client-releases e execute-o sobre a instalação existente
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## Desinstalação
+- Os desinstaladores para cada produto e plataforma ficam no repositório de releases: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) e os scripts .ps1 correspondentes (Windows)
+- O desinstalador interrompe e remove o serviço em segundo plano (unidade de usuário systemd, LaunchAgent ou serviço do Windows), os atalhos de linha de comando e o diretório de instalação
+- Seus dados — banco de dados SQLite local, configurações e logs — são mantidos por padrão. Adicione --purge-data (Linux/macOS) ou -PurgeData (Windows) para removê-los também
+- Se você tiver instalados a WebUI e o app Desktop, o diretório de instalação compartilhado é mantido a menos que também passe --purge-shared
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## Componentes de código aberto
+- Núcleo Rust — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite com SQLite embutido, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken para criptografia, aws-sdk-s3 para provedores compatíveis com S3, extism como runtime de componentes WASM
+- App Desktop — Tauri 2 (shell nativo com webview do sistema)
+- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n e ícones lucide
+- Segurança nas atualizações — assinaturas minisign e SHA256SUMS assinados
+- Listas completas com versões fixadas estão em Cargo.toml e frontend/package.json; cada componente é distribuído sob licenças tipo MIT / Apache-2.0 / ISC compatíveis com a GPL-2.0-or-later deste projeto
+
 ## Languages
 A interface do cliente traz a própria localização. Este README está disponível em 16 idiomas — veja a tabela no topo. Contribuições de mais idiomas são bem-vindas.
 

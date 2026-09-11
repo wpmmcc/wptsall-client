@@ -37,25 +37,26 @@ WPTSALL Client ist der Begleit-Client zum WordPress-Plugin WPMMCC ATS. Er läuft
 3. Worker einmal ausführen — holt einen Stapel ab, übersetzt und schreibt zurück
 
 ## Lokale Daten & Privatsphäre
-Alle Konfigurationen und Aufgabenstände bleiben auf deinem Rechner (SQLite plus lokale Dateien). Der Client spricht nur mit der von dir konfigurierten WordPress-Website und dem gewählten Anbieter-Endpoint.
+Alle Konfigurationen und Aufgabenstände bleiben auf deinem Rechner (SQLite plus lokale Dateien). Der Client spricht nur mit der von dir konfigurierten WordPress-Website und dem gewählten Anbieter-Endpoint. Debug-Logging ist standardmäßig deaktiviert; auf der Einstellungsseite kann das lokale Logging zur Laufzeit aktiviert oder deaktiviert werden.
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## Aktualisierung
+- Öffne die Einstellungen in der WebUI und nutze die Update-Prüfung — neue Versionen werden als signierte Kits heruntergeladen und direkt installiert
+- Jedes Kit wird vor dem Ersetzen vollständig verifiziert: minisign-Signatur plus SHA-256-Prüfsumme, mit Rollback-Schutz. Der Dienst startet danach automatisch neu; unter Windows wird die laufende Binärdatei sicher ersetzt, mit automatischem Rollback bei Fehlern
+- Manuelle Alternative: Lade den neuesten Installer von https://github.com/wpmmcc/wptsall-client-releases herunter und führe ihn über die bestehende Installation aus
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## Deinstallation
+- Deinstallationsskripte für jedes Produkt und jede Plattform liegen im Releases-Repository bereit: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) und die entsprechenden .ps1-Skripte (Windows)
+- Ein Deinstallationsprogramm stoppt und entfernt den Hintergrunddienst (systemd-Benutzereinheit, LaunchAgent oder Windows-Dienst), die Befehlszeilen-Verknüpfungen und das Installationsverzeichnis
+- Deine Daten — lokale SQLite-Datenbank, Konfiguration und Protokolle — bleiben standardmäßig erhalten. Füge --purge-data (Linux/macOS) oder -PurgeData (Windows) hinzu, um auch diese zu entfernen
+- Wenn sowohl die WebUI als auch die Desktop-App installiert sind, bleibt das gemeinsame Installationsverzeichnis erhalten, sofern nicht auch --purge-shared übergeben wird
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## Open-Source-Komponenten
+- Rust-Kern — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite mit gebündeltem SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken für Kryptografie, aws-sdk-s3 für S3-kompatible Anbieter, extism als WASM-Komponenten-Laufzeit
+- Desktop-App — Tauri 2 (native Shell mit der System-Webview)
+- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n und lucide-Icons
+- Update-Sicherheit — minisign-Signaturen und signierte SHA256SUMS
+- Vollständige versionsgebundene Listen finden sich in Cargo.toml und frontend/package.json; jede Komponente steht unter einer mit GPL-2.0-or-later kompatiblen MIT- / Apache-2.0- / ISC-Lizenz
+
 ## Languages
 Die Client-Oberfläche bringt ihre eigene Lokalisierung mit. Dieses README gibt es in 16 Sprachen — siehe Tabelle oben. Beiträge für weitere Sprachen sind willkommen.
 

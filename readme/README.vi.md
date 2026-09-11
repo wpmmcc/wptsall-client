@@ -37,25 +37,26 @@ WPTSALL Client là client đi kèm của plugin WordPress WPMMCC ATS. Nó chạy
 3. Chạy Worker một lần — nó nhận một lô, dịch và ghi kết quả về
 
 ## Dữ liệu cục bộ & riêng tư
-Mọi cấu hình và trạng thái tác vụ đều ở trên máy bạn (SQLite cộng tệp cục bộ). Client chỉ giao tiếp với site WordPress bạn cấu hình và endpoint nhà cung cấp bạn chọn.
+Mọi cấu hình và trạng thái tác vụ đều ở trên máy bạn (SQLite cộng tệp cục bộ). Client chỉ giao tiếp với site WordPress bạn cấu hình và endpoint nhà cung cấp bạn chọn. Nhật ký gỡ lỗi được tắt theo mặc định; trang Cài đặt có thể bật hoặc tắt nhật ký cục bộ trong thời gian chạy.
 
-## Updating
-- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
-- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+## Cập nhật
+- Mở Cài đặt trong WebUI và sử dụng tính năng kiểm tra cập nhật — các phiên bản mới được tải về dưới dạng kit có chữ ký và áp dụng trực tiếp
+- Mọi kit đều được xác minh nghiêm ngặt trước khi thay thế: chữ ký minisign và mã tổng kiểm SHA-256, cùng cơ chế chống rollback. Dịch vụ tự động khởi động lại sau đó; trên Windows, tệp thực thi đang chạy được thay thế an toàn và tự động hoàn tác nếu cập nhật thất bại
+- Phương án thủ công: tải trình cài đặt mới nhất từ https://github.com/wpmmcc/wptsall-client-releases và chạy đè lên bản cài đặt hiện tại
 
-## Uninstalling
-- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
-- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
-- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
-- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+## Gỡ cài đặt
+- Bộ gỡ cài đặt cho từng sản phẩm và nền tảng có trong kho lưu trữ releases: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) và script .ps1 tương ứng (Windows)
+- Trình gỡ cài đặt sẽ dừng và gỡ bỏ dịch vụ nền (systemd user unit, LaunchAgent hoặc Windows service), các lối tắt dòng lệnh và thư mục cài đặt
+- Dữ liệu của bạn — cơ sở dữ liệu SQLite cục bộ, cấu hình và nhật ký — được giữ lại theo mặc định. Thêm --purge-data (Linux/macOS) hoặc -PurgeData (Windows) để xóa toàn bộ
+- Nếu bạn cài đặt cả WebUI và Desktop, thư mục cài đặt dùng chung sẽ được giữ lại trừ khi bạn truyền thêm tùy chọn --purge-shared
 
-## Open-source components
-- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
-- Desktop app — Tauri 2 (native shell with the system webview)
-- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
-- Update security — minisign signatures and signed SHA256SUMS
-- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
+## Thành phần mã nguồn mở
+- Lõi Rust — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite tích hợp sẵn SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken cho mã hóa, aws-sdk-s3 cho nhà cung cấp tương thích S3, extism cho runtime thành phần WASM
+- Ứng dụng Desktop — Tauri 2 (vỏ bọc gốc sử dụng webview của hệ thống)
+- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n và bộ biểu tượng lucide
+- Bảo mật cập nhật — chữ ký minisign và tệp SHA256SUMS có chữ ký
+- Danh sách phiên bản cố định đầy đủ có trong Cargo.toml và frontend/package.json; mọi thành phần đều phát hành theo giấy phép tương thích GPL-2.0-or-later như MIT / Apache-2.0 / ISC
+
 ## Languages
 Giao diện client có sẵn bản địa hóa riêng. README này có 16 ngôn ngữ — xem bảng ở đầu trang. Hoan nghênh đóng góp thêm ngôn ngữ.
 
