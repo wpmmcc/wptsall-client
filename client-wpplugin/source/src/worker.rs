@@ -29,6 +29,29 @@ use crate::component_rt::proxy::ProxyClientPool;
 use crate::component_rt::sign_plugin;
 use crate::config::*;
 use crate::logging::{init_log_file, log_event, maybe_export_log, snippet};
+
+/// Apply persisted log settings (Settings page state in SQLite) plus the
+/// `WPTSALL_LOG_ENABLED` env override to the global logging atomics.
+///
+/// Worker mode must honor the same switch as the WebUI: release default is
+/// logging DISABLED, an explicit DB `true` enables it, and the env var
+/// overrides both when set.
+fn apply_log_settings_from_db(db_path: &str) {
+    let (db_enabled, db_level) = match crate::db::open_db(db_path) {
+        Ok(conn) => (
+            crate::db::system::get_system_config(&conn, "log_enabled"),
+            crate::db::system::get_system_config(&conn, "log_min_level"),
+        ),
+        Err(_) => (None, None),
+    };
+    let enabled = crate::logging::resolve_log_enabled(
+        db_enabled.as_deref(),
+        std::env::var("WPTSALL_LOG_ENABLED").ok().as_deref(),
+    );
+    let level = db_level.unwrap_or_else(|| "info".to_string());
+    crate::logging::set_log_enabled(enabled);
+    crate::logging::set_log_min_level(&level);
+}
 use crate::persistence::PendingCallbackStore;
 use crate::task_engine::discoverer::discover_and_translate;
 use crate::types::*;
@@ -123,6 +146,7 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
     let worker_config = build_worker_config(&device_id);
     let log_file = env_or("WPTSALL_LOG_FILE", DEFAULT_LOG_FILE);
     let log_export_path = env_or("WPTSALL_LOG_EXPORT_PATH", "");
+    apply_log_settings_from_db(&db_path);
     init_log_file(&log_file)?;
 
     let proxy_pool = {
@@ -564,6 +588,7 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
         pending + translated as usize
     };
 
+    apply_log_settings_from_db(&db_path);
     init_log_file(&log_file)?;
     let mut domain_token_bindings = match load_domain_token_bindings(&domain_token_bindings_path) {
         Ok(doc) => doc,

@@ -37,7 +37,7 @@ WPTSALL Client is the companion client for the WPMMCC ATS WordPress plugin. It r
 3. Run the worker once — it claims a batch, translates it and writes the results back
 
 ## Local data & privacy
-All configuration and task state stay on your machine (SQLite plus local files). The client only ever talks to the WordPress site you configured and the translation provider endpoint you chose.
+All configuration and task state stay on your machine (SQLite plus local files). The client only ever talks to the WordPress site you configured and the translation provider endpoint you chose. Debug logging is off by default; the Settings page can turn local logging on or off at runtime.
 
 ## Languages
 The client UI ships its own localization. This README is available in 16 languages — see the table at the top. Contributions for further languages are welcome.

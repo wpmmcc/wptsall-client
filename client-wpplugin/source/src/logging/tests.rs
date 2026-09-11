@@ -127,6 +127,35 @@ fn log_enabled_toggle() {
 }
 
 // -----------------------------------------------------------------------
+// resolve_log_enabled — release default is disabled
+// -----------------------------------------------------------------------
+
+#[test]
+fn resolve_log_enabled_defaults_to_disabled() {
+    assert!(!resolve_log_enabled(None, None), "fresh install must default to disabled");
+}
+
+#[test]
+fn resolve_log_enabled_only_explicit_true_enables() {
+    assert!(resolve_log_enabled(Some("true"), None));
+    assert!(resolve_log_enabled(Some("True"), None));
+    assert!(resolve_log_enabled(Some(" true "), None));
+    assert!(!resolve_log_enabled(Some("false"), None));
+    assert!(!resolve_log_enabled(Some("1"), None), "DB value must be exactly true");
+    assert!(!resolve_log_enabled(Some("garbage"), None));
+}
+
+#[test]
+fn resolve_log_enabled_env_overrides_db() {
+    assert!(resolve_log_enabled(Some("false"), Some("1")));
+    assert!(resolve_log_enabled(None, Some("true")));
+    assert!(resolve_log_enabled(None, Some("YES")));
+    assert!(resolve_log_enabled(None, Some("on")));
+    assert!(!resolve_log_enabled(Some("true"), Some("0")));
+    assert!(!resolve_log_enabled(None, Some("off")));
+}
+
+// -----------------------------------------------------------------------
 // log_event: disabled → no write
 // -----------------------------------------------------------------------
 

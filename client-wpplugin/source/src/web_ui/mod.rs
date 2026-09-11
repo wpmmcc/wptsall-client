@@ -217,10 +217,13 @@ pub async fn run_web_ui(
             .context("Failed to load or create device_id from DB")?,
     };
 
-    // Load log settings from DB and apply to global atomics
-    let log_enabled = crate::db::system::get_system_config(&db_conn, "log_enabled")
-        .map(|v| v != "false")
-        .unwrap_or(true);
+    // Load log settings from DB and apply to global atomics.
+    // Release default: logging DISABLED — only an explicit DB value "true"
+    // (set via the Settings page) or WPTSALL_LOG_ENABLED=1 turns it on.
+    let log_enabled = crate::logging::resolve_log_enabled(
+        crate::db::system::get_system_config(&db_conn, "log_enabled").as_deref(),
+        std::env::var("WPTSALL_LOG_ENABLED").ok().as_deref(),
+    );
     let log_min_level = crate::db::system::get_system_config(&db_conn, "log_min_level")
         .unwrap_or_else(|| "info".to_string());
     crate::logging::set_log_enabled(log_enabled);

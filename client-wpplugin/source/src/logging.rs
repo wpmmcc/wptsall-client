@@ -7,7 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-static LOG_ENABLED: AtomicBool = AtomicBool::new(true);
+// Release default: logging DISABLED. Runtime entry points (web UI, worker)
+// apply the persisted Settings-page state (or the WPTSALL_LOG_ENABLED env
+// override) via resolve_log_enabled() before meaningful work begins; the
+// static starts false so any pre-config event is never persisted.
+static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 static LOG_MIN_LEVEL: AtomicU8 = AtomicU8::new(1); // 1 = info
 
 /// Maximum log file size before rotation (50 MB).
@@ -41,6 +45,23 @@ pub(crate) fn level_to_u8(level: &str) -> u8 {
 
 pub(crate) fn set_log_enabled(v: bool) {
     LOG_ENABLED.store(v, Ordering::Relaxed);
+}
+
+/// Resolve the effective log-enabled flag from its two sources.
+///
+/// Release default is **disabled**:
+/// * a missing DB value (fresh install) disables logging;
+/// * only an explicit DB value `true` (written by the Settings page) enables it;
+/// * any other DB value (including garbage) disables it;
+/// * the `WPTSALL_LOG_ENABLED` env var overrides the DB when set
+///   (`1`/`true`/`yes`/`on` enable, anything else disables).
+pub(crate) fn resolve_log_enabled(db_value: Option<&str>, env_value: Option<&str>) -> bool {
+    if let Some(env) = env_value {
+        return matches!(env.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+    }
+    db_value
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 pub(crate) fn set_log_min_level(l: &str) {
