@@ -23,7 +23,7 @@ WPTSALL Client 是 WPMMCC ATS WordPress 外掛的配套用戶端。它運行在�
 
 ## 環境需求
 - 運行 WPMMCC ATS 外掛 2.x 的 WordPress 站台——https://github.com/wpmmcc/wpmmcc-ats
-- 外掛簽發的裝置級權杖與 route secret
+- 外掛簽發的站台連接包（wp-admin → 任務管理 → 用戶端授權，或 `wp wptsall security issue-pairing-pack`）
 - 一個翻譯廠商端點(任意 HTTP(S) API)
 
 ## 預設連接埠
@@ -37,7 +37,7 @@ WPTSALL Client 是 WPMMCC ATS WordPress 外掛的配套用戶端。它運行在�
 3. 啟動 WebUI 二進位並開啟 http://127.0.0.1:8977
 
 ## 快速上手
-1. 新增站台——貼上外掛的 client URL、route secret 與裝置級權杖
+1. 新增站台——在 wp-admin（任務管理 → 用戶端授權）產生連接包，連同配對碼一起貼到用戶端的站台頁面
 2. 設定翻譯廠商——端點加憑證,全部本地保存
 3. 執行一次 Worker——領取批次、翻譯、寫回
 

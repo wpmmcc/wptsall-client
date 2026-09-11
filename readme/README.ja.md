@@ -23,7 +23,7 @@ WPTSALL Client は WPMMCC ATS WordPress プラグインの companion クライ�
 
 ## 要件
 - WPMMCC ATS プラグイン 2.x が動く WordPress サイト — https://github.com/wpmmcc/wpmmcc-ats
-- プラグインが発行するデバイストークンと route secret
+- プラグインが発行するサイト接続パック（wp-admin → タスク管理 → 認証、または `wp wptsall security issue-pairing-pack`）
 - 翻訳プロバイダーのエンドポイント(任意の HTTP(S) API)
 
 ## 既定のポート
@@ -37,7 +37,7 @@ WPTSALL Client は WPMMCC ATS WordPress プラグインの companion クライ�
 3. WebUI バイナリを起動して http://127.0.0.1:8977 を開く
 
 ## クイックスタート
-1. サイトを追加 — プラグインの client URL・route secret・デバイストークンを貼り付け
+1. サイトを追加 — wp-admin（タスク管理 → 認証）で接続パックを生成し、ペアリングコードと一緒にクライアントのサイトページに貼り付け
 2. 翻訳プロバイダーを設定 — エンドポイントと認証情報、すべてローカルに保存
 3. Worker を1回実行 — バッチを取得、翻訳、書き戻し
 

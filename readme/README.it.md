@@ -23,7 +23,7 @@ WPTSALL Client è il client companion del plugin WordPress WPMMCC ATS. Girà sul
 
 ## Requisiti
 - Un sito WordPress con il plugin WPMMCC ATS 2.x — https://github.com/wpmmcc/wpmmcc-ats
-- Un token di dispositivo e route secret rilasciati dal plugin
+- Un pacchetto di connessione emesso dal plugin (wp-admin → Gestione attività → Autorizzazione, oppure `wp wptsall security issue-pairing-pack`)
 - Un endpoint di fornitore di traduzione (qualsiasi API HTTP(S))
 
 ## Porta predefinita
@@ -37,7 +37,7 @@ WPTSALL Client è il client companion del plugin WordPress WPMMCC ATS. Girà sul
 3. Avvia il binario WebUI e apri http://127.0.0.1:8977
 
 ## Avvio rapido
-1. Aggiungi il tuo sito — incolla l'URL client del plugin, il route secret e il token di dispositivo
+1. Aggiungi il tuo sito — genera un pacchetto di connessione in wp-admin (Gestione attività → Autorizzazione) e incollalo, insieme al codice di abbinamento, nella pagina Siti del client
 2. Configura un fornitore di traduzione — endpoint più credenziali, salvati in locale
 3. Esegui il worker una volta — preleva un batch, lo traduce e riscrive i risultati
 

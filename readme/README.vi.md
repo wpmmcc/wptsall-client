@@ -23,7 +23,7 @@ WPTSALL Client là client đi kèm của plugin WordPress WPMMCC ATS. Nó chạy
 
 ## Yêu cầu
 - Một site WordPress chạy plugin WPMMCC ATS 2.x — https://github.com/wpmmcc/wpmmcc-ats
-- Token thiết bị và route secret do plugin cấp
+- Gói kết nối do plugin cấp (wp-admin → Quản lý tác vụ → Ủy quyền, hoặc `wp wptsall security issue-pairing-pack`)
 - Một endpoint nhà cung cấp dịch (bất kỳ API HTTP(S) nào)
 
 ## Cổng mặc định
@@ -37,7 +37,7 @@ WPTSALL Client là client đi kèm của plugin WordPress WPMMCC ATS. Nó chạy
 3. Khởi động binary WebUI và mở http://127.0.0.1:8977
 
 ## Bắt đầu nhanh
-1. Thêm site của bạn — dán client URL của plugin, route secret và token thiết bị
+1. Thêm site của bạn — tạo gói kết nối trong wp-admin (Quản lý tác vụ → Ủy quyền) và dán nó cùng mã ghép nối vào trang Sites của client
 2. Cấu hình nhà cung cấp dịch — endpoint cùng thông tin xác thực, lưu cục bộ
 3. Chạy Worker một lần — nó nhận một lô, dịch và ghi kết quả về
 

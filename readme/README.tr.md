@@ -23,7 +23,7 @@ WPTSALL Client, WPMMCC ATS WordPress eklentisinin companion istemcisidir. Makine
 
 ## Gereksinimler
 - WPMMCC ATS eklentisi 2.x çalıştıran bir WordPress sitesi — https://github.com/wpmmcc/wpmmcc-ats
-- Eklentinin verdiği bir cihaz token'ı ve route secret
+- Eklentinin verdiği site bağlantı paketi (wp-admin → Görev Yönetimi → Yetkilendirme, veya `wp wptsall security issue-pairing-pack`)
 - Bir çeviri sağlayıcı uç noktası (herhangi bir HTTP(S) API)
 
 ## Varsayılan port
@@ -37,7 +37,7 @@ WPTSALL Client, WPMMCC ATS WordPress eklentisinin companion istemcisidir. Makine
 3. WebUI ikili dosyasını başlatın ve http://127.0.0.1:8977 adresini açın
 
 ## Hızlı başlangıç
-1. Sitenizi ekleyin — eklentinin client URL'sini, route secret ve cihaz token'ını yapıştırın
+1. Sitenizi ekleyin — wp-admin'de (Görev Yönetimi → Yetkilendirme) bir bağlantı paketi oluşturun ve eşleştirme koduyla birlikte istemcinin Siteler sayfasına yapıştırın
 2. Bir çeviri sağlayıcı yapılandırın — uç nokta artı kimlik bilgileri, hepsi yerelde saklanır
 3. Worker'ı bir kez çalıştırın — bir toplu işi alır, çevirir ve sonuçları geri yazar
 

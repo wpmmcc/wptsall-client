@@ -23,7 +23,7 @@ WPTSALL Client는 WPMMCC ATS WordPress 플러그인의 클라이언트입니다.
 
 ## 요구 사항
 - WPMMCC ATS 플러그인 2.x가 동작하는 WordPress 사이트 — https://github.com/wpmmcc/wpmmcc-ats
-- 플러그인이 발급한 기기 토큰과 route secret
+- 플러그인이 발급한 사이트 연결 팩(wp-admin → 작업 관리 → 인증, 또는 `wp wptsall security issue-pairing-pack`)
 - 번역 제공자 엔드포인트(아무 HTTP(S) API)
 
 ## 기본 포트
@@ -37,7 +37,7 @@ WPTSALL Client는 WPMMCC ATS WordPress 플러그인의 클라이언트입니다.
 3. WebUI 바이너리를 시작하고 http://127.0.0.1:8977 열기
 
 ## 빠른 시작
-1. 사이트 추가 — 플러그인의 client URL, route secret, 기기 토큰 붙여넣기
+1. 사이트 추가 — wp-admin(작업 관리 → 인증)에서 연결 팩을 생성하고 페어링 코드와 함께 클라이언트의 사이트 페이지에 붙여넣기
 2. 번역 제공자 설정 — 엔드포인트와 자격 증명, 모두 로컬 저장
 3. Worker 1회 실행 — 배치를 가져와 번역하고 다시 기록
 

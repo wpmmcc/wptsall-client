@@ -23,7 +23,7 @@ WPTSALL Client 是 WPMMCC ATS WordPress 插件的配套客户端。它运行在�
 
 ## 环境要求
 - 运行 WPMMCC ATS 插件 2.x 的 WordPress 站点 — https://github.com/wpmmcc/wpmmcc-ats
-- 插件签发的设备级令牌与路由密钥（route secret）
+- 插件签发的站点连接包（wp-admin → 任务管理 → 客户端授权，或 `wp wptsall security issue-pairing-pack`）
 - 一个翻译厂商端点（任意 HTTP(S) API）
 
 ## 默认端口
@@ -37,7 +37,7 @@ WPTSALL Client 是 WPMMCC ATS WordPress 插件的配套客户端。它运行在�
 3. 启动 WebUI 二进制并访问 http://127.0.0.1:8977
 
 ## 快速上手
-1. 添加站点 — 填入插件的客户端 URL、路由密钥（route secret）与设备级令牌
+1. 添加站点 — 在 wp-admin（任务管理 → 客户端授权）生成连接包，连同配对码一起粘贴到客户端的站点页面
 2. 配置翻译厂商 — 填入端点与凭据，全部保存在本地
 3. 执行一次 Worker — 领取批次任务，翻译并写回结果
 

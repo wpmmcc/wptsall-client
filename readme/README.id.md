@@ -23,7 +23,7 @@ WPTSALL Client adalah klien pendamping plugin WordPress WPMMCC ATS. Ia berjalan 
 
 ## Persyaratan
 - Situs WordPress dengan plugin WPMMCC ATS 2.x — https://github.com/wpmmcc/wpmmcc-ats
-- Token perangkat dan route secret yang diterbitkan plugin
+- Paket koneksi yang diterbitkan plugin (wp-admin → Manajemen Tugas → Otorisasi, atau `wp wptsall security issue-pairing-pack`)
 - Endpoint penyedia terjemahan (API HTTP(S) apa pun)
 
 ## Port bawaan
@@ -37,7 +37,7 @@ WPTSALL Client adalah klien pendamping plugin WordPress WPMMCC ATS. Ia berjalan 
 3. Jalankan biner WebUI dan buka http://127.0.0.1:8977
 
 ## Mulai cepat
-1. Tambahkan situs Anda — tempel URL klien plugin, route secret, dan token perangkat
+1. Tambahkan situs Anda — buat paket koneksi di wp-admin (Manajemen Tugas → Otorisasi) dan tempelkan bersama kode penyandingan di halaman Situs klien
 2. Konfigurasikan penyedia terjemahan — endpoint plus kredensial, semuanya tersimpan lokal
 3. Jalankan Worker sekali — ia mengambil satu batch, menerjemahkan, dan menulis hasilnya kembali
 
