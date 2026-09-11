@@ -39,6 +39,23 @@ WPTSALL Client là client đi kèm của plugin WordPress WPMMCC ATS. Nó chạy
 ## Dữ liệu cục bộ & riêng tư
 Mọi cấu hình và trạng thái tác vụ đều ở trên máy bạn (SQLite cộng tệp cục bộ). Client chỉ giao tiếp với site WordPress bạn cấu hình và endpoint nhà cung cấp bạn chọn.
 
+## Updating
+- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
+- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
+- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+
+## Uninstalling
+- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
+- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
+- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
+- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+
+## Open-source components
+- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
+- Desktop app — Tauri 2 (native shell with the system webview)
+- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
+- Update security — minisign signatures and signed SHA256SUMS
+- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
 ## Languages
 Giao diện client có sẵn bản địa hóa riêng. README này có 16 ngôn ngữ — xem bảng ở đầu trang. Hoan nghênh đóng góp thêm ngôn ngữ.
 

@@ -39,6 +39,23 @@ WPTSALL Client is the companion client for the WPMMCC ATS WordPress plugin. It r
 ## Local data & privacy
 All configuration and task state stay on your machine (SQLite plus local files). The client only ever talks to the WordPress site you configured and the translation provider endpoint you chose. Debug logging is off by default; the Settings page can turn local logging on or off at runtime.
 
+## Updating
+- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
+- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
+- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+
+## Uninstalling
+- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
+- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
+- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
+- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+
+## Open-source components
+- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
+- Desktop app — Tauri 2 (native shell with the system webview)
+- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
+- Update security — minisign signatures and signed SHA256SUMS
+- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
 ## Languages
 The client UI ships its own localization. This README is available in 16 languages — see the table at the top. Contributions for further languages are welcome.
 

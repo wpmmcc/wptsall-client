@@ -39,6 +39,23 @@ WPTSALL Client는 WPMMCC ATS WordPress 플러그인의 클라이언트입니다.
 ## 로컬 데이터와 프라이버시
 모든 설정과 작업 상태는 내 컴퓨터에 남습니다(SQLite + 로컬 파일). 클라이언트가 통신하는 대상은 설정한 WordPress 사이트와 선택한 번역 제공자 엔드포인트뿐입니다.
 
+## Updating
+- Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
+- Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
+- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+
+## Uninstalling
+- Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)
+- An uninstaller stops and removes the background service (systemd user unit, LaunchAgent or Windows service), the command-line shortcuts and the install directory
+- Your data — local SQLite database, configuration and logs — is kept by default. Add --purge-data (Linux/macOS) or -PurgeData (Windows) to remove it as well
+- If you have both the WebUI and the Desktop app, the shared install directory is kept unless you also pass --purge-shared
+
+## Open-source components
+- Rust core — tokio, reqwest (rustls TLS), serde/serde_json, rusqlite with bundled SQLite, aes-gcm/hkdf/sha2/hmac/rsa/jsonwebtoken for crypto, aws-sdk-s3 for S3-compatible providers, extism as the WASM component runtime
+- Desktop app — Tauri 2 (native shell with the system webview)
+- Web UI — Svelte 5, Vite, Tailwind CSS, svelte-i18n and lucide icons
+- Update security — minisign signatures and signed SHA256SUMS
+- Complete version-pinned lists are in Cargo.toml and frontend/package.json; every component ships under an MIT / Apache-2.0 / ISC-style license compatible with this project's GPL-2.0-or-later
 ## Languages
 클라이언트 UI 자체 로컬라이제이션을 포함합니다. 이 README는 16개 언어로 제공됩니다 — 상단 표 참고. 더 많은 언어 기여를 환영합니다.
 
