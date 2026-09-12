@@ -22,14 +22,16 @@ jobs:
     #   windows-latest    = windows-x86_64
     #   windows-11-arm    = windows-aarch64
     #   macos-latest      = darwin-aarch64  (macos-latest IS Apple Silicon)
-    #   macos-13          = darwin-x86_64   (last Intel label; on GitHub's
-    #                                      retirement path — if it goes away,
-    #                                      the darwin-x86_64 cell moves to
+    #   macos-15-intel    = darwin-x86_64   (transition label: macos-13 was
+    #                                      retired 2025-12-04; Intel lives on
+    #                                      via macos-15-intel until the macOS
+    #                                      15 image retires ~Fall 2027 — after
+    #                                      that, darwin-x86_64 falls back to
     #                                      cross-compile evidence only)
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-13]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -104,7 +106,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-13]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

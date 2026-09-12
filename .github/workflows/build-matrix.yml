@@ -28,13 +28,14 @@ jobs:
     # keys updater.rs probes (linux/windows x86_64+aarch64, darwin
     # x86_64+aarch64). The plat mapping below must keep emitting exactly
     # those keys (note arm64 → aarch64: RUNNER_ARCH says ARM64, the OTA
-    # platform key says aarch64).
+    # platform key says aarch64). darwin-x86_64 rides the macos-15-intel
+    # transition label (macos-13 retired 2025-12-04).
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-13]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
     env:
       SMOKE_PORT: '18123'
     steps:
@@ -143,13 +144,13 @@ jobs:
   desktop-build:
     name: Desktop (Tauri) release build (${{ matrix.os }})
     # 2026-09-12 (12-cell matrix): one leg per shipped platform (same six
-    # labels as webui-build).
+    # labels as webui-build, incl. the macos-15-intel transition label).
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-13]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
     steps:
       - uses: actions/checkout@v4
 
