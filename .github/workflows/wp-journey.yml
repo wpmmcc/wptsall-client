@@ -1,0 +1,332 @@
+name: WP + plugin + client journey
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      plugin_ref:
+        description: 'wpmmcc/wpmmcc-ats ref to test against (default: main)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The end-to-end lane the unit/CI jobs cannot be: a real WordPress site and
+# the real plugin installed on the runner, with BOTH client UI agents
+# (WebUI + desktop-agent parity instance) installed from kit layout,
+# paired via production connection packs, and driven through real UI
+# operations in a browser, then uninstalled and checked for residue.
+#
+# What each leg proves:
+#   install    - kit layout (bin + ui + version stamps) extracted, client
+#                first-run serves the embedded WebUI and answers /api/status
+#   pair       - production pack issuance (wptsall_create_site_connection_pack,
+#                device-bound) + client /api/site-connections/import + WP-side
+#                single-claim verification + live site_status=active round trip
+#   ui ops     - Playwright (chromium) drives the served SPA: nav to Sites,
+#                the paired site is listed, nav round trip; screenshot artifact
+#   uninstall  - both clients stopped, no process residue on the exact
+#                install paths, install roots + data dirs removed, ports freed
+#
+# Out of scope on purpose:
+#   update/self-replace - proven by wptsall-client.ota-upgrade.yml (signed
+#   manifest + kit, positive/negative/recovery rounds) on this same repo;
+#   desktop GUI window smoke (Xvfb + tauri-driver + WebKitWebDriver) stays on
+#   the local Lab lane (desktop runner coverage = compile + unit tests +
+#   headless integration via ci.yml).
+#
+# The plugin under test is the PUBLISHED public repo (wpmmcc/wpmmcc-ats),
+# so this lane continuously proves the client works against the released
+# plugin, not just the in-tree development copy.
+jobs:
+  wp-client-journey:
+    name: WP 6.7 + plugin + dual client agents (pair / UI / uninstall)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --host=localhost -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      WP_PATH: /tmp/wp
+      WP_URL: http://127.0.0.1:8080
+      JOURNEY_A_PORT: '18140'
+      JOURNEY_B_PORT: '18141'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out published plugin (wpmmcc/wpmmcc-ats)
+        uses: actions/checkout@v4
+        with:
+          repository: wpmmcc/wpmmcc-ats
+          ref: ${{ github.event.inputs.plugin_ref || 'main' }}
+          path: plugin-src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+
+      - name: Build WebUI frontend (embedded dist)
+        working-directory: client-wpplugin/source/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Playwright chromium
+        working-directory: client-wpplugin/source/frontend
+        run: npx playwright install --with-deps chromium
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-wpplugin/source
+
+      - name: Release build (core binary)
+        run: cargo build --release --bin wptsall-client --manifest-path client-wpplugin/source/Cargo.toml
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mysqli
+          coverage: none
+
+      - name: Install wp-cli
+        run: |
+          curl -sSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /tmp/wp-cli.phar
+          sudo install -m 0755 /tmp/wp-cli.phar /usr/local/bin/wp
+          wp --allow-root --info | sed -n '1,4p'
+
+      - name: Install WordPress 6.7 + published plugin
+        run: |
+          set -euo pipefail
+          wp core download --version=6.7 --path="$WP_PATH" --allow-root
+          wp config create --path="$WP_PATH" --dbname=wp --dbuser=root --dbpass=root \
+            --dbhost=127.0.0.1:3306 --allow-root
+          wp db create --path="$WP_PATH" --allow-root
+          wp core install --path="$WP_PATH" --url="$WP_URL" --title=WPTSALLJourney \
+            --admin_user=admin --admin_password=journey-admin-pw \
+            --admin_email=ci@example.com --skip-email --allow-root
+          wp core version --path="$WP_PATH" --allow-root
+          mkdir -p "$WP_PATH/wp-content/plugins/wpmmcc-ats"
+          tar -C "$GITHUB_WORKSPACE/plugin-src" --exclude=./.git -cf - . \
+            | tar -C "$WP_PATH/wp-content/plugins/wpmmcc-ats" -xf -
+          wp plugin activate wpmmcc-ats --path="$WP_PATH" --allow-root
+          wp rewrite structure '/%postname%/' --hard --path="$WP_PATH" --allow-root
+          wp post create --post_title='Journey seed' --post_status=publish \
+            --post_content='Journey lane seed post.' --path="$WP_PATH" --allow-root
+
+      # One step on purpose: every long-running process (php -S, both
+      # clients) must live inside the step that asserts against them —
+      # background processes are not reliable across step boundaries.
+      - name: Run the journey (pair both agents, drive the WebUI, uninstall)
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+          DIST="$ROOT/client-wpplugin/source/frontend/dist"
+          BIN="$ROOT/client-wpplugin/source/target/release/wptsall-client"
+
+          # --- WordPress served via php -S (index.php as router) -----------
+          PHP_CLI_SERVER_WORKERS=4 nohup php -S 127.0.0.1:8080 \
+            -t "$WP_PATH" "$WP_PATH/index.php" > /tmp/wp-server.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf -o /dev/null "$WP_URL/" && break; sleep 1
+          done
+          curl -sf -o /dev/null "$WP_URL/" || { cat /tmp/wp-server.log; exit 1; }
+          echo "wp server up: $WP_URL"
+
+          # --- install leg: both agents from kit layout ---------------------
+          for inst in a b; do
+            mkdir -p "/tmp/journey-install-$inst/bin" \
+                     "/tmp/journey-install-$inst/ui/webui" \
+                     "/tmp/journey-$inst/data"
+            cp "$BIN" "/tmp/journey-install-$inst/bin/"
+            cp -r "$DIST/." "/tmp/journey-install-$inst/ui/webui/"
+            echo ci > "/tmp/journey-install-$inst/VERSION-WEBUI"
+          done
+          for inst in a b; do
+            port_var="JOURNEY_$(echo "$inst" | tr 'ab' 'AB')_PORT"
+            port="${!port_var}"
+            setsid env WPTSALL_WEB_UI=1 \
+              WPTSALL_WEB_UI_BIND="127.0.0.1:$port" \
+              WPTSALL_WEB_UI_PORT="$port" \
+              WPTSALL_DATA_DIR="/tmp/journey-$inst/data" \
+              WPTSALL_DB_PATH="/tmp/journey-$inst/wptsall.db" \
+              WPTSALL_LOG_FILE="/tmp/journey-$inst/client.log" \
+              WPTSALL_INSTALL_ROOT="/tmp/journey-install-$inst" \
+              "/tmp/journey-install-$inst/bin/wptsall-client" \
+              > "/tmp/journey-$inst/stdout.log" 2>&1 &
+            echo $! > "/tmp/journey-$inst/pid"
+          done
+          for port in "$JOURNEY_A_PORT" "$JOURNEY_B_PORT"; do
+            for _ in $(seq 1 30); do
+              curl -fsS "http://127.0.0.1:$port/api/status" -o /dev/null 2>/dev/null && break
+              sleep 1
+            done
+            curl -fsS "http://127.0.0.1:$port/api/status" -o /dev/null \
+              || { cat /tmp/journey-a/stdout.log /tmp/journey-b/stdout.log 2>/dev/null || true
+                   echo "client on :$port did not come up" >&2; exit 1; }
+          done
+          echo "both client agents up (webui :$JOURNEY_A_PORT, desktop-agent parity :$JOURNEY_B_PORT)"
+
+          # --- pair leg: production pack per device, import, claim ----------
+          # Packs are device-bound (PAIRING_DEVICE_MISMATCH otherwise), so the
+          # client device ids are read FIRST and baked into the issuance.
+          cat > /tmp/issue-pack.php <<'PHP'
+          <?php
+          $device = getenv( 'JOURNEY_DEVICE_ID' );
+          $slug   = getenv( 'JOURNEY_PACK_SLUG' );
+          if ( empty( $device ) || empty( $slug ) ) {
+            fwrite( STDERR, "JOURNEY_DEVICE_ID / JOURNEY_PACK_SLUG missing\n" ); exit( 1 );
+          }
+          if ( ! function_exists( 'wptsall_create_site_connection_pack' ) ) {
+            fwrite( STDERR, "pack API unavailable\n" ); exit( 1 );
+          }
+          $pack = wptsall_create_site_connection_pack( $device, 'CI Journey ' . $slug, 600 );
+          $dir = getenv( 'WP_PATH' );
+          file_put_contents( $dir . "/journey-pack-$slug.json",
+            wp_json_encode( $pack, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) );
+          echo "pack-issued-for: $device\n";
+          PHP
+          cat > /tmp/verify-claim.php <<'PHP'
+          <?php
+          $records = wptsall_load_client_pairing_codes();
+          foreach ( $records as $r ) {
+            $dev = (string) ( $r['device_id'] ?? '' );
+            if ( in_array( $dev, explode( ',', (string) getenv( 'JOURNEY_DEVICES' ) ), true )
+                 && empty( $r['claimed_at'] ) ) {
+              fwrite( STDERR, "unclaimed pairing record remains for $dev\n" ); exit( 1 );
+            }
+          }
+          echo "pairing-consumed-ok records=" . count( $records ) . "\n";
+          PHP
+          for inst in a b; do
+            port_var="JOURNEY_$(echo "$inst" | tr 'ab' 'AB')_PORT"
+            port="${!port_var}"
+            dev="$(curl -fsS "http://127.0.0.1:$port/api/status" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["device_id"])')"
+            cp /tmp/issue-pack.php "$WP_PATH/issue-pack.php"
+            JOURNEY_DEVICE_ID="$dev" JOURNEY_PACK_SLUG="$inst" \
+              wp eval-file "$WP_PATH/issue-pack.php" --path="$WP_PATH" --allow-root
+            python3 - "$inst" "$port" <<'PY'
+          import json, os, sys, urllib.request
+          inst, port = sys.argv[1], sys.argv[2]
+          pack = json.load(open(f"{os.environ['WP_PATH']}/journey-pack-{inst}.json"))
+          req = urllib.request.Request(
+              f'http://127.0.0.1:{port}/api/site-connections/import',
+              data=json.dumps({'site_connection_pack': pack}).encode(),
+              headers={'Content-Type': 'application/json'}, method='POST')
+          r = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+          assert r.get('success') is True, r
+          assert r['data']['pairing_claimed'] is True, r
+          assert r['data']['api_base_url'] == 'http://127.0.0.1:8080', r
+          print(f'pair-ok {inst}: claimed, site bound')
+          PY
+          done
+          DEV_A="$(curl -fsS "http://127.0.0.1:$JOURNEY_A_PORT/api/status" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["device_id"])')"
+          DEV_B="$(curl -fsS "http://127.0.0.1:$JOURNEY_B_PORT/api/status" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["device_id"])')"
+          cp /tmp/verify-claim.php "$WP_PATH/verify-claim.php"
+          JOURNEY_DEVICES="$DEV_A,$DEV_B" \
+            wp eval-file "$WP_PATH/verify-claim.php" --path="$WP_PATH" --allow-root
+          for port in "$JOURNEY_A_PORT" "$JOURNEY_B_PORT"; do
+            curl -fsS "http://127.0.0.1:$port/api/status" \
+              | python3 -c 'import json,sys
+          d = json.load(sys.stdin)["data"]
+          domains = [x["api_base_url"] for x in d.get("domains", [])]
+          assert domains == ["http://127.0.0.1:8080"], domains
+          assert d["domains"][0]["site_status"] == "active", d["domains"][0]
+          print(f"site-active-ok :{port}")'
+          done
+          echo "pair leg OK: both agents paired, packs single-claimed, sites live-active"
+
+          # --- UI ops leg: real browser against the served WebUI ------------
+          cat > "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs" <<'EOF'
+          import { chromium } from '@playwright/test';
+          const BASE = process.env.JOURNEY_WEBUI_BASE;
+          const SITE_URL = process.env.JOURNEY_SITE_URL;
+          const OUT = process.env.JOURNEY_SHOT;
+          const browser = await chromium.launch();
+          const page = await browser.newPage();
+          const failures = [];
+          const step = (name, ok) => {
+            console.log(`${ok ? 'PASS' : 'FAIL'}: ${name}`);
+            if (!ok) failures.push(name);
+          };
+          await page.goto(BASE + '/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+          step('title is WPTSALL Client', (await page.title()) === 'WPTSALL Client');
+          const sitesNav = page.getByRole('button', { name: 'Sites', exact: true });
+          await sitesNav.waitFor({ state: 'visible', timeout: 15000 });
+          await sitesNav.click();
+          let listed = false;
+          try {
+            await page.getByText(SITE_URL, { exact: false }).first()
+              .waitFor({ state: 'visible', timeout: 15000 });
+            listed = true;
+          } catch { listed = false; }
+          step(`bound site ${SITE_URL} listed on Sites page`, listed);
+          await page.getByRole('button', { name: 'Overview', exact: true }).click();
+          await page.waitForTimeout(300);
+          step('navigated back to Overview', true);
+          await page.screenshot({ path: OUT, fullPage: true });
+          await browser.close();
+          if (failures.length) {
+            console.error('UI journey FAILED: ' + failures.join(', '));
+            process.exit(1);
+          }
+          console.log('UI journey OK');
+          EOF
+          JOURNEY_WEBUI_BASE="http://127.0.0.1:$JOURNEY_A_PORT" \
+          JOURNEY_SITE_URL="$WP_URL" \
+          JOURNEY_SHOT="$RUNNER_TEMP/journey-ui-sites.png" \
+            node "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
+          rm -f "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
+          echo "ui ops leg OK: SPA served, Sites nav, paired site listed"
+
+          # --- uninstall leg: stop, no residue, remove, ports freed ---------
+          kill "$(cat /tmp/journey-a/pid)" "$(cat /tmp/journey-b/pid)" 2>/dev/null || true
+          sleep 2
+          residue="$(pgrep -f '/tmp/journey-install-' || true)"
+          if [ -n "$residue" ]; then
+            echo "client processes survived stop on install paths:" >&2
+            echo "$residue" >&2
+            exit 1
+          fi
+          rm -rf /tmp/journey-install-a /tmp/journey-install-b \
+                 /tmp/journey-a /tmp/journey-b
+          for port in "$JOURNEY_A_PORT" "$JOURNEY_B_PORT"; do
+            if curl -s -o /dev/null -m 2 "http://127.0.0.1:$port/api/status"; then
+              echo "port $port still answering after uninstall" >&2
+              exit 1
+            fi
+          done
+          for p in /tmp/journey-install-a /tmp/journey-a /tmp/journey-install-b /tmp/journey-b; do
+            [ ! -e "$p" ] || { echo "$p survived uninstall" >&2; exit 1; }
+          done
+          echo "uninstall leg OK: no process residue, roots + data removed, ports freed"
+
+          pkill -f 'php -S 127.0.0.1:8080' 2>/dev/null || true
+          echo "JOURNEY OK: install -> pair -> UI ops -> uninstall (dual agents) all green"
+
+      - name: Upload UI screenshot
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: journey-ui-sites
+          path: ${{ runner.temp }}/journey-ui-sites.png
+          if-no-files-found: ignore
