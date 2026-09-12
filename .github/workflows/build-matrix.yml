@@ -24,12 +24,17 @@ concurrency:
 jobs:
   webui-build:
     name: WebUI release build + smoke + kit (${{ matrix.os }})
+    # 2026-09-12 (12-cell matrix): one leg per SHIPPED platform — the six
+    # keys updater.rs probes (linux/windows x86_64+aarch64, darwin
+    # x86_64+aarch64). The plat mapping below must keep emitting exactly
+    # those keys (note arm64 → aarch64: RUNNER_ARCH says ARM64, the OTA
+    # platform key says aarch64).
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-13]
     env:
       SMOKE_PORT: '18123'
     steps:
@@ -63,7 +68,7 @@ jobs:
           set -euo pipefail
           version="$(cat "$GITHUB_WORKSPACE/VERSION" | tr -d '[:space:]')"
           plat="$(echo "$RUNNER_OS-$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]' \
-            | sed 's/macos/darwin/;s/x64/x86_64/')"
+            | sed 's/macos/darwin/;s/x64/x86_64/;s/arm64/aarch64/')"
           ext=''
           if [ "$RUNNER_OS" = "Windows" ]; then ext='.exe'; fi
           stage="$RUNNER_TEMP/kit-stage/wptsall-client-webui"
@@ -137,12 +142,14 @@ jobs:
 
   desktop-build:
     name: Desktop (Tauri) release build (${{ matrix.os }})
+    # 2026-09-12 (12-cell matrix): one leg per shipped platform (same six
+    # labels as webui-build).
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-13]
     steps:
       - uses: actions/checkout@v4
 

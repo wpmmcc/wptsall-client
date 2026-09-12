@@ -12,10 +12,24 @@ jobs:
     # roots, DB paths differ per OS); unit tests must pass on every desktop
     # OS we ship kits for, not just the Linux lane (2026-09-12: was
     # ubuntu-only — win/mac only compiled + smoke-tested).
+    #
+    # 2026-09-12 (12-cell matrix): the OTA/cross-compile contract ships SIX
+    # platforms (linux/windows x86_64+aarch64, darwin x86_64+aarch64) —
+    # updater.rs probes exactly these — so the matrix runs one leg per
+    # shipped platform:
+    #   ubuntu-latest     = linux-x86_64
+    #   ubuntu-24.04-arm  = linux-aarch64   (free ARM runners, public repo)
+    #   windows-latest    = windows-x86_64
+    #   windows-11-arm    = windows-aarch64
+    #   macos-latest      = darwin-aarch64  (macos-latest IS Apple Silicon)
+    #   macos-13          = darwin-x86_64   (last Intel label; on GitHub's
+    #                                      retirement path — if it goes away,
+    #                                      the darwin-x86_64 cell moves to
+    #                                      cross-compile evidence only)
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-13]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -80,8 +94,17 @@ jobs:
       - run: npm run build
 
   desktop-check:
-    name: Desktop cargo test + check (Tauri v2)
-    runs-on: ubuntu-latest
+    # 2026-09-12 (12-cell matrix): was ubuntu-only, so the desktop crate's
+    # unit tests only ever executed on linux-x86_64 — win/mac legs compiled
+    # (build-matrix) but never ran tests. One leg per shipped platform, same
+    # six labels as core-unit: covers the Desktop column of the 2 UI x 6
+    # platform matrix.
+    name: Desktop cargo test + check (Tauri v2, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-13]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -98,6 +121,7 @@ jobs:
           npm run build
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Tauri v2 Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
           # The runner image's google-chrome apt source (any file format,
           # list or deb822) intermittently hash-mismatches on dl.google.com
