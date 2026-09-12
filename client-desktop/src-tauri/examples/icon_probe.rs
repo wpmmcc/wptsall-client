@@ -12,9 +12,14 @@
 // unbundled `cargo run` sessions show a generic window icon. Keep this
 // probe to re-verify behavior on other distros/WMs (KDE, Xfce) where the
 // GDK path may still work.
-use gtk::prelude::*;
-
+//
+// Linux-only: the gtk crate is a linux target dependency, and `cargo test`
+// compiles examples — on the 12-cell CI matrix (2026-09-12) this example
+// broke `cargo test` on darwin/windows with E0433 until it was gated.
+#[cfg(target_os = "linux")]
 fn main() {
+    use gtk::prelude::*;
+
     let app = gtk::Application::new(None, gtk::gio::ApplicationFlags::empty());
     app.connect_activate(|app| {
         let win = gtk::ApplicationWindow::new(app);
@@ -50,4 +55,11 @@ fn main() {
         win.show_all();
     });
     app.run();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    // Keep the example target compiling on darwin/windows (`cargo test`
+    // builds examples there too): the probe is meaningless without GTK.
+    eprintln!("icon_probe: linux-only GTK probe; nothing to do on this platform");
 }
