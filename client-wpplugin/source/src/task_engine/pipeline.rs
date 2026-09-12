@@ -88,15 +88,36 @@ fn short_domain_fingerprint(wp_base: &str) -> String {
     digest[..6].iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Normalize path separators to `/`. The pipeline's canonical layout strings
+/// use `/`, but on Windows the data dir (and paths built from PathBuf) arrive
+/// with `\`; std::fs accepts both on Windows, so comparison is the only place
+/// separators matter. Found by the 3-OS CI matrix: the raw-file cleanup never
+/// matched on Windows and silently leaked raw files after every sync.
+fn normalize_sep(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// `<data_dir>/<kind>/` prefix in separator-agnostic form.
+fn data_dir_kind_prefix(data_dir: &str, kind: &str) -> String {
+    let base = normalize_sep(data_dir).trim_end_matches('/').to_string();
+    format!("{}/{}/", base, kind)
+}
+
+/// Split the `<kind>/<rest...>` suffix off a data-dir path, agnostic to the
+/// platform separator. Returns None when the path does not live under the
+/// given kind directory.
+pub(crate) fn strip_data_dir_kind(path: &str, data_dir: &str, kind: &str) -> Option<String> {
+    normalize_sep(path)
+        .strip_prefix(&data_dir_kind_prefix(data_dir, kind))
+        .map(|rest| rest.to_string())
+}
+
 /// Derive the translated file path from a raw path by substituting the
 /// `raw/` segment with `translated/`.
 pub(crate) fn build_translated_path(raw_path: &str, data_dir: &str, _domain_key: &str) -> String {
-    let raw_prefix = format!("{}/raw/", data_dir);
-    let translated_prefix = format!("{}/translated/", data_dir);
-    if raw_path.starts_with(&raw_prefix) {
-        format!("{}{}", translated_prefix, &raw_path[raw_prefix.len()..])
-    } else {
-        format!("{}.translated", raw_path)
+    match strip_data_dir_kind(raw_path, data_dir, "raw") {
+        Some(rest) => format!("{}{}", data_dir_kind_prefix(data_dir, "translated"), rest),
+        None => format!("{}.translated", raw_path),
     }
 }
 
@@ -2940,16 +2961,12 @@ pub(crate) async fn sync_item_to_wp(
             // 5. Clean up pipeline data files (raw + translated) after successful sync
             let _ = std::fs::remove_file(translated_path);
             // Derive raw path from translated path and clean it up too
+            // (separator-agnostic: on Windows the translated path carries
+            // `\` while this layout is `/`-canonical — see strip_data_dir_kind).
             let data_dir = std::env::var("WPTSALL_DATA_DIR")
                 .unwrap_or_else(|_| crate::config::DEFAULT_DATA_DIR.to_string());
-            let translated_prefix = format!("{}/translated/", data_dir);
-            let raw_prefix = format!("{}/raw/", data_dir);
-            if translated_path.starts_with(&translated_prefix) {
-                let raw_path = format!(
-                    "{}{}",
-                    raw_prefix,
-                    &translated_path[translated_prefix.len()..]
-                );
+            if let Some(rest) = strip_data_dir_kind(translated_path, &data_dir, "translated") {
+                let raw_path = format!("{}{}", data_dir_kind_prefix(&data_dir, "raw"), rest);
                 let _ = std::fs::remove_file(&raw_path);
             }
 
@@ -3088,15 +3105,10 @@ pub(crate) async fn sync_i18n_item_to_wp(
             let _ = std::fs::remove_file(translated_path);
             let data_dir = std::env::var("WPTSALL_DATA_DIR")
                 .unwrap_or_else(|_| crate::config::DEFAULT_DATA_DIR.to_string());
-            let translated_prefix = format!("{}/translated/", data_dir);
-            let raw_prefix = format!("{}/raw/", data_dir);
-            if translated_path.starts_with(&translated_prefix) {
-                let raw_path = format!(
-                    "{}{}",
-                    raw_prefix,
-                    &translated_path[translated_prefix.len()..]
-                );
-                let _ = std::fs::remove_file(raw_path);
+            // Separator-agnostic derivation (Windows paths carry `\`).
+            if let Some(rest) = strip_data_dir_kind(translated_path, &data_dir, "translated") {
+                let raw_path = format!("{}{}", data_dir_kind_prefix(&data_dir, "raw"), rest);
+                let _ = std::fs::remove_file(&raw_path);
             }
             let _ = log_event(
                 log_file,

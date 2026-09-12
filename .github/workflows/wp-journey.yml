@@ -245,12 +245,12 @@ jobs:
             wp eval-file "$WP_PATH/verify-claim.php" --path="$WP_PATH" --allow-root
           for port in "$JOURNEY_A_PORT" "$JOURNEY_B_PORT"; do
             curl -fsS "http://127.0.0.1:$port/api/status" \
-              | python3 -c 'import json,sys
+              | JOURNEY_PORT="$port" python3 -c 'import json, os, sys
           d = json.load(sys.stdin)["data"]
           domains = [x["api_base_url"] for x in d.get("domains", [])]
           assert domains == ["http://127.0.0.1:8080"], domains
           assert d["domains"][0]["site_status"] == "active", d["domains"][0]
-          print(f"site-active-ok :{port}")'
+          print("site-active-ok :" + os.environ["JOURNEY_PORT"])'
           done
           echo "pair leg OK: both agents paired, packs single-claimed, sites live-active"
 

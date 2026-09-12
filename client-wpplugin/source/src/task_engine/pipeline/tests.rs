@@ -3943,6 +3943,16 @@ async fn test_fetch_item_content_creates_parent_directories() {
 #[tokio::test]
 async fn test_fetch_item_content_invalid_path_returns_error() {
     let db = ensure_db(None);
+    // Unwritable location that is deterministic on every OS: a regular FILE
+    // where a parent directory would have to be (writes below it fail with
+    // ENOTDIR on Unix / ERROR_DIRECTORY on Windows). The original fixture
+    // used /proc, which only exists — and only blocks writes — on Unix; on
+    // the Windows runner the current drive happily created `<drive>\proc\..`
+    // and the fetch succeeded.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "regular file, not a directory").expect("seed blocker");
+    let raw_path = blocker.join("impossible_path").join("file.json");
     let item_id = {
         let conn = db.lock().await;
         conn.execute(
@@ -3970,7 +3980,7 @@ async fn test_fetch_item_content_invalid_path_returns_error() {
                 effective_source_lang: None,
                 effective_target_lang: None,
                 editable_overrides: None,
-                raw_path: "/proc/0/impossible_path/file.json".to_string(),
+                raw_path: raw_path.to_string_lossy().into_owned(),
                 client_task_id: "test-50".to_string(),
                 max_retries: 3,
             },
@@ -3986,7 +3996,7 @@ async fn test_fetch_item_content_invalid_path_returns_error() {
     let client = Client::new();
 
     let err = fetch_item_content(Arc::clone(&db), &client, "/dev/null", &item, &content).await;
-    assert!(err.is_err(), "writing to /proc should fail");
+    assert!(err.is_err(), "writing under a regular file must fail");
 
     // DB status should be "failed"
     let status: String = {

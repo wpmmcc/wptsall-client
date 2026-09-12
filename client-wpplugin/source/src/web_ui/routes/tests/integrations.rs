@@ -627,6 +627,18 @@ async fn vendor_oauth_callback_rejects_success_response_without_access_token() {
     let upstream_addr = upstream.local_addr().unwrap();
     tokio::spawn(async move {
         let (mut socket, _) = upstream.accept().await.unwrap();
+        // Read the request before responding (same as the passing sibling
+        // tests): dropping a socket with UNREAD received data sends a TCP
+        // RST, which on Windows can reset the connection before reqwest
+        // reads the response — surfacing as a transport error (500) instead
+        // of the 400 this test asserts.
+        let mut request = [0u8; 4096];
+        let read = socket.read(&mut request).await.unwrap();
+        let request_text = String::from_utf8_lossy(&request[..read]);
+        assert!(
+            request_text.lines().next().unwrap_or_default().starts_with("POST /token"),
+            "expected vendor oauth token exchange request"
+        );
         let body = r#"{"expires_in":3600,"refresh_token":"rt-123"}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

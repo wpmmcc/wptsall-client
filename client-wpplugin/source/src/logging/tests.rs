@@ -587,10 +587,20 @@ fn rotate_log_falls_back_to_truncate_when_rename_is_blocked() {
 
     // Block the current→.1 rename the way Windows viewers/AV do. The chain
     // shift must be unable to clear the .1 slot first:
-    //   .1 = dir   → final rename(file → dir) fails with EISDIR/ENOTDIR
+    //   .1 = dir (non-empty) → final rename(file → dir) fails with
+    //        EISDIR/ENOTEMPTY on Unix and ACCESS_DENIED on Windows. The dir
+    //        must be NON-empty: an empty dir can be REPLACED by the file on
+    //        Windows (MoveFileEx REPLACE_EXISTING), which consumed the live
+    //        log file on the 3-OS CI matrix instead of forcing the fallback.
     //   .2 = file  → i=1 rename(dir .1 → file .2) fails, .1 stays pinned
     //   .3 = dir   → i=2 rename(file .2 → dir .3) fails, .2 stays pinned
-    std::fs::create_dir(format!("{}.1", log_str)).expect("dir at .1");
+    let pin_dir = format!("{}.1", log_str);
+    std::fs::create_dir(&pin_dir).expect("dir at .1");
+    std::fs::write(
+        std::path::Path::new(&pin_dir).join("pin"),
+        "pin",
+    )
+    .expect("non-empty pin inside .1");
     std::fs::write(format!("{}.2", log_str), "pin").expect("file pin at .2");
     std::fs::create_dir(format!("{}.3", log_str)).expect("dir pin at .3");
 
@@ -601,7 +611,7 @@ fn rotate_log_falls_back_to_truncate_when_rename_is_blocked() {
     let truncated_len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(1);
     assert_eq!(truncated_len, 0, "fallback must truncate the live file");
 
-    let _ = std::fs::remove_dir(format!("{}.1", log_str));
+    let _ = std::fs::remove_dir_all(format!("{}.1", log_str));
     let _ = std::fs::remove_file(format!("{}.2", log_str));
     let _ = std::fs::remove_dir(format!("{}.3", log_str));
 }
