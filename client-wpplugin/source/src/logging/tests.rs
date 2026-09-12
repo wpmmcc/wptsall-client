@@ -593,7 +593,10 @@ fn rotate_log_falls_back_to_truncate_when_rename_is_blocked() {
     //        Windows (MoveFileEx REPLACE_EXISTING), which consumed the live
     //        log file on the 3-OS CI matrix instead of forcing the fallback.
     //   .2 = file  → i=1 rename(dir .1 → file .2) fails, .1 stays pinned
-    //   .3 = dir   → i=2 rename(file .2 → dir .3) fails, .2 stays pinned
+    //   .3 = dir (non-empty) → i=2 rename(file .2 → dir .3) fails for the
+    //        same replaceability reason — an EMPTY .3 let Windows shift the
+    //        whole chain (.2→.3, .1→.2, live→.1) so the live path vanished
+    //        instead of falling back.
     let pin_dir = format!("{}.1", log_str);
     std::fs::create_dir(&pin_dir).expect("dir at .1");
     std::fs::write(
@@ -602,7 +605,13 @@ fn rotate_log_falls_back_to_truncate_when_rename_is_blocked() {
     )
     .expect("non-empty pin inside .1");
     std::fs::write(format!("{}.2", log_str), "pin").expect("file pin at .2");
-    std::fs::create_dir(format!("{}.3", log_str)).expect("dir pin at .3");
+    let pin_dir3 = format!("{}.3", log_str);
+    std::fs::create_dir(&pin_dir3).expect("dir at .3");
+    std::fs::write(
+        std::path::Path::new(&pin_dir3).join("pin"),
+        "pin",
+    )
+    .expect("non-empty pin inside .3");
 
     // Must not error even though the rename path is blocked: the
     // copy+truncate fallback keeps size bounds enforceable.
@@ -613,5 +622,5 @@ fn rotate_log_falls_back_to_truncate_when_rename_is_blocked() {
 
     let _ = std::fs::remove_dir_all(format!("{}.1", log_str));
     let _ = std::fs::remove_file(format!("{}.2", log_str));
-    let _ = std::fs::remove_dir(format!("{}.3", log_str));
+    let _ = std::fs::remove_dir_all(format!("{}.3", log_str));
 }
