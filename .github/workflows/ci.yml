@@ -7,8 +7,16 @@ on:
 
 jobs:
   core-unit:
-    name: cargo test --lib --bins (Rust core)
-    runs-on: ubuntu-latest
+    name: cargo test --lib --bins (Rust core, ${{ matrix.os }})
+    # The core is cross-platform by contract (updater self-replace, install
+    # roots, DB paths differ per OS); unit tests must pass on every desktop
+    # OS we ship kits for, not just the Linux lane (2026-09-12: was
+    # ubuntu-only — win/mac only compiled + smoke-tested).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -34,7 +42,7 @@ jobs:
         run: cargo test --lib --bins --manifest-path client-wpplugin/source/Cargo.toml
 
   webui-frontend:
-    name: WebUI frontend (vitest + build)
+    name: WebUI frontend (svelte-check + vitest + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -47,11 +55,14 @@ jobs:
           cache: npm
           cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
       - run: npm ci
+      # Type gate: 3 type-drift errors shipped on 2026-09-12 while CI was
+      # green because no lane ran svelte-check (Vitest is untyped).
+      - run: npm run check
       - run: npm run test:unit
       - run: npm run build
 
   desktop-frontend:
-    name: Desktop frontend (vitest + build)
+    name: Desktop frontend (svelte-check + vitest + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -64,11 +75,12 @@ jobs:
           cache: npm
           cache-dependency-path: client-desktop/frontend/package-lock.json
       - run: npm ci
+      - run: npm run check
       - run: npm run test
       - run: npm run build
 
   desktop-check:
-    name: Desktop cargo check (Tauri v2)
+    name: Desktop cargo test + check (Tauri v2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -99,5 +111,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: client-desktop/src-tauri
+      # Unit tests of the desktop crate (command layer, headless — same set
+      # the private module-ci desktop-unit lane runs). 2026-09-12: this job
+      # previously ran cargo check only, so the public repo never executed
+      # the desktop crate's tests.
+      - name: Run desktop crate unit tests
+        run: cargo test --manifest-path client-desktop/src-tauri/Cargo.toml
       - name: cargo check (desktop crate + path deps)
         run: cargo check --manifest-path client-desktop/src-tauri/Cargo.toml
