@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Components
+// oracle: L2
+// 状态矩阵：默认 tab + 组件治理 tab 切换；local 模式隐藏 server 模板 tab。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import Components from './Components.svelte';

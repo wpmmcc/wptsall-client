@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Overview
+// oracle: L2
+// 状态矩阵：worker 单次运行 + 状态刷新 / 轮询区间钳位 / 启停按钮 / 缺件覆盖检查与策略阻断 / wp token 吊销指引 / local-legacy 刷新控件切换。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, cleanup } from '@testing-library/svelte';
 import Overview from './Overview.svelte';

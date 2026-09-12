@@ -70,6 +70,52 @@ pub struct I18nManager {
 
 static I18N_INSTANCE: OnceLock<I18nManager> = OnceLock::new();
 
+/// Resolve a dotted key against one language's catalog.
+///
+/// Two catalog styles are supported (2026-09-12, resolving the flat/nested
+/// mismatch documented in the client's main.rs):
+///
+/// 1. Nested objects (documented example: `"common.save"` →
+///    `{"common": {"save": "..."}}`). The nested walk runs first, so a
+///    collision between both styles resolves to the nested entry.
+/// 2. Flat dotted keys stored as literal object members
+///    (`{"app.title": "..."}`). The embedded client catalogs
+///    (`client-wpplugin/source/locales/*.json`) use this style; without
+///    the fallback every dotted lookup against them failed with
+///    KeyNotFound.
+fn translate_in(translations: &JsonValue, key: &str) -> I18nResult<String> {
+    let keys: Vec<&str> = key.split('.').collect();
+    let mut current = translations;
+
+    for (i, k) in keys.iter().enumerate() {
+        match current.get(k) {
+            Some(value) => {
+                if i == keys.len() - 1 {
+                    if let Some(text) = value.as_str() {
+                        return Ok(text.to_string());
+                    }
+                    // Last segment resolved to a non-string (or an object
+                    // when the flat style was intended) — try the flat
+                    // lookup below before giving up.
+                    break;
+                }
+                current = value;
+            }
+            None => {
+                // Segment missing in the nested walk — the catalog may be
+                // flat; try the whole dotted key as a literal member.
+                break;
+            }
+        }
+    }
+
+    translations
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| I18nError::KeyNotFound(format!("Translation key not found: {}", key)))
+}
+
 impl I18nManager {
     /// Initialize the i18n manager with translation files
     ///
@@ -179,38 +225,7 @@ impl I18nManager {
             .get(lang_code)
             .ok_or_else(|| I18nError::LanguageNotSupported(lang_code.to_string()))?;
 
-        let keys: Vec<&str> = key.split('.').collect();
-        let mut current = translations;
-
-        for (i, k) in keys.iter().enumerate() {
-            match current.get(k) {
-                Some(value) => {
-                    if i == keys.len() - 1 {
-                        // Last key - should be a string
-                        return value
-                            .as_str()
-                            .ok_or_else(|| {
-                                I18nError::KeyNotFound(format!(
-                                    "Translation value is not a string: {}",
-                                    key
-                                ))
-                            })
-                            .map(|s| s.to_string());
-                    } else {
-                        // Intermediate key - should be an object
-                        current = value;
-                    }
-                }
-                None => {
-                    return Err(I18nError::KeyNotFound(format!(
-                        "Translation key not found: {} (missing: {})",
-                        key, k
-                    )));
-                }
-            }
-        }
-
-        Err(I18nError::KeyNotFound(key.to_string()))
+        translate_in(translations, key)
     }
 
     /// Translate with fallback to default language if key not found
@@ -397,6 +412,65 @@ mod tests {
         assert_eq!(
             common_section.get("save").unwrap().as_str().unwrap(),
             "Save"
+        );
+    }
+
+    // ── flat dotted-key catalog style (2026-09-12: resolves the mismatch
+    // documented in the client's main.rs — embedded catalogs are flat) ──
+    const FLAT_EN_JSON: &str = r#"{
+      "app.title": "WPTSALL Client",
+      "app.menu.tasks": "Tasks"
+    }"#;
+
+    const FLAT_ZH_CN_JSON: &str = r#"{
+      "app.title": "WPTSALL 客户端"
+    }"#;
+
+    #[test]
+    fn test_translate_flat_catalog_keys() {
+        let manager = I18nManager::load_from_content(FLAT_EN_JSON, FLAT_ZH_CN_JSON, Language::En)
+            .expect("Failed to load flat translations");
+
+        assert_eq!(
+            manager.translate("app.title", Language::En).unwrap(),
+            "WPTSALL Client"
+        );
+        assert_eq!(
+            manager.translate("app.menu.tasks", Language::En).unwrap(),
+            "Tasks"
+        );
+        // Flat style + language fallback: key only in en, asked in zh-CN.
+        assert_eq!(
+            manager
+                .translate_with_fallback("app.menu.tasks", Language::ZhCn)
+                .unwrap(),
+            "Tasks"
+        );
+        // Flat style in the requested language wins when present.
+        assert_eq!(
+            manager.translate("app.title", Language::ZhCn).unwrap(),
+            "WPTSALL 客户端"
+        );
+        // Truly missing keys still KeyNotFound in flat catalogs.
+        match manager.translate("app.missing", Language::En) {
+            Err(I18nError::KeyNotFound(_)) => {}
+            _ => panic!("Expected KeyNotFound error for missing flat key"),
+        }
+    }
+
+    #[test]
+    fn test_nested_walk_takes_precedence_over_flat_entry() {
+        let en = r#"{
+          "app": { "title": "Nested Wins" },
+          "app.title": "Flat Loses"
+        }"#;
+        let manager = I18nManager::load_from_content(en, en, Language::En)
+            .expect("Failed to load mixed-style translations");
+
+        assert_eq!(
+            manager.translate("app.title", Language::En).unwrap(),
+            "Nested Wins",
+            "the nested walk must resolve before the flat fallback"
         );
     }
 }

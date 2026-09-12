@@ -36,3 +36,55 @@ impl GlobalKeyRegistry {
             .clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-component-rt-key-registry-rs
+    // oracle: L1
+    use super::*;
+
+    #[test]
+    fn same_key_shares_one_counter_across_lookups() {
+        let registry = GlobalKeyRegistry::new();
+        let a = registry.get_or_create("key-a");
+        let b = registry.get_or_create("key-a");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the same key_id must resolve to one shared counter"
+        );
+
+        a.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            b.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "increments through one handle must be visible through the other"
+        );
+    }
+
+    #[test]
+    fn different_keys_get_independent_counters() {
+        let registry = GlobalKeyRegistry::new();
+        let a = registry.get_or_create("key-a");
+        let b = registry.get_or_create("key-b");
+        assert!(!Arc::ptr_eq(&a, &b));
+
+        a.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            b.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "per-key limits must not bleed across key ids"
+        );
+    }
+
+    #[test]
+    fn cloned_registries_share_the_underlying_counters() {
+        let registry = GlobalKeyRegistry::new();
+        let clone = registry.clone();
+        let a = registry.get_or_create("key-a");
+        let b = clone.get_or_create("key-a");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "registry clones (one per KeyPool instance) must see the same counters"
+        );
+    }
+}

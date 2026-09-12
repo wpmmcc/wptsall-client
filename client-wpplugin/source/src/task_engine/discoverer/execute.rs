@@ -887,3 +887,80 @@ pub(super) async fn translate_content_item(
         execution_summary,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-task-engine-discoverer-execute-rs
+    // oracle: L1
+    // The heavy pipeline paths (translate_content_item_owned and friends)
+    // are exercised end-to-end in discoverer/tests.rs against a recording
+    // WP server; this module pins the pure summary aggregation contract.
+    use super::*;
+    use serde_json::json;
+
+    fn payload(field_results: Vec<CallbackFieldResult>, media: usize) -> TranslationCallbackPayload {
+        let mut payload: TranslationCallbackPayload = serde_json::from_value(json!({
+            "relation_id": 1,
+            "business_line": "post_content",
+            "object_type": "post",
+            "post_type": "post",
+            "object_id": 10,
+            "translated_fields": {},
+            "translated_meta": {},
+            "media_mappings": (0..media).map(|i| json!({
+                "source_id": i, "translated_ref": "ref"
+            })).collect::<Vec<_>>(),
+            "client_task_id": "task-1",
+            "worker_id": "worker-1",
+            "source_lang": "en_US",
+            "target_lang": "fr_FR",
+            "execution_time_ms": 1
+        }))
+        .unwrap();
+        payload.field_results = field_results;
+        payload
+    }
+
+    fn field_result(status: &str, fallback_reason: &str, detail: &str) -> CallbackFieldResult {
+        serde_json::from_value(json!({
+            "field": "post_title",
+            "status": status,
+            "fallback_reason": fallback_reason,
+            "detail": detail
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn execution_summary_counts_and_reason_precedence() {
+        let payload = payload(
+            vec![
+                field_result("completed", "", ""),
+                // First failed field: fallback_reason wins over its own
+                // detail when both are present.
+                field_result("failed", "no slot", "also detail"),
+                field_result("failed", "", "provider 500"),
+                field_result("skipped", "", ""),
+            ],
+            2,
+        );
+        let summary = build_translation_execution_summary(&payload, vec!["comp-a".into()]);
+
+        assert_eq!(summary.component_ids, vec!["comp-a".to_string()]);
+        assert_eq!(summary.media_mappings_count, 2);
+        assert_eq!(summary.failed_fields_count, 2);
+        assert_eq!(summary.primary_failure_reason.as_deref(), Some("no slot"));
+    }
+
+    #[test]
+    fn execution_summary_falls_back_to_detail_then_none() {
+        let only_detail = payload(vec![field_result("failed", "", "timeout after 3s")], 0);
+        let summary = build_translation_execution_summary(&only_detail, vec![]);
+        assert_eq!(summary.primary_failure_reason.as_deref(), Some("timeout after 3s"));
+
+        let no_failures = payload(vec![field_result("completed", "", "")], 0);
+        let summary = build_translation_execution_summary(&no_failures, vec![]);
+        assert_eq!(summary.primary_failure_reason, None);
+        assert_eq!(summary.failed_fields_count, 0);
+    }
+}

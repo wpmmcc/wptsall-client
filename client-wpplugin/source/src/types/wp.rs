@@ -344,3 +344,143 @@ pub(crate) struct ContentTranslationResult {
     pub(crate) source_lang: String,
     pub(crate) target_lang: String,
 }
+
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-types-wp-rs
+    // oracle: L1
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn callback_payload_wire_contract_defaults_and_rename() {
+        // Minimal shape as WordPress sends it: the payload carries the
+        // required fields and relies on documented defaults for the rest.
+        let payload: TranslationCallbackPayload = serde_json::from_value(json!({
+            "relation_id": 12,
+            "business_line": "post_content",
+            "object_type": "post",
+            "post_type": "page",
+            "object_id": 345,
+            "translated_fields": { "post_title": "Bonjour" },
+            "translated_meta": {},
+            "media_mappings": [],
+            "client_task_id": "task-1",
+            "worker_id": "worker-1",
+            "source_lang": "en_US",
+            "target_lang": "fr_FR",
+            "execution_time_ms": 5
+        }))
+        .unwrap();
+
+        // `post_type` on the wire lands in `subtype` (the shared field for
+        // taxonomy terms and post types).
+        assert_eq!(payload.subtype, "page");
+        assert_eq!(
+            payload.schema_version,
+            crate::config::TASK_CALLBACK_SCHEMA_VERSION,
+            "schema_version defaults to the configured protocol version"
+        );
+        assert_eq!(payload.attempt_id, "");
+        assert!(payload.field_results.is_empty());
+        assert_eq!(payload.outbox_id, None);
+        assert_eq!(payload.source_revision, "");
+
+        // Round trip: empty optional strings are skipped on the way out.
+        let wire = serde_json::to_value(&payload).unwrap();
+        assert!(wire.get("attempt_id").is_none());
+        assert!(wire.get("outbox_id").is_none());
+        assert_eq!(wire["post_type"], "page", "rename is symmetric");
+        assert_eq!(wire["schema_version"], payload.schema_version);
+    }
+
+    #[test]
+    fn media_mapping_skips_false_source_copy_flag() {
+        let mapping: MediaMapping = serde_json::from_value(json!({
+            "source_id": 7,
+            "translated_ref": "https://cdn.example/x.png"
+        }))
+        .unwrap();
+        assert!(!mapping.source_copy);
+        assert_eq!(mapping.attachment_id, None);
+
+        let wire = serde_json::to_value(&mapping).unwrap();
+        assert!(wire.get("source_copy").is_none(), "false stays off the wire");
+        assert_eq!(wire["source_id"], 7);
+
+        let lifecycle_copy: MediaMapping = serde_json::from_value(json!({
+            "source_id": 7,
+            "translated_ref": "wp-content/uploads/a.png",
+            "source_copy": true
+        }))
+        .unwrap();
+        assert!(lifecycle_copy.source_copy);
+        assert_eq!(
+            serde_json::to_value(&lifecycle_copy).unwrap()["source_copy"],
+            true
+        );
+    }
+
+    #[test]
+    fn discovery_documents_parse_with_documented_defaults() {
+        let relation: DiscoveredRelation = serde_json::from_value(json!({
+            "id": 1,
+            "source_lang": "en_US",
+            "target_site_id": "v_9",
+            "target_site_type": "virtual",
+            "target_lang": "fr_FR",
+            "sync_mode": "auto"
+        }))
+        .unwrap();
+        assert!(relation.models.is_empty());
+        assert!(relation.i18n_config.is_none());
+        assert!(relation.source_group_config.is_none());
+        assert_eq!(relation.template, "");
+        assert_eq!(relation.source_site_id, Value::Null);
+
+        // Outbox and claim responses must parse with the documented
+        // defaults for their inner collections; the envelope fields
+        // (`success`, `data`) are required.
+        let outbox: OutboxContentChangesResponse =
+            serde_json::from_value(json!({ "success": true, "data": {} })).unwrap();
+        assert!(outbox.data.items.is_empty());
+
+        let claim: ContentClaimResponse = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(claim.claimed_count, None);
+        assert!(claim.claimed_items.is_none());
+
+        let claimed: ClaimedContentItem = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(claimed.object_id, 0);
+        assert_eq!(claimed.post_type, "");
+        assert_eq!(claimed.entry_id, 0);
+    }
+
+    #[test]
+    fn i18n_callback_envelope_round_trips() {
+        let payload = I18nCallbackPayload {
+            business_line: "plugin_i18n".into(),
+            relation_id: 3,
+            client_task_id: "task-9".into(),
+            worker_id: "worker-1".into(),
+            source_lang: "en_US".into(),
+            target_lang: "fr_FR".into(),
+            entries: vec![I18nCallbackEntry {
+                entry_id: 5,
+                msgstr: "bonjour".into(),
+            }],
+        };
+        let envelope = I18nTranslatedEnvelope {
+            payload_type: "i18n_language_pack".into(),
+            idempotency_key: "lang-pack-...".into(),
+            route_secret: None,
+            payload,
+            persisted_at: 123,
+        };
+        let wire = serde_json::to_value(&envelope).unwrap();
+        assert!(wire.get("route_secret").is_none());
+        let back: I18nTranslatedEnvelope = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.payload.entries[0].entry_id, 5);
+        assert_eq!(back.payload.entries[0].msgstr, "bonjour");
+        assert_eq!(back.payload_type, "i18n_language_pack");
+    }
+}

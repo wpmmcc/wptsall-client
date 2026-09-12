@@ -215,3 +215,92 @@ pub(super) async fn persist_language_pack_batch_for_sync(
         translated_path,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-task-engine-discoverer-language-pack-rs
+    // oracle: L1
+    use super::*;
+    use serde_json::json;
+
+    fn entry(entry_id: i64, msgstr: &str) -> I18nCallbackEntry {
+        serde_json::from_value(json!({ "entry_id": entry_id, "msgstr": msgstr })).unwrap()
+    }
+
+    #[test]
+    fn storage_identity_is_deterministic_and_entry_order_insensitive() {
+        let a = language_pack_batch_storage_identity(
+            9,
+            "plugin_i18n",
+            "language_pack",
+            &[entry(2, "b"), entry(1, "a")],
+        );
+        let b = language_pack_batch_storage_identity(
+            9,
+            "plugin_i18n",
+            "language_pack",
+            &[entry(1, "a"), entry(2, "b")],
+        );
+        assert_eq!(a, b, "entry order must not change the storage identity");
+
+        // Same inputs again -> same identity (stable across restarts).
+        let c = language_pack_batch_storage_identity(
+            9,
+            "plugin_i18n",
+            "language_pack",
+            &[entry(1, "a"), entry(2, "b")],
+        );
+        assert_eq!(a, c);
+
+        // Different inputs -> different identities.
+        let other_relation = language_pack_batch_storage_identity(
+            10,
+            "plugin_i18n",
+            "language_pack",
+            &[entry(1, "a"), entry(2, "b")],
+        );
+        let other_subtype = language_pack_batch_storage_identity(
+            9,
+            "plugin_i18n",
+            "theme_i18n",
+            &[entry(1, "a"), entry(2, "b")],
+        );
+        assert_ne!(a, other_relation);
+        assert_ne!(a, other_subtype);
+
+        let (key, synthetic_id) = a;
+        assert_eq!(key.len(), 12, "storage key is the first 6 digest bytes hex");
+        assert!(synthetic_id >= 1, "synthetic object id is strictly positive");
+    }
+
+    #[test]
+    fn idempotency_key_is_content_sensitive_and_domain_normalized() {
+        let base_args = ("http://wp.example/", 5i64, "plugin_i18n", "language_pack", "en_US", "fr_FR", "worker-1");
+        let key_a = language_pack_batch_idempotency_key(
+            base_args.0, base_args.1, base_args.2, base_args.3, base_args.4, base_args.5,
+            base_args.6, &[entry(1, "bonjour"), entry(2, "salut")],
+        );
+        // Same domain modulo trailing slash -> same key.
+        let key_b = language_pack_batch_idempotency_key(
+            "http://wp.example", base_args.1, base_args.2, base_args.3, base_args.4, base_args.5,
+            base_args.6, &[entry(1, "bonjour"), entry(2, "salut")],
+        );
+        assert_eq!(key_a, key_b, "normalize_domain_base must fold the domain");
+
+        // Different translated text -> different key (content is hashed in).
+        let key_c = language_pack_batch_idempotency_key(
+            base_args.0, base_args.1, base_args.2, base_args.3, base_args.4, base_args.5,
+            base_args.6, &[entry(1, "bonsoir"), entry(2, "salut")],
+        );
+        assert_ne!(key_a, key_c);
+
+        // Different worker -> different key.
+        let key_d = language_pack_batch_idempotency_key(
+            base_args.0, base_args.1, base_args.2, base_args.3, base_args.4, base_args.5,
+            "worker-2", &[entry(1, "bonjour"), entry(2, "salut")],
+        );
+        assert_ne!(key_a, key_d);
+
+        assert!(key_a.starts_with("lang-pack-"), "documented key prefix");
+    }
+}

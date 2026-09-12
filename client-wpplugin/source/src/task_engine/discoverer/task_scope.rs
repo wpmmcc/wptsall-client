@@ -97,3 +97,96 @@ pub(super) fn apply_discovery_task_relation_overrides(
     }
     effective_relation
 }
+
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-task-engine-discoverer-task-scope-rs
+    // oracle: L1
+    // The happy path (editable overrides applied to a scoped registry) is
+    // exercised in discoverer/tests.rs; these tests pin the guard rails and
+    // the relation-override semantics.
+    use super::*;
+    use serde_json::json;
+
+    fn base_relation() -> DiscoveredRelation {
+        serde_json::from_value(json!({
+            "id": 1,
+            "source_lang": "en_US",
+            "target_site_id": "v_1",
+            "target_site_type": "virtual",
+            "target_lang": "fr_FR",
+            "sync_mode": "auto"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn relation_overrides_apply_only_when_present() {
+        let relation = base_relation();
+        let both = DiscoveryTaskParams {
+            effective_source_lang: Some("de_DE".into()),
+            effective_target_lang: Some("ja_JP".into()),
+            ..Default::default()
+        };
+        let effective = apply_discovery_task_relation_overrides(&relation, &both);
+        assert_eq!(effective.source_lang, "de_DE");
+        assert_eq!(effective.target_lang, "ja_JP");
+
+        let none = DiscoveryTaskParams::default();
+        let untouched = apply_discovery_task_relation_overrides(&relation, &none);
+        assert_eq!(untouched.source_lang, "en_US");
+        assert_eq!(untouched.target_lang, "fr_FR");
+    }
+
+    #[test]
+    fn task_scoped_registry_rejects_overrides_without_selected_component() {
+        let err = build_task_scoped_runtime_registry(
+            None,
+            None,
+            Some(&json!({ "temperature": 0.5 })),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("requires selected_component_id"),
+            "err={err}"
+        );
+
+        // Without overrides and without a selection the scoped registry is
+        // simply absent (main execution runs unscoped).
+        let absent = build_task_scoped_runtime_registry(None, None, None).unwrap();
+        assert!(absent.is_none());
+    }
+
+    #[test]
+    fn task_scoped_registry_requires_a_registry_and_a_known_component() {
+        let err = build_task_scoped_runtime_registry(None, Some("comp-a"), None).unwrap_err();
+        assert!(
+            err.to_string().contains("registry unavailable"),
+            "err={err}"
+        );
+
+        let empty_registry = ComponentRuntimeRegistry {
+            runtimes: HashMap::new(),
+            ordered_ids: Vec::new(),
+        };
+        let err = build_task_scoped_runtime_registry(
+            Some(&empty_registry),
+            Some("comp-a"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not available in runtime registry"),
+            "err={err}"
+        );
+
+        // Blank/whitespace selections behave like no selection.
+        let absent = build_task_scoped_runtime_registry(
+            Some(&empty_registry),
+            Some("  "),
+            None,
+        )
+        .unwrap();
+        assert!(absent.is_none());
+    }
+}

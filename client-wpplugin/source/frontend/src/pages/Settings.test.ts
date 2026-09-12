@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Settings
+// oracle: L2
+// 状态矩阵：worker 配置保存（自适应延迟归一 + 审核模式）/ 媒体步骤禁用 / 绑定模式变更重启指引。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import Settings from './Settings.svelte';

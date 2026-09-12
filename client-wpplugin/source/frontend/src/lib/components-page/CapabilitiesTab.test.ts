@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-CapabilitiesTab
+// oracle: L2
+// 状态矩阵：能力摘要 + format 键排序；错误态 + 刷新恢复。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import CapabilitiesTab from './CapabilitiesTab.svelte';

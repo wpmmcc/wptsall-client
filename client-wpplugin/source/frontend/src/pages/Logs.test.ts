@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Logs
+// oracle: L2
+// 状态矩阵：共享 helper 加载 + 关键字过滤；后端失败 toast / 网络错误 toast。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, cleanup } from '@testing-library/svelte';
 import Logs from './Logs.svelte';

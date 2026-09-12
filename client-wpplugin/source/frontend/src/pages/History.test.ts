@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-History
+// oracle: L2
+// 状态矩阵：列表级执行摘要 + 展开详情。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import History from './History.svelte';

@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-VendorCatalogTab
+// oracle: L2
+// 状态矩阵：本地供应商目录加载 + 免登刷新 / 错误态 + 重载恢复 / 安装→密钥→测试→启用→路由向导 / 测试失败停留。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import VendorCatalogTab from './VendorCatalogTab.svelte';

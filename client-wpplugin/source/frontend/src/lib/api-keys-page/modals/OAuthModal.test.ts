@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import OAuthModal from './OAuthModal.svelte';
 import { handleBackdropKeydown, oauthModalFieldId } from '../helpers';
-import type { OAuthFormState, OAuthItem } from '../types';
+import type { AuthExtraPreset, OAuthFormState, OAuthItem } from '../types';
 
 function baseForm(overrides: Partial<OAuthFormState> = {}): OAuthFormState {
   return {
@@ -41,7 +41,9 @@ const editingOAuth: OAuthItem = {
   has_token: false,
 };
 
-const presets = [
+// Typed against AuthExtraPreset so the array does not infer a union with
+// `access_type?: undefined` (fails params: Record<string, string>).
+const presets: AuthExtraPreset[] = [
   { label: 'Google', params: { access_type: 'offline', prompt: 'consent' } },
   { label: 'Salesforce', params: { prompt: 'consent' } },
 ];

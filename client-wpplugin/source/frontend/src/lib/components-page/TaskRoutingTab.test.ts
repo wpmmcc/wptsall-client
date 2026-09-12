@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-TaskRoutingTab
+// oracle: L2
+// 状态矩阵：槽位推荐过滤 + 规则绑定保存 / scope_key 校验 / 删除绑定 + 刷新 / config·message 规则指引 + 快捷选择 / 规则语义发现 + 快填。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import TaskRoutingTab from './TaskRoutingTab.svelte';

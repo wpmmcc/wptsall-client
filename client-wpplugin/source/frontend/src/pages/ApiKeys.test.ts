@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-ApiKeys
+// oracle: L2
+// 状态矩阵：默认 vendor catalog + tab 切换；local 模式隐藏官网库存 tab / legacy 模式恢复。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import ApiKeys from './ApiKeys.svelte';

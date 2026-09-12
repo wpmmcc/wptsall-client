@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Badge
+// oracle: L2
+// 状态矩阵：变体样式矩阵：默认 / success / error。
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, render } from '@testing-library/svelte';
 import Badge from './Badge.svelte';

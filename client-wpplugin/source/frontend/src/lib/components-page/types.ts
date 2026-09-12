@@ -79,18 +79,14 @@ export interface ServerComp {
   client_contract?: ComponentClientContractSummary;
 }
 
-export interface VendorKeyItem {
-  id: string;
-  vendor_id: string;
-  label: string;
-}
-
-export interface OAuthItem {
-  id: string;
-  vendor_id: string;
-  label: string;
-  grant_type: string;
-}
+// VendorKeyItem / OAuthItem describe the same wire objects the api-keys
+// page manages (vendor-keys / oauth API items). They were re-declared here
+// in a reduced shape that drifted from the runtime data — MyComponentsTab
+// feeds full API items into them (double cast) and the modal test fixtures
+// model the real wire shape, so svelte-check flagged 3 fixture type errors
+// (PUBLIC-REPO-DEEP-E2E-20260911 台账 §6-2, 2026-09-12 修复). Reuse the
+// canonical api-keys-page definitions instead of maintaining duplicates.
+export type { VendorKeyItem, OAuthItem } from '../api-keys-page/types';
 
 export type AuthStrategy = 'RoundRobin' | 'Random' | 'Weighted';
 export type FileSizeClass = 'S' | 'M' | 'L' | 'XL' | 'UNLIMITED';

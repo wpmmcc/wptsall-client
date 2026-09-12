@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Products
+// oracle: L2
+// 状态矩阵：产品渲染 + 激活权益徽章 / 空态。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import Products from './Products.svelte';

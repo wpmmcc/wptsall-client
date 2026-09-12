@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Sites
+// oracle: L2
+// 状态矩阵：必填校验 / token 保存 + 状态刷新 / 测试与删除 / 编辑免重填 / license 门拒绝指引。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor, cleanup } from '@testing-library/svelte';
 import Sites from './Sites.svelte';

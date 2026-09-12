@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-TranslationReview
+// oracle: L2
+// 状态矩阵：翻译 payload 字段执行审计详情渲染（装载 → 数据态）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
 import TranslationReview from './TranslationReview.svelte';

@@ -69,3 +69,39 @@ pub fn detect_cli_locale() -> String {
         })
         .unwrap_or_else(|_| "en".into())
 }
+
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-i18n-rs
+    // oracle: L1
+    use super::*;
+
+    #[test]
+    fn t_resolves_embedded_catalogs_per_language() {
+        assert_eq!(t("app.title", "en"), "WPTSALL Client");
+        assert_eq!(t("app.title", "zh-CN"), "WPTSALL 客户端");
+    }
+
+    #[test]
+    fn t_falls_back_to_english_for_unknown_language() {
+        // An unknown language must resolve through the English catalog
+        // rather than echoing the key.
+        assert_eq!(t("app.title", "xx-XX"), "WPTSALL Client");
+    }
+
+    #[test]
+    fn t_echoes_the_key_when_no_catalog_has_it() {
+        assert_eq!(t("totally.missing.key", "zh-CN"), "totally.missing.key");
+    }
+
+    #[test]
+    fn locale_json_serializes_the_flat_catalog() {
+        let en = locale_json("en");
+        let parsed: Value = serde_json::from_str(&en).unwrap();
+        assert_eq!(parsed["app.title"], "WPTSALL Client");
+        // Unknown language resolves to the English catalog, never "{}".
+        let fallback = locale_json("xx-XX");
+        let parsed_fallback: Value = serde_json::from_str(&fallback).unwrap();
+        assert_eq!(parsed_fallback["app.title"], "WPTSALL Client");
+    }
+}

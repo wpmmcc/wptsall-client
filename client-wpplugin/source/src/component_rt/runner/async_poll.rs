@@ -614,3 +614,119 @@ pub(super) async fn finalize_non_text_async(
     };
     finalize_non_text_outcome(ctx, runtime, normalized_task_type, outcome)
 }
+
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-component-rt-runner-async-poll-rs
+    // oracle: L1
+    // Poll/network paths are covered through mock-component flows; this
+    // module pins the status-normalization and response-extract contracts.
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn status_values_are_normalized_deduped_and_lowercased() {
+        let values = vec![
+            " Pending ".to_string(),
+            "PENDING".to_string(),
+            "".to_string(),
+            "  ".to_string(),
+            "Completed".to_string(),
+        ];
+        assert_eq!(
+            normalize_status_values(&values),
+            vec!["pending".to_string(), "completed".to_string()]
+        );
+    }
+
+    #[test]
+    fn status_membership_normalizes_the_probe() {
+        // The list side is expected pre-normalized (callers pass the output
+        // of normalize_status_values); only the probe is normalized here.
+        let values = vec!["pending".to_string(), "completed".to_string()];
+        assert!(status_values_contains(&values, "  PENDING "));
+        assert!(status_values_contains(&values, "Completed"));
+        assert!(!status_values_contains(&values, "failed"));
+        assert!(!status_values_contains(&values, ""));
+    }
+
+    #[test]
+    fn extract_map_populates_computed_context_from_response() {
+        let mut ctx = HashMap::new();
+        let extract: HashMap<String, String> = HashMap::from([
+            ("job_id".to_string(), "data.id".to_string()),
+            ("token".to_string(), "data.token".to_string()),
+            ("count".to_string(), "data.count".to_string()),
+            ("flag".to_string(), "data.flag".to_string()),
+            ("obj".to_string(), "data.obj".to_string()),
+        ]);
+        let response = json!({
+            "data": {
+                "id": 42,
+                "token": "tok-1",
+                "count": 3,
+                "flag": true,
+                "obj": { "k": "v" }
+            }
+        });
+
+        apply_json_extract_map(&extract, &response, &mut ctx, "comp", "test.extract").unwrap();
+
+        assert_eq!(ctx.get("computed.job_id").map(String::as_str), Some("42"));
+        assert_eq!(ctx.get("computed.token").map(String::as_str), Some("tok-1"));
+        assert_eq!(ctx.get("computed.count").map(String::as_str), Some("3"));
+        assert_eq!(ctx.get("computed.flag").map(String::as_str), Some("true"));
+        // Objects/arrays are stringified rather than failing.
+        assert!(ctx.get("computed.obj").unwrap().contains("\"k\""));
+
+        // A key already namespaced with `computed.` is not double-prefixed.
+        let mut ctx2 = HashMap::new();
+        let namespaced: HashMap<String, String> =
+            HashMap::from([("computed.job_id".to_string(), "data.id".to_string())]);
+        apply_json_extract_map(&namespaced, &response, &mut ctx2, "comp", "t").unwrap();
+        assert!(ctx2.contains_key("computed.job_id"));
+        assert!(!ctx2.contains_key("computed.computed.job_id"));
+    }
+
+    #[test]
+    fn extract_map_fails_closed_on_missing_values_and_empty_paths() {
+        let mut ctx = HashMap::new();
+
+        // Missing path -> error naming the key, path, and component.
+        let missing: HashMap<String, String> =
+            HashMap::from([("job_id".to_string(), "data.absent".to_string())]);
+        let err = apply_json_extract_map(&missing, &json!({ "data": {} }), &mut ctx, "comp-x", "t")
+            .unwrap_err();
+        let err_text = err.to_string();
+        assert!(err_text.contains("job_id"), "err={err_text}");
+        assert!(err_text.contains("data.absent"));
+        assert!(err_text.contains("comp-x"));
+
+        // Null values resolve to empty and therefore fail the same check.
+        let null_value: HashMap<String, String> =
+            HashMap::from([("job_id".to_string(), "data.null".to_string())]);
+        let err = apply_json_extract_map(
+            &null_value,
+            &json!({ "data": { "null": null } }),
+            &mut ctx,
+            "comp-x",
+            "t",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("data.null"));
+
+        // An explicitly empty path is a configuration error.
+        let empty_path: HashMap<String, String> =
+            HashMap::from([("job_id".to_string(), "   ".to_string())]);
+        let err =
+            apply_json_extract_map(&empty_path, &json!({}), &mut ctx, "comp-x", "t").unwrap_err();
+        assert!(err.to_string().contains("empty json path"));
+
+        // Empty keys are skipped entirely.
+        let blank_key: HashMap<String, String> =
+            HashMap::from([("  ".to_string(), "data.id".to_string())]);
+        apply_json_extract_map(&blank_key, &json!({ "data": { "id": 1 } }), &mut ctx, "c", "t")
+            .unwrap();
+        assert!(ctx.is_empty());
+    }
+}

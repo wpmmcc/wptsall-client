@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-ServerTemplatesTab
+// oracle: L2
+// 状态矩阵：模板过滤 + 详情 modal / 搜索失败回退空态 / 加载失败 toast + modal 关闭。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { addMessages, init, locale } from 'svelte-i18n';

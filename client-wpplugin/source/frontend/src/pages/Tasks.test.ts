@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Tasks
+// oracle: L2
+// 状态矩阵：列表加载 → 展开作业项 → 多组件执行轨迹渲染（装载/数据/展开三态）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import Tasks from './Tasks.svelte';

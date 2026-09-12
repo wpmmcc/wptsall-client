@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Sidebar
+// oracle: L2
+// 状态矩阵：当前页高亮 / local 模式无登出·会话前缀·legacy 入口·权益拉取 / 导航回调 / legacy 模式恢复登出与会话前缀。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import Sidebar from './Sidebar.svelte';

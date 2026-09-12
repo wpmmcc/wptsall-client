@@ -53,3 +53,67 @@ pub(crate) fn normalize_patch_field_key(raw: &str) -> String {
     }
     out.trim_matches('_').to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-task-engine-executor-rs
+    // oracle: L1
+    use super::*;
+
+    #[test]
+    fn normalize_task_content_type_maps_vendor_spellings() {
+        for (raw, expected) in [
+            ("Text", "text"),
+            (" TEXT_TRANSLATION ", "text"),
+            ("fields", "text"),
+            ("Images", "image"),
+            ("image_translation", "image"),
+            ("Video", "video"),
+            ("video_translation", "video"),
+            ("Audios", "audio"),
+            ("audio_translation", "audio"),
+            ("Document", "document"),
+            ("doc", "document"),
+            ("files", "document"),
+            ("Mixed", "mixed"),
+            ("multimodal_translation", "mixed"),
+            ("anything-else", "text"),
+            ("", "text"),
+        ] {
+            assert_eq!(normalize_task_content_type(raw), expected, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_business_line_maps_vendor_spellings() {
+        for (raw, expected) in [
+            ("Post", "post_content"),
+            ("post_type", "post_content"),
+            ("Term", "taxonomy_content"),
+            ("taxonomy", "taxonomy_content"),
+            ("Theme", "theme_i18n"),
+            ("Plugin", "plugin_i18n"),
+            ("language_pack", "plugin_i18n"),
+            ("Config", "config_i18n"),
+            ("Site", "site_strings"),
+            ("Menu", "menu_strings"),
+            ("Widget", "widget_strings"),
+            ("model", "custom_model"),
+            ("unknown-line", "custom_model"),
+            ("", "custom_model"),
+        ] {
+            assert_eq!(normalize_business_line(raw), expected, "raw={raw:?}");
+        }
+    }
+
+    #[test]
+    fn normalize_patch_field_key_is_slug_safe() {
+        assert_eq!(normalize_patch_field_key("  Post Title "), "post_title");
+        assert_eq!(normalize_patch_field_key("a.b/c d"), "a_b_c_d");
+        assert_eq!(normalize_patch_field_key("keep-dash"), "keep-dash");
+        assert_eq!(normalize_patch_field_key("Squeeze__Double"), "squeeze_double");
+        assert_eq!(normalize_patch_field_key("__trim__"), "trim");
+        assert_eq!(normalize_patch_field_key("drop!@#punct"), "droppunct");
+        assert_eq!(normalize_patch_field_key(""), "");
+    }
+}

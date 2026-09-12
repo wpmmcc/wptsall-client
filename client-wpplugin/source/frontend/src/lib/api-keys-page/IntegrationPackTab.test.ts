@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-IntegrationPackTab
+// oracle: L2
+// 状态矩阵：公开 redacted 导出（免口令）/ 私有导出需确认 + 口令 / 安全 pack 预览与导入。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import IntegrationPackTab from './IntegrationPackTab.svelte';

@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-App
+// oracle: L2
+// 状态矩阵：P0-LF-04 本地 UI 边界：legacy 仅 Products 页 / Sidebar 无权益查询 / 页级 tab 门控 / 无付费分支控件。
 import { describe, expect, it } from 'vitest';
 import appSource from './App.svelte?raw';
 import sidebarSource from './lib/components/Sidebar.svelte?raw';

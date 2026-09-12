@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-MyComponentsTab
+// oracle: L2
+// 状态矩阵：快速测试错误（含结构化）/ 文件测试渲染与泛化失败 / openai 预设与必填校验创建（9 用例全矩阵）。
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import MyComponentsTab from './MyComponentsTab.svelte';

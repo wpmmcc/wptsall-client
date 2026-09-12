@@ -1,3 +1,6 @@
+// catalog: WEBUI-UI-Toast
+// oracle: L2
+// 状态矩阵：store 消息 + 详情渲染 / dismiss 移除（生命周期两态）。
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { fireEvent, render, screen, cleanup, waitFor } from '@testing-library/svelte';
 import { get } from 'svelte/store';

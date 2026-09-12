@@ -1,8 +1,9 @@
 //! Content discovery flow: fetch site-relations, rules, and untranslated content
 //! from a WP site, translate via component, and submit results via callback.
 //!
-//! This is an alternative to the task-pull flow (puller.rs). Enabled when
-//! `WorkerConfig::discovery_mode` is `true`.
+//! This is an alternative to the pre-v1.2.0 task-pull flow (puller.rs,
+//! removed as dead code 2026-09-12: it was no longer in the module tree).
+//! Enabled when `WorkerConfig::discovery_mode` is `true`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};

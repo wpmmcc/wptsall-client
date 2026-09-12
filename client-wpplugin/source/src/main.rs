@@ -80,3 +80,46 @@ async fn main() -> anyhow::Result<()> {
     }
     worker::run_worker_cli(shutdown_token).await
 }
+
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-main-rs
+    // oracle: L1
+    // Binary-root wiring contract: main() bootstraps i18n from the two
+    // embedded catalogs via I18nManager::init_with_content; the test
+    // replays that exact bootstrap and resolves a known key in both
+    // languages through the global instance it installs.
+    use super::*;
+
+    #[test]
+    fn embedded_catalogs_initialize_the_i18n_manager() {
+        // main()'s observable bootstrap contract: both embedded catalogs
+        // parse, initialize the global manager, and RESOLVE real keys.
+        //
+        // The former flat/nested mismatch (documented 2026-09-12: catalogs
+        // use flat dotted keys while translate() walked nested objects, so
+        // every lookup KeyNotFound) was resolved in wptsall-i18n: the
+        // walker now runs the nested walk first and falls back to the
+        // whole dotted key as a literal member. Both catalog styles
+        // resolve with one manager.
+        I18nManager::init_with_content(I18N_EN, I18N_ZH_CN, Language::En)
+            .expect("embedded en/zh-CN catalogs must initialize the manager");
+        assert!(
+            I18nManager::get().is_ok(),
+            "the global manager must be installed after bootstrap"
+        );
+
+        // Real translation roundtrip through the embedded flat catalogs:
+        // "app.title" exists in both languages.
+        let manager = I18nManager::get().expect("global manager installed");
+        let en = manager.translate("app.title", Language::En);
+        assert!(en.is_ok(), "embedded en catalog must resolve app.title: {:?}", en.err());
+        let zh = manager.translate("app.title", Language::ZhCn);
+        assert!(zh.is_ok(), "embedded zh-CN catalog must resolve app.title: {:?}", zh.err());
+        assert_ne!(
+            en.unwrap(),
+            zh.unwrap(),
+            "the two embedded catalogs must actually differ for the probe key"
+        );
+    }
+}
