@@ -185,7 +185,8 @@ pub fn perform_self_replace(
             )
         };
         let script = format!(
-            "sleep 0.5; \
+            "exec >>\"{cur_dir}/wptsall-update.log\" 2>&1; \
+             sleep 0.5; \
              systemctl --user stop {svc} >/dev/null 2>&1 || true; \
              incoming=\"{cur_dir}/wptsall-incoming.$$\"; \
              mv -f \"{new}\" \"$incoming\" && \
@@ -252,7 +253,8 @@ pub fn perform_self_replace(
             )
         };
         let script = format!(
-            "sleep 0.5 && \
+            "exec >>\"{cur_dir}/wptsall-update.log\" 2>&1; \
+             sleep 0.5 && \
              launchctl bootout gui/$(id -u)/{svc} 2>/dev/null; \
              sleep 1 && \
              incoming=\"{cur_dir}/wptsall-incoming.$$\" && \
