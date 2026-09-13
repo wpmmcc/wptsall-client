@@ -41,8 +41,8 @@ concurrency:
 #                the whole flow runs over.
 #   ui ops     - Playwright (chromium) drives the served SPA: nav to Sites,
 #                the paired site is listed, nav to Tasks, the translation
-#                job card with done items, nav to Logs, the pipeline
-#                sync_done trace for the source post; nav round trip;
+#                job card with done items, nav to Logs, the discovery
+#                item_translated trace for the source post; nav round trip;
 #                screenshot artifacts
 #   uninstall  - both clients stopped, no process residue on the exact
 #                install paths, install roots + data dirs removed, ports freed
@@ -645,9 +645,11 @@ jobs:
             }
           } catch { jobOk = false; }
           step('translation job card visible with >= 1 done item', jobOk);
-          // Logs page: the pipeline.sync_done event for the source post is
-          // the client-side trace of the translation (object_id = WP post
-          // id, the last key in the formatted detail).
+          // Logs page: the discovery.item_translated event for the source
+          // post is the client-side trace of the translation. Posts stream
+          // through the inline discover -> translate -> callback pipeline
+          // (discovery.item_translated / discovery.callback_sent events);
+          // pipeline.sync_done belongs to the config_i18n review flow only.
           const logsNav = page.getByRole('button', { name: 'Logs', exact: true });
           await logsNav.waitFor({ state: 'visible', timeout: 15000 });
           await logsNav.click();
@@ -655,19 +657,23 @@ jobs:
           await page.getByRole('button', { name: 'Load Logs', exact: true }).click();
           await page.locator('#log-container .font-mono > div').first()
             .waitFor({ state: 'visible', timeout: 15000 });
-          await page.getByPlaceholder('Filter Placeholder').fill('sync_done');
+          await page.getByPlaceholder('Filter Placeholder').fill('item_translated');
+          // Rendered detail is the JSON.stringify'd detail object, so the
+          // post id appears as "object_id":N (trailing , or } keeps an
+          // exact-value match: 6 cannot match 61).
           const logLines = page.locator('#log-container .font-mono > div');
-          const syncCount = await logLines
-            .filter({ hasText: /object_id=\d+/ }).count();
-          step(`pipeline sync_done events visible (${syncCount} lines)`, syncCount > 0);
+          const translatedCount = await logLines
+            .filter({ hasText: /"object_id":\d+/ }).count();
+          step(`discovery item_translated events visible (${translatedCount} lines)`,
+            translatedCount > 0);
           let postOk = false;
           try {
             await logLines
-              .filter({ hasText: new RegExp('object_id=' + POST_ID + '(\\s|$)') })
+              .filter({ hasText: new RegExp('"object_id":' + POST_ID + '[,}]') })
               .first().waitFor({ state: 'visible', timeout: 10000 });
             postOk = true;
           } catch { postOk = false; }
-          step(`client log shows sync_done for post ${POST_ID}`, postOk);
+          step(`client log shows item_translated for post ${POST_ID}`, postOk);
           await page.screenshot({ path: OUT_TASKS, fullPage: true });
           await page.getByRole('button', { name: 'Overview', exact: true }).click();
           await page.waitForTimeout(300);
@@ -687,7 +693,7 @@ jobs:
           JOURNEY_SHOT_TASKS="$RUNNER_TEMP/journey-ui-translate.png" \
             node "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
           rm -f "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
-          echo "ui ops leg OK: SPA served, Sites nav, paired site listed, Tasks job card, Logs sync_done trace, round trip"
+          echo "ui ops leg OK: SPA served, Sites nav, paired site listed, Tasks job card, Logs item_translated trace, round trip"
 
           # --- uninstall leg: stop, no residue, remove, ports freed ---------
           kill "$(cat /tmp/journey-a/pid)" "$(cat /tmp/journey-b/pid)" 2>/dev/null || true
