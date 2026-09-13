@@ -811,9 +811,15 @@ jobs:
           foreach ( $items as $it ) {
               $post_id = (int) ( $it['post_id'] ?? 0 );
               $project = (string) ( $it['project'] ?? '?' );
+              $cpt = (string) ( $it['cpt'] ?? '?' );
+              # CPTs registered without editor support (envira, give_forms)
+              # have no post_content field at all — the product correctly
+              # translates title-only for them; the content marker is only
+              # required for editor-capable CPTs.
+              $editor_cpt = post_type_supports( $cpt, 'editor' );
               $row = array(
                   'project' => $project, 'plugin' => (string) ( $it['plugin'] ?? '?' ),
-                  'cpt' => (string) ( $it['cpt'] ?? '?' ), 'post_id' => $post_id,
+                  'cpt' => $cpt, 'post_id' => $post_id, 'editor' => $editor_cpt,
                   'target_post_id' => 0, 'title_marker' => false, 'content_marker' => false,
                   'virtual_url' => '',
               );
@@ -825,7 +831,9 @@ jobs:
                   $row['target_post_id'] = $target_post_id;
                   if ( $target && 'publish' === $target->post_status ) {
                       $row['title_marker'] = false !== mb_strpos( $target->post_title, '【zh_CN】' );
-                      $row['content_marker'] = false !== mb_strpos( $target->post_content, '【zh_CN】' );
+                      $row['content_marker'] = $editor_cpt
+                          ? ( false !== mb_strpos( $target->post_content, '【zh_CN】' ) )
+                          : true;
                       if ( '' !== $prefix && '' !== (string) $target->post_name ) {
                           $row['virtual_url'] = '/' . $prefix . '/' . $target->post_name . '/';
                       }
