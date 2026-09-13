@@ -384,6 +384,32 @@ jobs:
                   'source_blog_id' => 1, 'enable_blog_sync' => 1, 'status' => 'enabled',
               ) );
           }
+          # Plugin initialization scan FIRST (the same chain the setup wizard
+          # / admin "Scan All" runs): create_rule enforces that the rule's
+          # target object exists in the model template (model_objects), which
+          # only the scanner populates — a fresh install has no template yet
+          # and create_rule fails with template_object_not_found. Incremental
+          # mode: no auto rule create/delete side effects.
+          $plugin_dir = trailingslashit( WP_PLUGIN_DIR ) . 'wpmmcc-ats';
+          $scanner_file = $plugin_dir . '/includes/models/scanners/class-model-scanner-v2.php';
+          $tracker_file = $plugin_dir . '/includes/models/scanners/class-runtime-tracker.php';
+          if ( is_readable( $scanner_file ) ) { require_once $scanner_file; }
+          if ( is_readable( $tracker_file ) ) { require_once $tracker_file; }
+          if ( ! class_exists( 'WPTSALL\Models\Scanners\Model_Scanner_V2' ) ) {
+              fwrite( STDERR, "Model_Scanner_V2 unavailable\n" ); exit( 1 );
+          }
+          if ( class_exists( 'WPTSALL\Models\Scanners\Runtime_Tracker' ) ) {
+              WPTSALL\Models\Scanners\Runtime_Tracker::init();
+          }
+          $scanner = new WPTSALL\Models\Scanners\Model_Scanner_V2();
+          $scanner->set_mode( 'incremental' );
+          $scan = $scanner->scan_all_plugins();
+          if ( (int) ( $scan['models_failed'] ?? 1 ) > 0 ) {
+              fwrite( STDERR, "model scan failed: " . wp_json_encode( $scan ) . "\n" ); exit( 1 );
+          }
+          echo "scan: models_created=" . (int) ( $scan['models_created'] ?? 0 )
+              . " models_updated=" . (int) ( $scan['models_updated'] ?? 0 ) . "\n";
+
           $models_table = $wpdb->prefix . 'wptsall_models';
           $model_id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$models_table} WHERE plugin_slug = %s LIMIT 1", 'wordpress-blog' ) );
           if ( $model_id <= 0 ) {
