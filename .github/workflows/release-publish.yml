@@ -624,9 +624,19 @@ jobs:
           set -euo pipefail
           # 1. The default channel URL must resolve to this release and the
           #    manifest signature must verify with the pinned public key.
+          #    releases/latest is eventually consistent: right after
+          #    `gh release create` it can still 404 for a few seconds, so
+          #    poll instead of failing the release over propagation delay.
           default_url="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/releases.json"
           rel="$RUNNER_TEMP/release"
-          curl -fsSL "$default_url" -o "$RUNNER_TEMP/latest-releases.json"
+          for _ in $(seq 1 60); do
+            if curl -fsSL "$default_url" -o "$RUNNER_TEMP/latest-releases.json"; then
+              echo "latest channel resolves after propagation"; break
+            fi
+            sleep 2
+          done
+          [ -s "$RUNNER_TEMP/latest-releases.json" ] \
+            || { echo "releases/latest never resolved to a manifest" >&2; exit 1; }
           python3 - "$RUNNER_TEMP/latest-releases.json" "$RUNNER_TEMP/latest-canonical.json" <<'PY'
           import json, sys
           def sortv(v):
