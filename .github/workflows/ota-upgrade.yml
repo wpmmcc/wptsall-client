@@ -22,9 +22,10 @@ concurrency:
 #      + signed kit from a local HTTP server;
 #   3. positive round on EVERY OS: /api/update-check → /api/perform-update
 #      → self-replace swaps the binary (rename-aside dance on Windows,
-#      inode swap on Linux, rename on macOS) → cold start + /api/status.
-#      This exercises the platform-specific self-replace helpers for real
-#      (perform_self_replace: sh on Linux/macOS, PowerShell on Windows).
+#      stage-aside + unlink + rename on Unix — Darwin refuses rename onto a
+#      running executable) → cold start + /api/status. This exercises the
+#      platform-specific self-replace helpers for real (perform_self_replace:
+#      sh on Linux/macOS, PowerShell on Windows).
 #   4. negatives + recovery (ubuntu leg only): missing kit signature,
 #      tampered kit, bad manifest signature, read-only install dir
 #      (INSTALL_DIR_NOT_WRITABLE, binary byte-identical), recovery round.
@@ -113,14 +114,13 @@ jobs:
           set -euo pipefail
           # Chocolatey ships minisign 0.8, which lacks `-W` (unencrypted
           # key) — the ephemeral keypair generation would die at the
-          # password prompt. Build 0.11 from source instead (cmake + MSVC,
-          # both preinstalled; libsodium is fetched by CMake FetchContent).
-          git clone --depth 1 https://github.com/jedisct1/minisign "$RUNNER_TEMP/minisign-src"
-          cmake -S "$RUNNER_TEMP/minisign-src" -B "$RUNNER_TEMP/minisign-build"
-          cmake --build "$RUNNER_TEMP/minisign-build" --config Release
-          bin="$RUNNER_TEMP/minisign-build/Release/minisign.exe"
-          [ -f "$bin" ] || bin="$RUNNER_TEMP/minisign-build/minisign.exe"
-          [ -f "$bin" ] || { echo "minisign.exe not found after build" >&2; exit 1; }
+          # password prompt. Building from source needs PkgConfig, which
+          # the Windows runner lacks; use the official prebuilt 0.12 zip.
+          url="https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip"
+          curl -fsSL "$url" -o "$RUNNER_TEMP/minisign.zip"
+          unzip -o "$RUNNER_TEMP/minisign.zip" -d "$RUNNER_TEMP/minisign-bin"
+          bin="$(find "$RUNNER_TEMP/minisign-bin" -name minisign.exe | head -n 1)"
+          [ -n "$bin" ] || { echo "minisign.exe not found in the zip" >&2; exit 1; }
           cp "$bin" /usr/local/bin/minisign.exe
           minisign -v
           # Prove -W works before the real keygen step depends on it.
@@ -290,7 +290,10 @@ jobs:
           rm -rf "$home" && mkdir -p "$home/data"
           ui_port=18131
           bin="$ota/install/bin/wptsall-client$OTA_EXE"
-          before_mtime="$("$PY" -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$bin")"
+          # mtime of the pre-swap binary; the -1 arm guards the millisecond
+          # window mid-swap where unlink+rename leaves the path absent (a
+          # bare ENOENT would abort the step under `set -e`).
+          before_mtime="$("$PY" -c 'import os,sys; print(int(os.stat(p).st_mtime) if os.path.exists(p:=sys.argv[1]) else -1)' "$bin")"
           WPTSALL_WEB_UI=1 \
           WPTSALL_SERVER_BASE="http://127.0.0.1:$OTA_SERVER_PORT" \
           WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
@@ -324,8 +327,8 @@ jobs:
           # response; wait for the install-root binary mtime to move.
           swapped=0
           for _ in $(seq 1 60); do
-            now_mtime="$("$PY" -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$bin")"
-            if [ "$now_mtime" != "$before_mtime" ]; then swapped=1; break; fi
+            now_mtime="$("$PY" -c 'import os,sys; print(int(os.stat(p).st_mtime) if os.path.exists(p:=sys.argv[1]) else -1)' "$bin")"
+            if [ "$now_mtime" != "$before_mtime" ] && [ "$now_mtime" != "-1" ]; then swapped=1; break; fi
             sleep 0.5
           done
           kill "$client_pid" 2>/dev/null || true
@@ -545,8 +548,8 @@ jobs:
           kill "$client_pid" 2>/dev/null || true; wait "$client_pid" 2>/dev/null || true
           swapped=0
           for _ in $(seq 1 60); do
-            now_mtime="$(stat -c %Y "$ota/install/bin/wptsall-client")"
-            if [ "$now_mtime" != "$before_mtime" ]; then swapped=1; break; fi
+            now_mtime="$(stat -c %Y "$ota/install/bin/wptsall-client" 2>/dev/null || echo -1)"
+            if [ "$now_mtime" != "$before_mtime" ] && [ "$now_mtime" != "-1" ]; then swapped=1; break; fi
             sleep 0.5
           done
           [ "$swapped" = "1" ] \
@@ -742,8 +745,8 @@ jobs:
 
           swapped=0
           for _ in $(seq 1 60); do
-            now_mtime="$(stat -c %Y "$bin")"
-            if [ "$now_mtime" != "$before_mtime" ]; then swapped=1; break; fi
+            now_mtime="$(stat -c %Y "$bin" 2>/dev/null || echo -1)"
+            if [ "$now_mtime" != "$before_mtime" ] && [ "$now_mtime" != "-1" ]; then swapped=1; break; fi
             sleep 0.5
           done
           kill "$client_pid" 2>/dev/null || true

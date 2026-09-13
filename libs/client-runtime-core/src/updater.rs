@@ -124,8 +124,15 @@ fn ensure_replace_dir_writable(current_binary: &Path) -> Result<()> {
 ///   Hidden` must NOT be used for a GUI app (BUG-UPD-02: invisible ghost).
 ///
 /// Platform swap mechanics:
-/// - Unix: `mv -f` over the running binary is safe (the old inode stays
-///   mapped until exit).
+/// - Unix: the new binary is first staged NEXT TO the current one, the
+///   current one is unlinked, and the staged file is renamed into place.
+///   Staging in the same directory guarantees a pure rename (same
+///   filesystem); unlinking a running executable is allowed on both Linux
+///   and Darwin (the process keeps its vnode), while `mv` straight over
+///   the running binary fails: Darwin's rename(2) onto an executing file
+///   returns ETXTBSY, and a cross-device `mv` (e.g. /tmp on tmpfs, install
+///   under /home) degrades to a write into the running file, which both
+///   kernels refuse.
 /// - Windows: a running .exe cannot be overwritten (ERROR_SHARING_VIOLATION,
 ///   BUG-UPD-01) but it CAN be renamed. The helper renames the running exe to
 ///   `<exe>.old`, moves the new one into place with a retry loop (AV scanners
@@ -149,12 +156,21 @@ pub fn perform_self_replace(
 
     #[cfg(target_os = "linux")]
     {
-        // Rename-over a running ELF is OK (old inode stays mapped). The
-        // systemd unit is optional — install-webui.sh creates
-        // `wptsall-client.service`; the desktop has no unit, so stop/start
-        // are harmless no-ops there and the restart is a detached relaunch.
+        // Rename-over a running ELF is OK on a single filesystem (old inode
+        // stays mapped), but a cross-device `mv` (tmpfs /tmp, install under
+        // /home) degrades to a write into the running file — ETXTBSY. The
+        // stage-aside sequence below keeps every step a same-directory
+        // rename/unlink, which the kernel allows even while the old binary
+        // is executing. The systemd unit is optional — install-webui.sh
+        // creates `wptsall-client.service`; the desktop has no unit, so
+        // stop/start are harmless no-ops there and the restart is a
+        // detached relaunch.
         let cur = current_binary.display();
         let new = new_binary.display();
+        let cur_dir = current_binary
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
         let restart = if is_desktop {
             format!("(nohup \"{cur}\" >/dev/null 2>&1 &) >/dev/null 2>&1")
         } else {
@@ -163,10 +179,14 @@ pub fn perform_self_replace(
         let script = format!(
             "sleep 0.5; \
              systemctl --user stop {svc} >/dev/null 2>&1 || true; \
-             mv -f \"{new}\" \"{cur}\"; \
-             chmod +x \"{cur}\"; \
+             incoming=\"{cur_dir}/wptsall-incoming.$$\"; \
+             mv -f \"{new}\" \"$incoming\" && \
+             rm -f \"{cur}\" && \
+             mv -f \"$incoming\" \"{cur}\" && \
+             chmod +x \"{cur}\" && \
              {restart}",
             svc = service_name,
+            cur_dir = cur_dir,
             restart = restart,
         );
         std::process::Command::new("/usr/bin/env")
@@ -187,6 +207,15 @@ pub fn perform_self_replace(
         // to a detached relaunch for raw binaries. Note: replacing a binary
         // inside a signed .app invalidates the bundle signature — distribute
         // desktop updates through signed installers when that matters.
+        //
+        // Darwin refuses rename(2) onto a running executable with ETXTBSY
+        // ("Text file busy"), and the webui process stays alive whenever no
+        // LaunchAgent exists (see restart_mechanism_available), so a plain
+        // `mv new cur` silently fails there. Sparkle-style sequence instead:
+        // stage the incoming binary next to the current one (same directory
+        // ⇒ same filesystem ⇒ pure renames), unlink the current one (allowed
+        // even while executing — the process keeps its vnode), then rename
+        // the staged file into place.
         let cur = current_binary.display();
         let new = new_binary.display();
         let mut app_dir = current_binary.to_path_buf();
@@ -195,6 +224,10 @@ pub fn perform_self_replace(
         }
         let app_bundle = app_dir.extension().map(|ext| ext == "app").unwrap_or(false)
             && app_dir.is_dir();
+        let cur_dir = current_binary
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
         let restart = if is_desktop {
             if app_bundle {
                 format!("open \"{}\"", app_dir.display())
@@ -211,10 +244,14 @@ pub fn perform_self_replace(
             "sleep 0.5 && \
              launchctl bootout gui/$(id -u)/{svc} 2>/dev/null; \
              sleep 1 && \
-             mv -f \"{new}\" \"{cur}\" && \
+             incoming=\"{cur_dir}/wptsall-incoming.$$\" && \
+             mv -f \"{new}\" \"$incoming\" && \
+             rm -f \"{cur}\" && \
+             mv -f \"$incoming\" \"{cur}\" && \
              chmod +x \"{cur}\" && \
              {restart}",
             svc = service_name,
+            cur_dir = cur_dir,
             restart = restart,
         );
         std::process::Command::new("/usr/bin/env")
