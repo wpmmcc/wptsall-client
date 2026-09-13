@@ -1,0 +1,674 @@
+name: Release publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: "Release notes (optional; a default is generated when empty)"
+        required: false
+        type: string
+
+# Publish a versioned GitHub Release on this repository: the official
+# public update channel. This is the ONLY packaging/publishing path for
+# new client versions (the legacy host cross-compile + private-releases
+# pipeline is retired for public releases).
+#
+# Rigorous gating ("run tests first, package only when green"):
+#   gate      — refuses to package unless (a) dispatched at the default
+#               branch HEAD, (b) the tag v{VERSION} does not exist yet, and
+#               (c) ALL FOUR test workflows (ci / build-matrix / ota-upgrade
+#               / wp-journey) have a completed, successful push-run for
+#               exactly this commit;
+#   build-*   — assemble the six-platform webui + desktop kits on their
+#               native runners (the same layout the host make-kit scripts
+#               produce: bin + ui + VERSION/VERSION-BINARY/VERSION-WEBUI +
+#               PLATFORM.txt + TRIPLE.txt + launcher + HARDENING.txt +
+#               SHA256SUMS);
+#   publish   — UI-only bundles + signed SHA256SUMS + the four-product
+#               releases manifest, all minisign-signed with the public
+#               release key (Actions secret WPTSALL_RELEASE_MINISIGN_KEY;
+#               the pinned public key is the build.rs fallback, so every
+#               public build can verify this channel), then `gh release
+#               create v{VERSION}` with every asset, and finally a live
+#               self-verification: the manifest is re-fetched through
+#               releases/latest/download/, its signature verified with the
+#               public key, and a freshly built client (no source
+#               configured) discovers the new version through the default
+#               channel.
+#
+# Flow (documented in OPEN-SOURCE-PUBLISH-FLOW.md §5): monorepo dev + SSOT
+# version bump → oss sync → push → all four workflows green → dispatch
+# this workflow → clients see the new version via the built-in channel.
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Public release channel key (public information; the private half lives
+  # only in this repository's Actions secret). Kept in sync with the
+  # build.rs fallback — the publish job asserts they match.
+  RELEASE_PUBKEY_B64: RWRK0RTOL1wb3YAJ6sywCLsN0kvpOttJ1CYv3AHluZAfYUXzSEm/0cSw
+  RELEASE_KEY_ID: DD1B5C2FCE14D14A
+
+jobs:
+  gate:
+    name: Gate - all tests green on this commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse unless at default-branch HEAD
+        run: |
+          set -euo pipefail
+          default_branch="$(gh api repos/{owner}/{repo} --jq .default_branch)"
+          if [ "$GITHUB_REF_NAME" != "$default_branch" ]; then
+            echo "dispatched from '$GITHUB_REF_NAME', but releases publish only from the default branch '$default_branch'" >&2
+            exit 1
+          fi
+          head_sha="$(gh api "repos/{owner}/{repo}/branches/$default_branch" --jq .commit.sha)"
+          if [ "$GITHUB_SHA" != "$head_sha" ]; then
+            echo "dispatched at $GITHUB_SHA but $default_branch HEAD is $head_sha — re-dispatch from the current HEAD" >&2
+            exit 1
+          fi
+          echo "publishing $GITHUB_SHA (HEAD of $default_branch)"
+
+      - name: Read and validate the SSOT version
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "invalid VERSION '$version' (expected MAJOR.MINOR.PATCH)" >&2; exit 1;
+          }
+          echo "version: $version"
+
+      - name: Refuse if this version is already published
+        run: |
+          set -euo pipefail
+          tag="v$RELEASE_VERSION"
+          if gh api "repos/{owner}/{repo}/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "tag $tag already exists — this version is published (or has a stray tag). Bump the SSOT version (install-client/versions.json) and sync before releasing." >&2
+            exit 1
+          fi
+          echo "tag $tag is free"
+
+      - name: Require green push-runs of all four test workflows on this commit
+        run: |
+          set -euo pipefail
+          missing=""
+          for wf in ci.yml build-matrix.yml ota-upgrade.yml wp-journey.yml; do
+            runs="$(gh api "repos/{owner}/{repo}/actions/workflows/$wf/runs?head_sha=$GITHUB_SHA&event=push&per_page=20" \
+              --jq '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")] | length')"
+            inprogress="$(gh api "repos/{owner}/{repo}/actions/workflows/$wf/runs?head_sha=$GITHUB_SHA&event=push&per_page=20" \
+              --jq '[.workflow_runs[] | select(.status != "completed")] | length')"
+            if [ "${runs:-0}" -gt 0 ]; then
+              echo "OK: $wf has a green push-run at $GITHUB_SHA"
+            elif [ "${inprogress:-0}" -gt 0 ]; then
+              echo "WAIT: $wf is still running at $GITHUB_SHA — wait for it to finish and re-dispatch" >&2
+              missing="$missing $wf(running)"
+            else
+              echo "FAIL: $wf has no green push-run at $GITHUB_SHA" >&2
+              missing="$missing $wf(red-or-missing)"
+            fi
+          done
+          [ -z "$missing" ] || {
+            echo "release gate refused — not all tests are green:$missing" >&2
+            exit 1
+          }
+          echo "GATE OK: ci, build-matrix, ota-upgrade and wp-journey are all green at $GITHUB_SHA"
+
+  build-webui:
+    name: WebUI kit (${{ matrix.plat }})
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    plat: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, plat: linux-aarch64 }
+          - { os: windows-latest,   plat: windows-x86_64 }
+          - { os: windows-11-arm,   plat: windows-aarch64 }
+          - { os: macos-latest,     plat: darwin-aarch64 }
+          - { os: macos-15-intel,   plat: darwin-x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+
+      - name: Build WebUI frontend
+        working-directory: client-wpplugin/source/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-wpplugin/source
+
+      - name: Release build (core binary)
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: cargo build --release --bin wptsall-client --manifest-path client-wpplugin/source/Cargo.toml
+
+      - name: Assemble kit-webui-${{ matrix.plat }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/VERSION")"
+          plat="$PLAT"
+          ext=""
+          [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          triple="$(rustc -vV | awk '/^host:/{print $2}')"
+
+          stage_root="$RUNNER_TEMP/kit-stage"
+          stage="$stage_root/wptsall-client-webui"
+          rm -rf "$stage_root"
+          mkdir -p "$stage/bin" "$stage/ui/webui"
+          cp "client-wpplugin/source/target/release/wptsall-client$ext" "$stage/bin/"
+
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            cat > "$stage/bin/wptsall-webui-start" <<'LAUNCHER'
+          #!/usr/bin/env bash
+          DIR="$(cd "$(dirname "$0")/.." && pwd)"
+          export WPTSALL_INSTALL_ROOT="$DIR"
+          export WPTSALL_WEB_UI=1
+          export WPTSALL_WEB_UI_PATH="${WPTSALL_WEB_UI_PATH:-$DIR/ui/webui/index.html}"
+          export WPTSALL_DATA_DIR="${WPTSALL_DATA_DIR:-$HOME/.local/share/wptsall-client}"
+          mkdir -p "$WPTSALL_DATA_DIR"
+          exec "$DIR/bin/wptsall-client" "$@"
+          LAUNCHER
+            chmod +x "$stage/bin/wptsall-webui-start"
+          fi
+
+          cp -r client-wpplugin/source/frontend/dist/. "$stage/ui/webui/"
+          echo "$version" > "$stage/VERSION"
+          echo "$version" > "$stage/VERSION-BINARY"
+          echo "$version" > "$stage/VERSION-WEBUI"
+          echo "$plat" > "$stage/PLATFORM.txt"
+          echo "$triple" > "$stage/TRIPLE.txt"
+          cat > "$stage/HARDENING.txt" <<EOF
+          strip=yes
+          obfuscation=none
+          product_entry=wptsall-client (WebUI mode)
+          timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          version=$version
+          binary_version=$version
+          webui_version=$version
+          ui_path=ui/webui
+          triple=$triple
+          EOF
+          ( cd "$stage" \
+            && find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )
+          # Relative tar paths only: Windows bsdtar treats absolute D:\...
+          # arguments as host:file remotes.
+          kit="kit-webui-$plat.tar.gz"
+          ( cd "$stage_root" && tar -czf "$RUNNER_TEMP/$kit" wptsall-client-webui )
+          ( cd "$RUNNER_TEMP" && tar -tzf "$kit" > kit-list.txt )
+          head -n 25 "$RUNNER_TEMP/kit-list.txt"
+          ( cd "$stage" && sha256sum -c SHA256SUMS >/dev/null && echo 'in-kit SHA256SUMS verified' )
+        env:
+          PLAT: ${{ matrix.plat }}
+
+      - name: Upload kit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kit-webui-${{ matrix.plat }}
+          path: ${{ runner.temp }}/kit-webui-*.tar.gz
+          if-no-files-found: error
+
+  build-desktop:
+    name: Desktop kit (${{ matrix.plat }})
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    plat: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, plat: linux-aarch64 }
+          - { os: windows-latest,   plat: windows-x86_64 }
+          - { os: windows-11-arm,   plat: windows-aarch64 }
+          - { os: macos-latest,     plat: darwin-aarch64 }
+          - { os: macos-15-intel,   plat: darwin-x86_64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+
+      # The desktop crate path-depends on the Rust core, which embeds the
+      # WebUI frontend dist at compile time — build it first (same contract
+      # as the CI/build-matrix lanes).
+      - name: Build WebUI frontend (embedded by the Rust core)
+        working-directory: client-wpplugin/source/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Desktop frontend
+        working-directory: client-desktop/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Tauri v2 Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          # The runner image's google-chrome apt source (any file format,
+          # list or deb822) intermittently hash-mismatches on dl.google.com
+          # and kills apt-get update; nothing installed here needs it.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* || true
+          sudo sed -i '/dl\.google\.com/d' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends \
+            libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
+            librsvg2-dev libayatana-appindicator3-dev libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-desktop/src-tauri
+
+      - name: Release build (Tauri crate)
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+        run: cargo build --release --manifest-path client-desktop/src-tauri/Cargo.toml
+
+      - name: Assemble kit-desktop-${{ matrix.plat }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/VERSION")"
+          plat="$PLAT"
+          ext=""
+          [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          triple="$(rustc -vV | awk '/^host:/{print $2}')"
+
+          stage_root="$RUNNER_TEMP/kit-stage"
+          stage="$stage_root/wptsall-client"
+          rm -rf "$stage_root"
+          mkdir -p "$stage/bin" "$stage/ui"
+          # The Tauri binary is `wptsall-desktop`; the kit ships it under the
+          # shared product entry `wptsall-client` (same as the host kit).
+          cp "client-desktop/src-tauri/target/release/wptsall-desktop$ext" \
+             "$stage/bin/wptsall-client$ext"
+
+          if [ "$RUNNER_OS" != "Windows" ]; then
+            cat > "$stage/bin/wptsall-start" <<'LAUNCHER'
+          #!/usr/bin/env bash
+          DIR="$(cd "$(dirname "$0")/.." && pwd)"
+          export WPTSALL_INSTALL_ROOT="$DIR"
+          export WPTSALL_DATA_DIR="${WPTSALL_DATA_DIR:-$HOME/.local/share/wptsall-client}"
+          mkdir -p "$WPTSALL_DATA_DIR"
+          exec "$DIR/bin/wptsall-client" "$@"
+          LAUNCHER
+            chmod +x "$stage/bin/wptsall-start"
+          fi
+
+          mkdir -p "$stage/ui/desktop"
+          cp -r client-desktop/frontend/dist/. "$stage/ui/desktop/"
+          echo "$version" > "$stage/VERSION"
+          echo "$version" > "$stage/VERSION-BINARY"
+          echo "$version" > "$stage/VERSION-WEBUI"
+          echo "$plat" > "$stage/PLATFORM.txt"
+          echo "$triple" > "$stage/TRIPLE.txt"
+          cat > "$stage/HARDENING.txt" <<EOF
+          strip=yes
+          obfuscation=none
+          product_entry=wptsall-client
+          timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          version=$version
+          binary_version=$version
+          webui_version=$version
+          ui_path=ui/desktop
+          triple=$triple
+          EOF
+          ( cd "$stage" \
+            && find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )
+          kit="kit-desktop-$plat.tar.gz"
+          ( cd "$stage_root" && tar -czf "$RUNNER_TEMP/$kit" wptsall-client )
+          ( cd "$RUNNER_TEMP" && tar -tzf "$kit" > kit-list.txt )
+          head -n 25 "$RUNNER_TEMP/kit-list.txt"
+          ( cd "$stage" && sha256sum -c SHA256SUMS >/dev/null && echo 'in-kit SHA256SUMS verified' )
+        env:
+          PLAT: ${{ matrix.plat }}
+
+      - name: Upload kit artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kit-desktop-${{ matrix.plat }}
+          path: ${{ runner.temp }}/kit-desktop-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Sign and publish the GitHub Release
+    needs: [build-webui, build-desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+
+      - name: Install minisign
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* || true
+          sudo sed -i '/dl\.google\.com/d' /etc/apt/sources.list 2>/dev/null || true
+          sudo apt-get update || true
+          sudo apt-get install -y --no-install-recommends minisign
+          minisign -v
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-wpplugin/source
+
+      - name: Download the twelve platform kits
+        uses: actions/download-artifact@v4
+        with:
+          pattern: kit-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/release
+
+      - name: Assert the pinned release key matches this workflow
+        run: |
+          set -euo pipefail
+          pinned="$(grep -o 'RWR[A-Za-z0-9+/=]\{20,\}' libs/wptsall-client-security/build.rs | tail -n 1)"
+          if [ "$pinned" != "$RELEASE_PUBKEY_B64" ]; then
+            echo "build.rs pins '$pinned' but this workflow expects '$RELEASE_PUBKEY_B64'" >&2
+            echo "update the pinned key and this workflow in the same changeset" >&2
+            exit 1
+          fi
+          echo "pinned release key matches ($RELEASE_KEY_ID)"
+
+      - name: Verify every kit carries this exact version and platform
+        run: |
+          set -euo pipefail
+          version="$(tr -d '[:space:]' < VERSION)"
+          rel="$RUNNER_TEMP/release"
+          count=0
+          for kit in "$rel"/kit-webui-*.tar.gz "$rel"/kit-desktop-*.tar.gz; do
+            [ -f "$kit" ] || { echo "missing kit: $kit" >&2; exit 1; }
+            root="$(tar -tzf "$kit" | awk -F/ 'NF > 1 { print $1; exit }')"
+            kit_ver="$(tar -xOzf "$kit" "$root/VERSION-BINARY" | tr -d '\r\n')"
+            kit_plat="$(tar -xOzf "$kit" "$root/PLATFORM.txt" | tr -d '\r\n')"
+            base="$(basename "$kit" .tar.gz)"
+            want_plat="${base#kit-}"
+            want_plat="${want_plat#webui-}"
+            want_plat="${want_plat#desktop-}"
+            [ "$kit_ver" = "$version" ] || { echo "$base: VERSION-BINARY=$kit_ver, wanted $version" >&2; exit 1; }
+            [ "$kit_plat" = "$want_plat" ] || { echo "$base: PLATFORM.txt=$kit_plat, wanted $want_plat" >&2; exit 1; }
+            count=$((count + 1))
+            echo "kit ok: $base (v$kit_ver, $kit_plat)"
+          done
+          [ "$count" -eq 12 ] || { echo "expected 12 kits, found $count" >&2; exit 1; }
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Build the two UI-only bundles
+        run: |
+          set -euo pipefail
+          ui="$RUNNER_TEMP/ui"
+          rm -rf "$ui"
+          for product in webui desktop; do
+            if [ "$product" = "webui" ]; then
+              front="client-wpplugin/source/frontend"
+            else
+              front="client-desktop/frontend"
+            fi
+            ( cd "$front" && npm ci && npm run build )
+            stage="$ui/$product"
+            mkdir -p "$stage/ui/$product"
+            cp -r "$front/dist/." "$stage/ui/$product/"
+            printf '%s\n' "$RELEASE_VERSION" > "$stage/VERSION-WEBUI"
+            printf '%s\n' "$product" > "$stage/PRODUCT.txt"
+            ( cd "$stage" && tar -czf "$RUNNER_TEMP/release/$product-ui-$RELEASE_VERSION.tar.gz" . )
+          done
+          ls -la "$RUNNER_TEMP/release"
+
+      - name: Sign kits, bundles, sums, and the releases manifest
+        env:
+          WPTSALL_RELEASE_MINISIGN_KEY: ${{ secrets.WPTSALL_RELEASE_MINISIGN_KEY }}
+        run: |
+          set -euo pipefail
+          rel="$RUNNER_TEMP/release"
+          key="$RUNNER_TEMP/release.key"
+          # Unencrypted throwaway-at-rest secret delivered by the Actions
+          # secret store; exists only for this job.
+          printf '%s\n' "$WPTSALL_RELEASE_MINISIGN_KEY" > "$key"
+          chmod 600 "$key"
+          trap 'rm -f "$key"' EXIT
+
+          sign() {
+            minisign -S -s "$key" -m "$1" -t "wptsall release $RELEASE_VERSION" -x "$1.minisig"
+            echo "signed: $(basename "$1")"
+          }
+
+          # Per-kit signatures + .sha256 sidecars (host release convention).
+          for kit in "$rel"/kit-webui-*.tar.gz "$rel"/kit-desktop-*.tar.gz \
+                     "$rel"/webui-ui-*.tar.gz "$rel"/desktop-ui-*.tar.gz; do
+            sign "$kit"
+            ( cd "$rel" && sha256sum "$(basename "$kit")" > "$(basename "$kit").sha256" )
+          done
+
+          # Signed per-axis SHA256SUMS documents (what the updater's
+          # signature_url_template points at).
+          write_sums() {
+            out="$rel/$1"
+            : > "$out"
+            shift
+            for name in "$@"; do
+              ( cd "$rel" && sha256sum "$name" ) >> "$out"
+            done
+            sign "$out"
+          }
+          write_sums RELEASE-SHA256SUMS-webui.txt \
+            kit-webui-linux-x86_64.tar.gz kit-webui-linux-aarch64.tar.gz \
+            kit-webui-windows-x86_64.tar.gz kit-webui-windows-aarch64.tar.gz \
+            kit-webui-darwin-x86_64.tar.gz kit-webui-darwin-aarch64.tar.gz
+          write_sums RELEASE-SHA256SUMS-desktop.txt \
+            kit-desktop-linux-x86_64.tar.gz kit-desktop-linux-aarch64.tar.gz \
+            kit-desktop-windows-x86_64.tar.gz kit-desktop-windows-aarch64.tar.gz \
+            kit-desktop-darwin-x86_64.tar.gz kit-desktop-darwin-aarch64.tar.gz
+          write_sums SHA256SUMS-webui-ui.txt "webui-ui-$RELEASE_VERSION.tar.gz"
+          write_sums SHA256SUMS-desktop-ui.txt "desktop-ui-$RELEASE_VERSION.tar.gz"
+
+          # Four-product releases manifest pointing at this release's asset
+          # URLs; the client resolves {version} and {platform} placeholders.
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/v$RELEASE_VERSION"
+          data="$RUNNER_TEMP/releases-data.json"
+          python3 - "$data" "$base" "$RELEASE_VERSION" <<'PY'
+          import datetime as dt
+          import json, sys
+          out, base, ver = sys.argv[1], sys.argv[2], sys.argv[3]
+          products = {}
+          for binary, ui, kit_prefix, sums in (
+              ("client-wpplugin", "client-wpplugin-webui", "kit-webui", "RELEASE-SHA256SUMS-webui.txt"),
+              ("client-desktop", "client-desktop-webui", "kit-desktop", "RELEASE-SHA256SUMS-desktop.txt"),
+          ):
+            products[binary] = {
+              "latest_version": ver,
+              "min_supported_version": "2.0.0",
+              "release_notes_url": f"https://github.com/wpmmcc/wptsall-client/releases/tag/v{ver}",
+              "download_url_template": f"{base}/{kit_prefix}-{{platform}}.tar.gz",
+              "signature_url_template": f"{base}/{sums}.minisig",
+              "mandatory": False,
+            }
+            ui_name = "webui-ui" if kit_prefix == "kit-webui" else "desktop-ui"
+            products[ui] = {
+              "latest_version": ver,
+              "min_supported_version": "2.0.0",
+              "release_notes_url": f"https://github.com/wpmmcc/wptsall-client/releases/tag/v{ver}",
+              "download_url_template": f"{base}/{ui_name}-{{version}}.tar.gz",
+              "signature_url_template": f"{base}/SHA256SUMS-{ui_name}.txt.minisig",
+              "mandatory": False,
+            }
+          data = {
+            "schema_version": 1,
+            "generated_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "products": products,
+            "signing": {
+              "key_id": "DD1B5C2FCE14D14A",
+              "algorithm": "minisign",
+              "public_key_b64": "RWRK0RTOL1wb3YAJ6sywCLsN0kvpOttJ1CYv3AHluZAfYUXzSEm/0cSw",
+            },
+          }
+          json.dump(data, open(out, "w"), indent=2)
+          PY
+          # releases.json asset = the wire shape ({"success":true,"data":…});
+          # the .minisig covers the canonicalized inner data object.
+          wrapper="$rel/releases.json"
+          python3 - "$data" "$wrapper" <<'PY'
+          import json, sys
+          data = json.loads(open(sys.argv[1]).read())
+          json.dump({"success": True, "data": data}, open(sys.argv[2], "w"), indent=2)
+          PY
+          canon="$RUNNER_TEMP/releases-canonical.json"
+          python3 - "$data" "$canon" <<'PY'
+          import json, sys
+          def sortv(v):
+            if isinstance(v, dict): return {k: sortv(v[k]) for k in sorted(v)}
+            if isinstance(v, list): return [sortv(i) for i in v]
+            return v
+          raw = json.loads(open(sys.argv[1]).read())
+          open(sys.argv[2], "wb").write(json.dumps(
+            sortv(raw), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+          ).encode("utf-8"))
+          PY
+          minisign -Sm "$canon" -s "$key" -x "$rel/releases.json.minisig"
+          echo "manifest signed"
+
+      - name: Create the GitHub Release with every asset
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          rel="$RUNNER_TEMP/release"
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "wptsall-client v$RELEASE_VERSION"
+            echo
+            echo "Signed kits for all six platforms (webui + desktop), UI-only bundles, and the four-product releases manifest. Published by the release-publish workflow after all four test workflows were green at this commit."
+            echo
+            echo "The built-in update channel of existing clients resolves this release automatically (releases/latest/download/releases.json, minisign key $RELEASE_KEY_ID)."
+            echo
+            echo "Manual verification:"
+            echo '```'
+            echo "minisign -Vm kit-webui-linux-x86_64.tar.gz -P $RELEASE_PUBKEY_B64 < kit-webui-linux-x86_64.tar.gz.minisig"
+            echo '```'
+            if [ -n "$NOTES" ]; then
+              echo
+              echo "## Notes"
+              echo
+              echo "$NOTES"
+            fi
+          } > "$notes"
+          gh release create "v$RELEASE_VERSION" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "wptsall-client v$RELEASE_VERSION" \
+            --notes-file "$notes" \
+            "$rel"/*
+          echo "release v$RELEASE_VERSION published"
+
+      - name: Self-verify the published channel
+        run: |
+          set -euo pipefail
+          # 1. The default channel URL must resolve to this release and the
+          #    manifest signature must verify with the pinned public key.
+          default_url="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/releases.json"
+          rel="$RUNNER_TEMP/release"
+          curl -fsSL "$default_url" -o "$RUNNER_TEMP/latest-releases.json"
+          python3 - "$RUNNER_TEMP/latest-releases.json" "$RUNNER_TEMP/latest-canonical.json" <<'PY'
+          import json, sys
+          def sortv(v):
+            if isinstance(v, dict): return {k: sortv(v[k]) for k in sorted(v)}
+            if isinstance(v, list): return [sortv(i) for i in v]
+            return v
+          body = json.loads(open(sys.argv[1]).read())
+          data = body["data"]
+          open(sys.argv[2], "wb").write(json.dumps(
+            sortv(data), ensure_ascii=False, separators=(",", ":"), allow_nan=False
+          ).encode("utf-8"))
+          PY
+          curl -fsSL "$default_url.minisig" -o "$RUNNER_TEMP/latest-releases.json.minisig"
+          minisign -Vm "$RUNNER_TEMP/latest-canonical.json" \
+            -P "$RELEASE_PUBKEY_B64" \
+            -x "$RUNNER_TEMP/latest-releases.json.minisig"
+          echo "latest manifest verifies with the pinned public key"
+
+          # 2. Every signed sums document must check out against the kits.
+          ( cd "$rel" && sha256sum -c RELEASE-SHA256SUMS-webui.txt )
+          ( cd "$rel" && sha256sum -c RELEASE-SHA256SUMS-desktop.txt )
+          ( cd "$rel" && sha256sum -c SHA256SUMS-webui-ui.txt )
+          ( cd "$rel" && sha256sum -c SHA256SUMS-desktop-ui.txt )
+          echo "all release checksums verify"
+
+      - name: Live discovery smoke - default channel client sees the new version
+        run: |
+          set -euo pipefail
+          # Build with the pinned release key (no WPTSALL_MINISIGN_PUBKEY
+          # env in this job) — exactly what a public build ships with.
+          cargo build --release --bin wptsall-client --manifest-path client-wpplugin/source/Cargo.toml
+          home="$RUNNER_TEMP/discover"
+          root="$RUNNER_TEMP/discover-root"
+          rm -rf "$home" "$root"
+          mkdir -p "$home/data" "$root/bin" "$root/ui/webui"
+          cp client-wpplugin/source/target/release/wptsall-client "$root/bin/"
+          cp -r client-wpplugin/source/frontend/dist/. "$root/ui/webui/"
+          ui_port=18151
+          # No WPTSALL_SERVER_BASE, no WPTSALL_RELEASES_URL: the client must
+          # use the built-in default channel on its own.
+          WPTSALL_WEB_UI=1 \
+          WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
+          WPTSALL_WEB_UI_PORT="$ui_port" \
+          WPTSALL_DATA_DIR="$home/data" \
+          WPTSALL_DB_PATH="$home/wptsall.db" \
+          WPTSALL_LOG_FILE="$home/client.log" \
+          WPTSALL_INSTALL_ROOT="$root" \
+            "$root/bin/wptsall-client" > "$home/stdout.log" 2>&1 &
+          client_pid=$!
+          ready=0
+          for _ in $(seq 1 40); do
+            curl -fsS "http://127.0.0.1:$ui_port/api/status" >/dev/null 2>&1 && { ready=1; break; }
+            sleep 0.5
+          done
+          [ "$ready" = "1" ] || { cat "$home/stdout.log" "$home/client.log" 2>/dev/null || true; \
+            echo "client did not start" >&2; exit 1; }
+          check="$(curl -fsS "http://127.0.0.1:$ui_port/api/update-check")"
+          echo "default-channel update-check after publish: $check"
+          kill "$client_pid" 2>/dev/null || true; wait "$client_pid" 2>/dev/null || true
+          echo "$check" | grep -q '"success":true' \
+            || { echo "the default channel must verify the just-published manifest" >&2; exit 1; }
+          echo "$check" | grep -q "\"latest_version\":\"$RELEASE_VERSION\"" \
+            || { echo "expected latest_version $RELEASE_VERSION" >&2; exit 1; }
+          echo "PASS: freshly published release is discoverable and verifiable through the default channel"
+
+      - name: Remove the signing key material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.key"

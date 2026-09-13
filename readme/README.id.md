@@ -11,7 +11,7 @@ WPTSALL Client adalah klien pendamping plugin WordPress WPMMCC ATS. Ia berjalan 
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## Fitur
 - Dua produk, satu inti — WebUI lokal di 127.0.0.1:8977 dan aplikasi desktop native (Tauri) berbagi inti Rust yang sama
@@ -32,7 +32,7 @@ WPTSALL Client adalah klien pendamping plugin WordPress WPMMCC ATS. Ia berjalan 
 - Jika port sudah dipakai, startup gagal dengan bind web ui failed — atur WPTSALL_WEB_UI_PORT atau WPTSALL_WEB_UI_BIND ke port lain lalu mulai ulang layanan
 
 ## Instalasi
-1. Ambil kit bertanda tangan atau installer di https://github.com/wpmmcc/wptsall-client-releases
+1. Ambil kit bertanda tangan di https://github.com/wpmmcc/wptsall-client/releases
 2. Atau bangun dari sumber: cargo build --release di dalam client-wpplugin/source (biner WebUI), atau toolchain Tauri di dalam client-desktop (aplikasi desktop)
 3. Jalankan biner WebUI dan buka http://127.0.0.1:8977
 
@@ -45,9 +45,10 @@ WPTSALL Client adalah klien pendamping plugin WordPress WPMMCC ATS. Ia berjalan 
 Semua konfigurasi dan status tugas tetap di mesin Anda (SQLite plus berkas lokal). Klien hanya berkomunikasi dengan situs WordPress yang Anda konfigurasi dan endpoint penyedia yang Anda pilih. Pencatatan debug dimatikan secara default; halaman Pengaturan dapat mengaktifkan atau menonaktifkan pencatatan lokal saat runtime.
 
 ## Pembaruan
+- Pemeriksaan pembaruan menggunakan GitHub Releases repositori ini sebagai kanal pembaruan bawaan — tidak perlu konfigurasi
 - Buka Pengaturan di WebUI dan gunakan pemeriksaan pembaruan — versi baru diunduh sebagai kit bertanda tangan dan diterapkan langsung di tempat
 - Setiap kit diverifikasi sebelum file diganti: tanda tangan minisign ditambah checksum SHA-256, dengan perlindungan anti-rollback. Layanan dimulai ulang secara otomatis setelahnya; di Windows biner yang sedang berjalan diganti dengan aman, dengan rollback jika pembaruan gagal
-- Alternatif manual: unduh penginstal terbaru dari https://github.com/wpmmcc/wptsall-client-releases dan jalankan di atas instalasi yang ada
+- Alternatif manual: unduh kit terbaru dari https://github.com/wpmmcc/wptsall-client/releases dan ekstrak di atas instalasi yang ada
 
 ## Copot Pemasangan
 - Pencopot pemasangan untuk setiap produk dan platform tersedia di repositori rilis: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) dan skrip .ps1 yang cocok (Windows)

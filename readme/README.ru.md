@@ -11,7 +11,7 @@ WPTSALL Client — клиент-компаньон плагина WPMMCC ATS д�
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## Возможности
 - Два продукта, одно ядро — локальный WebUI на 127.0.0.1:8977 и нативное Desktop-приложение (Tauri) на одном Rust-ядре
@@ -32,7 +32,7 @@ WPTSALL Client — клиент-компаньон плагина WPMMCC ATS д�
 - Если порт уже занят, запуск завершается ошибкой bind web ui failed — задайте другой порт в WPTSALL_WEB_UI_PORT или WPTSALL_WEB_UI_BIND и перезапустите службу
 
 ## Установка
-1. Возьмите подписанный kit или установщик на https://github.com/wpmmcc/wptsall-client-releases
+1. Возьмите подписанный kit на https://github.com/wpmmcc/wptsall-client/releases
 2. Или соберите из исходников: cargo build --release в client-wpplugin/source (бинарник WebUI) или инструментальная цепочка Tauri в client-desktop (Desktop-приложение)
 3. Запустите бинарник WebUI и откройте http://127.0.0.1:8977
 
@@ -45,9 +45,10 @@ WPTSALL Client — клиент-компаньон плагина WPMMCC ATS д�
 Все настройки и состояние задач остаются на вашей машине (SQLite плюс локальные файлы). Клиент обменивается данными только с настроенным сайтом WordPress и выбранным эндпоинтом провайдера. Отладочные журналы по умолчанию отключены; на странице настроек можно включать и отключать локальные журналы во время работы.
 
 ## Обновление
+- Проверка обновлений по умолчанию использует GitHub Releases этого репозитория как канал обновлений — настройка не требуется
 - Откройте «Настройки» в WebUI и воспользуйтесь проверкой обновлений — новые версии загружаются в виде подписанных kit-ов и применяются на месте
 - Каждый kit проверяется перед заменой файлов: подпись minisign и контрольная сумма SHA-256 с защитой от отката. После этого служба перезапускается автоматически; в Windows работающий бинарный файл заменяется безопасно с откатом при ошибке
-- Ручная альтернатива: загрузите последний установщик с https://github.com/wpmmcc/wptsall-client-releases и запустите его поверх существующей установки
+- Ручная альтернатива: загрузите последний kit с https://github.com/wpmmcc/wptsall-client/releases и распакуйте его поверх существующей установки
 
 ## Удаление
 - Программы удаления для каждого продукта и платформы доступны в репозитории релизов: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) и соответствующие скрипты .ps1 (Windows)

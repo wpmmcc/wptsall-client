@@ -11,7 +11,7 @@ WPTSALL Client, WPMMCC ATS WordPress eklentisinin companion istemcisidir. Makine
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## Özellikler
 - İki ürün, tek çekirdek — 127.0.0.1:8977 üzerindeki yerel WebUI ve yerel masaüstü uygulaması (Tauri) aynı Rust çekirdeğini paylaşır
@@ -32,7 +32,7 @@ WPTSALL Client, WPMMCC ATS WordPress eklentisinin companion istemcisidir. Makine
 - Port zaten kullanımdaysa başlatma bind web ui failed ile başarısız olur — WPTSALL_WEB_UI_PORT veya WPTSALL_WEB_UI_BIND ile başka bir port ayarlayıp servisi yeniden başlatın
 
 ## Kurulum
-1. https://github.com/wpmmcc/wptsall-client-releases adresinden imzalı kit ya da yükleyici alın
+1. https://github.com/wpmmcc/wptsall-client/releases adresinden imzalı kit alın
 2. Ya da kaynaktan derleyin: client-wpplugin/source içinde cargo build --release (WebUI ikili dosyası) veya client-desktop içinde Tauri araç zinciri (masaüstü uygulaması)
 3. WebUI ikili dosyasını başlatın ve http://127.0.0.1:8977 adresini açın
 
@@ -45,9 +45,10 @@ WPTSALL Client, WPMMCC ATS WordPress eklentisinin companion istemcisidir. Makine
 Tüm yapılandırma ve görev durumu makinenizde kalır (SQLite artı yerel dosyalar). İstemci yalnızca yapılandırdığınız WordPress sitesi ve seçtiğiniz sağlayıcı uç noktasıyla iletişim kurar. Hata ayıklama günlükleri varsayılan olarak kapalıdır; Ayarlar sayfası çalışma zamanında yerel günlük kaydını açıp kapatabilir.
 
 ## Güncelleme
+- Güncelleme kontrolü, bu deponun GitHub Releases sayfasını varsayılan güncelleme kanalı olarak kullanır — hiçbir yapılandırma gerektirmez
 - WebUI'de Ayarlar'ı açın ve güncelleme kontrolünü kullanın — yeni sürümler imzalı kit'ler olarak indirilir ve yerinde uygulanır
 - Her kit herhangi bir dosya değiştirilmeden önce doğrulanır: minisign imzası ve SHA-256 sağlama toplamı ile geri alma koruması. Hizmet sonrasında otomatik olarak yeniden başlar; Windows'ta çalışan ikili dosya güvenli bir şekilde değiştirilir ve güncelleme başarısız olursa geri alınır
-- Manuel alternatif: https://github.com/wpmmcc/wptsall-client-releases adresinden en son yükleyiciyi indirin ve mevcut kurulumun üzerine çalıştırın
+- Manuel alternatif: https://github.com/wpmmcc/wptsall-client/releases adresinden en son kit'i indirin ve mevcut kurulumun üzerine açın
 
 ## Kaldırma
 - Her ürün ve platform için kaldırıcılar releases deposunda mevcuttur: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) ve eşleşen .ps1 komut dosyaları (Windows)

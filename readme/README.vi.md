@@ -11,7 +11,7 @@ WPTSALL Client là client đi kèm của plugin WordPress WPMMCC ATS. Nó chạy
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## Tính năng
 - Hai sản phẩm, một lõi — WebUI cục bộ tại 127.0.0.1:8977 và ứng dụng desktop gốc (Tauri) dùng chung lõi Rust
@@ -32,7 +32,7 @@ WPTSALL Client là client đi kèm của plugin WordPress WPMMCC ATS. Nó chạy
 - Nếu cổng đã bị chiếm, khởi động sẽ lỗi bind web ui failed — đặt WPTSALL_WEB_UI_PORT hoặc WPTSALL_WEB_UI_BIND sang cổng khác rồi khởi động lại dịch vụ
 
 ## Cài đặt
-1. Lấy kit có chữ ký hoặc trình cài đặt tại https://github.com/wpmmcc/wptsall-client-releases
+1. Lấy kit có chữ ký tại https://github.com/wpmmcc/wptsall-client/releases
 2. Hoặc build từ mã nguồn: cargo build --release trong client-wpplugin/source (binary WebUI), hoặc chuỗi công cụ Tauri trong client-desktop (ứng dụng desktop)
 3. Khởi động binary WebUI và mở http://127.0.0.1:8977
 
@@ -45,9 +45,10 @@ WPTSALL Client là client đi kèm của plugin WordPress WPMMCC ATS. Nó chạy
 Mọi cấu hình và trạng thái tác vụ đều ở trên máy bạn (SQLite cộng tệp cục bộ). Client chỉ giao tiếp với site WordPress bạn cấu hình và endpoint nhà cung cấp bạn chọn. Nhật ký gỡ lỗi được tắt theo mặc định; trang Cài đặt có thể bật hoặc tắt nhật ký cục bộ trong thời gian chạy.
 
 ## Cập nhật
+- Tính năng kiểm tra cập nhật dùng GitHub Releases của kho lưu trữ này làm kênh cập nhật mặc định — không cần cấu hình
 - Mở Cài đặt trong WebUI và sử dụng tính năng kiểm tra cập nhật — các phiên bản mới được tải về dưới dạng kit có chữ ký và áp dụng trực tiếp
 - Mọi kit đều được xác minh nghiêm ngặt trước khi thay thế: chữ ký minisign và mã tổng kiểm SHA-256, cùng cơ chế chống rollback. Dịch vụ tự động khởi động lại sau đó; trên Windows, tệp thực thi đang chạy được thay thế an toàn và tự động hoàn tác nếu cập nhật thất bại
-- Phương án thủ công: tải trình cài đặt mới nhất từ https://github.com/wpmmcc/wptsall-client-releases và chạy đè lên bản cài đặt hiện tại
+- Phương án thủ công: tải kit mới nhất từ https://github.com/wpmmcc/wptsall-client/releases và giải nén đè lên bản cài đặt hiện tại
 
 ## Gỡ cài đặt
 - Bộ gỡ cài đặt cho từng sản phẩm và nền tảng có trong kho lưu trữ releases: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) và script .ps1 tương ứng (Windows)

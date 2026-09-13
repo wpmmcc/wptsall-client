@@ -11,7 +11,7 @@ WPTSALL Client ist der Begleit-Client zum WordPress-Plugin WPMMCC ATS. Er läuft
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## Funktionen
 - Zwei Produkte, ein Kern — lokale WebUI auf 127.0.0.1:8977 und native Desktop-App (Tauri) mit demselben Rust-Kern
@@ -32,7 +32,7 @@ WPTSALL Client ist der Begleit-Client zum WordPress-Plugin WPMMCC ATS. Er läuft
 - Ist der Port bereits belegt, schlägt der Start mit bind web ui failed fehl — setzen Sie WPTSALL_WEB_UI_PORT oder WPTSALL_WEB_UI_BIND auf einen anderen Port und starten Sie den Dienst neu
 
 ## Installation
-1. Hol dir ein signiertes Kit oder einen Installer auf https://github.com/wpmmcc/wptsall-client-releases
+1. Hol dir ein signiertes Kit auf https://github.com/wpmmcc/wptsall-client/releases
 2. Oder baue aus dem Quellcode: cargo build --release in client-wpplugin/source (WebUI-Binary) oder die Tauri-Toolchain in client-desktop (Desktop-App)
 3. Starte das WebUI-Binary und öffne http://127.0.0.1:8977
 
@@ -45,9 +45,10 @@ WPTSALL Client ist der Begleit-Client zum WordPress-Plugin WPMMCC ATS. Er läuft
 Alle Konfigurationen und Aufgabenstände bleiben auf deinem Rechner (SQLite plus lokale Dateien). Der Client spricht nur mit der von dir konfigurierten WordPress-Website und dem gewählten Anbieter-Endpoint. Debug-Logging ist standardmäßig deaktiviert; auf der Einstellungsseite kann das lokale Logging zur Laufzeit aktiviert oder deaktiviert werden.
 
 ## Aktualisierung
+- Die Update-Prüfung nutzt die GitHub-Releases dieses Repositories als Standard-Update-Kanal — keine Konfiguration nötig
 - Öffne die Einstellungen in der WebUI und nutze die Update-Prüfung — neue Versionen werden als signierte Kits heruntergeladen und direkt installiert
 - Jedes Kit wird vor dem Ersetzen vollständig verifiziert: minisign-Signatur plus SHA-256-Prüfsumme, mit Rollback-Schutz. Der Dienst startet danach automatisch neu; unter Windows wird die laufende Binärdatei sicher ersetzt, mit automatischem Rollback bei Fehlern
-- Manuelle Alternative: Lade den neuesten Installer von https://github.com/wpmmcc/wptsall-client-releases herunter und führe ihn über die bestehende Installation aus
+- Manuelle Alternative: Lade das neueste Kit von https://github.com/wpmmcc/wptsall-client/releases herunter und entpacke es über die bestehende Installation
 
 ## Deinstallation
 - Deinstallationsskripte für jedes Produkt und jede Plattform liegen im Releases-Repository bereit: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) und die entsprechenden .ps1-Skripte (Windows)

@@ -159,9 +159,11 @@ fn empty_product() -> ReleaseProduct {
 
 /// Explicit control-plane base for release checks.
 ///
-/// Empty means that no release source was configured.  In particular, this
-/// must not fall back to the official website: normal client startup is
-/// local-first and release checks are an explicit opt-in operation.
+/// Empty means no control-plane server is configured.  It must not fall
+/// back to an arbitrary website: normal client startup is local-first and
+/// release checks are an explicit, user-initiated operation.  An empty base
+/// now resolves to the official public update channel below rather than an
+/// error — but nothing is contacted until the user asks for a check.
 #[allow(dead_code)]
 pub fn default_server_base() -> String {
     for key in ["WPTSALL_SERVER_BASE", "WPTSALL_SERVER_URL"] {
@@ -175,6 +177,40 @@ pub fn default_server_base() -> String {
     String::new()
 }
 
+/// Official public update channel: the newest GitHub Release of the public
+/// source repository.  The `release-publish` workflow publishes `releases.json`
+/// (+ `.minisig`) and the platform kits as release assets on every version;
+/// `releases/latest/download/` always points at the newest full release, so
+/// this URL is stable across versions.
+pub const DEFAULT_PUBLIC_RELEASES_URL: &str =
+    "https://github.com/wpmmcc/wptsall-client/releases/latest/download/releases.json";
+
+/// Resolve the releases-manifest URL for an update check.
+///
+/// Precedence:
+/// 1. `WPTSALL_RELEASES_URL` — explicit full manifest URL (highest; used by
+///    CI lanes and staged-rollout setups);
+/// 2. a configured control-plane base — `{base}/api/v1/client/releases`
+///    (unchanged behavior for server deployments and the local OTA lanes);
+/// 3. the official public update channel (default) — the repository's
+///    GitHub Releases.
+///
+/// The URL is only ever contacted by an explicit user-initiated check
+/// (`/api/update-check` or the Desktop command); startup stays local-first.
+pub fn resolve_releases_url(server_base: &str) -> String {
+    if let Ok(value) = std::env::var("WPTSALL_RELEASES_URL") {
+        let value = value.trim().trim_end_matches('/');
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+    let base = server_base.trim().trim_end_matches('/');
+    if !base.is_empty() {
+        return format!("{base}/api/v1/client/releases");
+    }
+    DEFAULT_PUBLIC_RELEASES_URL.to_string()
+}
+
 #[allow(dead_code)]
 pub fn default_http_client() -> reqwest::Client {
     reqwest::Client::new()
@@ -186,13 +222,10 @@ pub async fn check_for_update_axis(
     server_base: &str,
     axis: ProductAxis,
 ) -> anyhow::Result<UpdateCheckResult> {
-    let server_base = server_base.trim().trim_end_matches('/');
-    if server_base.is_empty() {
-        anyhow::bail!(
-            "release update source is not configured; set WPTSALL_SERVER_BASE explicitly"
-        );
-    }
-    let url = format!("{server_base}/api/v1/client/releases");
+    // Explicit override → control-plane base → official public channel.
+    // Empty/whitespace values fall through; the resolved URL is only
+    // contacted by this (user-initiated) update check.
+    let url = resolve_releases_url(server_base);
     // Prefer signed manifest path (minisign over `data`); see wptsall-client-security.
     let data = wptsall_client_security::fetch_verified_releases_data(http, &url).await?;
     let manifest: ReleasesManifest = serde_json::from_value(data)?;
@@ -482,16 +515,36 @@ mod tests {
         assert!(default_server_base().is_empty());
     }
 
-    #[tokio::test]
-    async fn missing_update_source_fails_before_http_request() {
+    #[test]
+    fn resolve_releases_url_prefers_explicit_override() {
+        let _base = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_BASE", "https://ctrl.example");
+        let _rel = crate::db::TestEnvVarGuard::set("WPTSALL_RELEASES_URL", "https://mirror.example/releases.json");
+        assert_eq!(
+            resolve_releases_url(&default_server_base()),
+            "https://mirror.example/releases.json"
+        );
+    }
+
+    #[test]
+    fn resolve_releases_url_uses_control_plane_base_when_configured() {
+        let _base = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_BASE", "https://ctrl.example/");
+        let _rel = crate::db::TestEnvVarGuard::set("WPTSALL_RELEASES_URL", "");
+        assert_eq!(
+            resolve_releases_url(&default_server_base()),
+            "https://ctrl.example/api/v1/client/releases"
+        );
+    }
+
+    #[test]
+    fn resolve_releases_url_defaults_to_official_public_channel() {
         let _base = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_BASE", "");
         let _url = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_URL", "");
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let error = check_for_update(&http, &default_server_base())
-            .await
-            .expect_err("an unset release source must fail closed");
-        assert!(error
-            .to_string()
-            .contains("release update source is not configured"));
+        let _rel = crate::db::TestEnvVarGuard::set("WPTSALL_RELEASES_URL", "");
+        // Pure URL resolution — no network is contacted by this assertion;
+        // the default channel is only ever fetched by an explicit check.
+        assert_eq!(
+            resolve_releases_url(&default_server_base()),
+            DEFAULT_PUBLIC_RELEASES_URL
+        );
     }
 }

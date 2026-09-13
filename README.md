@@ -11,7 +11,7 @@ WPTSALL Client is the companion client for the WPMMCC ATS WordPress plugin. It r
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## Features
 - Two products, one core — a local WebUI on 127.0.0.1:8977 and a native Desktop app (Tauri) sharing the same Rust core
@@ -32,7 +32,7 @@ WPTSALL Client is the companion client for the WPMMCC ATS WordPress plugin. It r
 - If the port is already taken, startup fails with "bind web ui failed" — set WPTSALL_WEB_UI_PORT or WPTSALL_WEB_UI_BIND to another port and restart the service
 
 ## Installation
-1. Get a signed kit or installer from https://github.com/wpmmcc/wptsall-client-releases
+1. Get a signed kit from https://github.com/wpmmcc/wptsall-client/releases
 2. Or build from source: cargo build --release inside client-wpplugin/source (WebUI binary), or the Tauri toolchain inside client-desktop (Desktop app)
 3. Start the WebUI binary and open http://127.0.0.1:8977
 
@@ -45,9 +45,10 @@ WPTSALL Client is the companion client for the WPMMCC ATS WordPress plugin. It r
 All configuration and task state stay on your machine (SQLite plus local files). The client only ever talks to the WordPress site you configured and the translation provider endpoint you chose. Debug logging is off by default; the Settings page can turn local logging on or off at runtime.
 
 ## Updating
+- The update check uses this repository's GitHub Releases as its default update channel — no configuration needed
 - Open Settings in the WebUI and use the update check — new versions download as signed kits and apply in place
 - Every kit is verified before anything is replaced: minisign signature plus SHA-256 checksum, with anti-rollback protection. The service restarts automatically afterwards; on Windows the running binary is replaced safely, with rollback if the update fails
-- Manual alternative: download the latest installer from https://github.com/wpmmcc/wptsall-client-releases and run it over the existing installation
+- Manual alternative: download the latest kit from https://github.com/wpmmcc/wptsall-client/releases and unpack it over the existing installation
 
 ## Uninstalling
 - Uninstallers for every product and platform live in the releases repository: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) and the matching .ps1 scripts (Windows)

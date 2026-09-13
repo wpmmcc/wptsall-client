@@ -11,7 +11,7 @@ WPTSALL Client, WPMMCC ATS WordPress प्लगइन का साथी क�
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## विशेषताएँ
 - दो उत्पाद, एक कोर — स्थानीय WebUI (127.0.0.1:8977) और नेटिव Desktop ऐप (Tauri) एक ही Rust कोर साझा करते हैं
@@ -32,7 +32,7 @@ WPTSALL Client, WPMMCC ATS WordPress प्लगइन का साथी क�
 - यदि पोर्ट पहले से व्यस्त है, तो स्टार्टअप bind web ui failed के साथ विफल होता है —— WPTSALL_WEB_UI_PORT या WPTSALL_WEB_UI_BIND में दूसरा पोर्ट सेट करें और सेवा पुनः आरंभ करें
 
 ## स्थापना
-1. https://github.com/wpmmcc/wptsall-client-releases से हस्ताक्षरित kit या इंस्टॉलर लें
+1. https://github.com/wpmmcc/wptsall-client/releases से हस्ताक्षरित kit लें
 2. या स्रोत से बिल्ड करें: client-wpplugin/source में cargo build --release (WebUI बाइनरी), या client-desktop में Tauri टूलचेन (Desktop ऐप)
 3. WebUI बाइनरी चालू करें और http://127.0.0.1:8977 खोलें
 
@@ -45,9 +45,10 @@ WPTSALL Client, WPMMCC ATS WordPress प्लगइन का साथी क�
 सारी विन्यास और कार्य स्थिति आपकी मशीन पर रहती है (SQLite + स्थानीय फ़ाइलें)। क्लाइंट केवल आपके विन्यस्त WordPress साइट और चुने गए प्रोवाइडर एंडपॉइंट से संवाद करता है। डिबग लॉगिंग डिफ़ॉल्ट रूप से बंद है; सेटिंग्स पृष्ठ से रनटाइम पर स्थानीय लॉगिंग चालू या बंद की जा सकती है।
 
 ## अपडेट करना
+- अपडेट जांच डिफ़ॉल्ट रूप से इस रिपॉज़िटरी के GitHub Releases को अपडेट चैनल के रूप में उपयोग करती है — किसी सेटिंग की ज़रूरत नहीं
 - WebUI में सेटिंग्स खोलें और अपडेट जांच का उपयोग करें — नए संस्करण हस्ताक्षरित kit के रूप में डाउनलोड होते हैं और उसी स्थान पर लागू होते हैं
 - फ़ाइलों को बदलने से पहले प्रत्येक kit को सत्यापित किया जाता है: minisign हस्ताक्षर और SHA-256 चेकसम, साथ ही एंटी-रोलबैक सुरक्षा। इसके बाद सेवा स्वतः पुनरारंभ होती है; Windows पर चल रही बाइनरी सुरक्षित रूप से बदल दी जाती है और विफलता पर स्वतः रोलबैक होता है
-- मैन्युअल विकल्प: https://github.com/wpmmcc/wptsall-client-releases से नवीनतम इंस्टॉलर डाउनलोड करें और मौजूदा इंस्टॉलेशन पर चलाएं
+- मैन्युअल विकल्प: https://github.com/wpmmcc/wptsall-client/releases से नवीनतम kit डाउनलोड करें और मौजूदा इंस्टॉलेशन पर अनपैक करें
 
 ## अनइंस्टॉल करना
 - प्रत्येक उत्पाद और प्लेटफ़ॉर्म के अनइंस्टॉलर रिलीज़ रिपॉज़िटरी में उपलब्ध हैं: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) और संबंधित .ps1 स्क्रिप्ट (Windows)

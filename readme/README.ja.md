@@ -11,7 +11,7 @@ WPTSALL Client は WPMMCC ATS WordPress プラグインの companion クライ�
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## 機能
 - 2つの製品、1つのコア — ローカル WebUI(127.0.0.1:8977)とネイティブ Desktop アプリ(Tauri)が同じ Rust コアを共有
@@ -32,7 +32,7 @@ WPTSALL Client は WPMMCC ATS WordPress プラグインの companion クライ�
 - ポートが既に使われている場合は起動時に bind web ui failed と表示されます —— WPTSALL_WEB_UI_PORT または WPTSALL_WEB_UI_BIND で別のポートを指定し、サービスを再起動してください
 
 ## インストール
-1. https://github.com/wpmmcc/wptsall-client-releases から署名済み kit かインストーラーを入手
+1. https://github.com/wpmmcc/wptsall-client/releases から署名済み kit を入手
 2. またはソースからビルド: client-wpplugin/source で cargo build --release(WebUI バイナリ)、client-desktop で Tauri ツールチェーン(Desktop アプリ)
 3. WebUI バイナリを起動して http://127.0.0.1:8977 を開く
 
@@ -45,9 +45,10 @@ WPTSALL Client は WPMMCC ATS WordPress プラグインの companion クライ�
 設定もタスク状態もすべてあなたのマシンに置かれます（SQLite＋ローカルファイル）。クライアントが通信するのは、設定した WordPress サイトと選んだ翻訳プロバイダーのエンドポイントだけです。デバッグログはデフォルトでオフです。設定ページから実行時にローカルログのオン/オフを切り替えられます。
 
 ## アップデート
+- アップデート確認は、既定でこのリポジトリの GitHub Releases を更新チャネルとして使用します — 設定は不要です
 - WebUI の設定画面を開き、アップデート確認を使用してください — 新バージョンは署名済み kit としてダウンロードされ、その場で適用されます
 - すべての kit は置き換え前に minisign 署名と SHA-256 チェックサムで検証され、ロールバック防止機能も備えています。更新完了後はサービスが自動再起動します。Windows では実行中のバイナリを安全に置き換え、失敗した場合はロールバックします
-- 手動での代替手段：https://github.com/wpmmcc/wptsall-client-releases から最新のインストーラーをダウンロードし、既存のインストールに上書き実行してください
+- 手動での代替手段：https://github.com/wpmmcc/wptsall-client/releases から最新の kit をダウンロードし、既存のインストールディレクトリに上書き展開してください
 
 ## アンインストール
 - 各製品・プラットフォーム向けのアンインストーラーは releases リポジトリで提供されています：uninstall-webui.sh / uninstall-desktop.sh（Linux、macOS）および対応する .ps1 スクリプト（Windows）

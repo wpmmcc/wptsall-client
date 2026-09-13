@@ -11,7 +11,7 @@ WPTSALL Client es el cliente complementario del plugin WPMMCC ATS para WordPress
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## Características
 - Dos productos, un núcleo — WebUI local en 127.0.0.1:8977 y aplicación de escritorio nativa (Tauri) compartiendo el mismo núcleo Rust
@@ -32,7 +32,7 @@ WPTSALL Client es el cliente complementario del plugin WPMMCC ATS para WordPress
 - Si el puerto ya está ocupado, el arranque falla con bind web ui failed — configura WPTSALL_WEB_UI_PORT o WPTSALL_WEB_UI_BIND con otro puerto y reinicia el servicio
 
 ## Instalación
-1. Consigue un kit firmado o instalador en https://github.com/wpmmcc/wptsall-client-releases
+1. Consigue un kit firmado en https://github.com/wpmmcc/wptsall-client/releases
 2. O compila desde el código: cargo build --release dentro de client-wpplugin/source (binario WebUI), o el toolchain de Tauri dentro de client-desktop (aplicación de escritorio)
 3. Arranca el binario WebUI y abre http://127.0.0.1:8977
 
@@ -45,9 +45,10 @@ WPTSALL Client es el cliente complementario del plugin WPMMCC ATS para WordPress
 Toda la configuración y el estado de las tareas permanecen en tu máquina (SQLite y archivos locales). El cliente solo se comunica con el sitio WordPress que configuraste y el endpoint del proveedor que elegiste. El registro de depuración está desactivado por defecto; la página de Configuración permite activar o desactivar los registros locales en tiempo de ejecución.
 
 ## Actualización
+- La comprobación de actualizaciones usa los GitHub Releases de este repositorio como canal predeterminado — no requiere configuración
 - Abre Configuración en la WebUI y usa la comprobación de actualizaciones: las nuevas versiones se descargan como kits firmados y se aplican en el lugar
 - Cada kit se verifica antes de reemplazar nada: firma minisign más suma de comprobación SHA-256, con protección antirretorno. El servicio se reinicia automáticamente después; en Windows el binario en ejecución se reemplaza de forma segura, con reversión si la actualización falla
-- Alternativa manual: descarga el instalador más reciente desde https://github.com/wpmmcc/wptsall-client-releases y ejecútalo sobre la instalación existente
+- Alternativa manual: descarga el kit más reciente desde https://github.com/wpmmcc/wptsall-client/releases y descomprímelo sobre la instalación existente
 
 ## Desinstalación
 - Los desinstaladores para cada producto y plataforma están disponibles en el repositorio de releases: uninstall-webui.sh / uninstall-desktop.sh (Linux, macOS) y los scripts .ps1 correspondientes (Windows)

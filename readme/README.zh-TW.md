@@ -11,7 +11,7 @@ WPTSALL Client 是 WPMMCC ATS WordPress 外掛的配套用戶端。它運行在�
 - 文件與使用說明(English / 簡體中文)— https://www.wpmm.cc/docs/
 - WPMMCC ATS 外掛(WordPress.org)— https://wordpress.org/plugins/wpmmcc-ats/
 - 外掛原始碼儲存庫 — https://github.com/wpmmcc/wpmmcc-ats
-- 已簽署 kit 與安裝器 — https://github.com/wpmmcc/wptsall-client-releases
+- 已簽署 kit — https://github.com/wpmmcc/wptsall-client/releases
 
 ## 功能
 - 雙產品同核心——本地 WebUI(127.0.0.1:8977)與原生 Desktop 應用(Tauri)共享同一 Rust 核心
@@ -32,7 +32,7 @@ WPTSALL Client 是 WPMMCC ATS WordPress 外掛的配套用戶端。它運行在�
 - 若連接埠已被占用，啟動會報 bind web ui failed —— 設定 WPTSALL_WEB_UI_PORT 或 WPTSALL_WEB_UI_BIND 改用其他連接埠後重新啟動服務
 
 ## 安裝
-1. 從 https://github.com/wpmmcc/wptsall-client-releases 取得已簽署 kit 或安裝器
+1. 從 https://github.com/wpmmcc/wptsall-client/releases 取得已簽署 kit
 2. 或從原始碼建置:在 client-wpplugin/source 內 cargo build --release(WebUI 二進位),或在 client-desktop 內用 Tauri 工具鏈(Desktop 應用)
 3. 啟動 WebUI 二進位並開啟 http://127.0.0.1:8977
 
@@ -45,9 +45,10 @@ WPTSALL Client 是 WPMMCC ATS WordPress 外掛的配套用戶端。它運行在�
 全部設定與任務狀態都留在你的機器上(SQLite + 本地檔案)。用戶端只會與你設定的 WordPress 站台和翻譯廠商端點通訊。除錯日誌預設關閉;可在設定頁運行時開啟或關閉本地日誌。
 
 ## 更新
+- 更新檢查預設使用本儲存庫的 GitHub Releases 作為更新通道——無需任何設定
 - 開啟 WebUI 的設定頁面使用更新檢查——新版本將下載為已簽署 kit 並原地套用更新
 - 在替換任何檔案前均經過嚴格驗證:minisign 簽名與 SHA-256 總和檢查碼,並具備防回滾機制。更新完成後服務自動重啟;在 Windows 上執行中二進位檔案會被安全替換,更新失敗自動復原
-- 手動替代方案:從 https://github.com/wpmmcc/wptsall-client-releases 下載最新安裝程式並覆蓋安裝
+- 手動替代方案:從 https://github.com/wpmmcc/wptsall-client/releases 下載最新 kit 並解壓覆蓋現有安裝目錄
 
 ## 解除安裝
 - 各產品與平台的解除安裝指令碼均可在 releases 儲存庫取得:uninstall-webui.sh / uninstall-desktop.sh(Linux、macOS)以及對應的 .ps1 指令碼(Windows)

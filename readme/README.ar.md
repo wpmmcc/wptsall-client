@@ -11,7 +11,7 @@ WPTSALL Client هو العميل المرافق لإضافة WPMMCC ATS لوور
 - Documentation and usage help (English / 简体中文) — https://www.wpmm.cc/docs/
 - WPMMCC ATS plugin on WordPress.org — https://wordpress.org/plugins/wpmmcc-ats/
 - Plugin source repository — https://github.com/wpmmcc/wpmmcc-ats
-- Signed kits and installers — https://github.com/wpmmcc/wptsall-client-releases
+- Signed kits — https://github.com/wpmmcc/wptsall-client/releases
 
 ## الميزات
 - منتجان ونواة واحدة — واجهة ويب محلية على 127.0.0.1:8977 وتطبيق سطح مكتب أصلي (Tauri) يتشاركان نواة Rust نفسها
@@ -32,7 +32,7 @@ WPTSALL Client هو العميل المرافق لإضافة WPMMCC ATS لوور
 - إذا كان المنفذ مشغولًا، يفشل بدء التشغيل برسالة bind web ui failed — عيّن WPTSALL_WEB_UI_PORT أو WPTSALL_WEB_UI_BIND على منفذ آخر ثم أعد تشغيل الخدمة
 
 ## التثبيت
-1. احصل على kit موقّع أو مثبّت من https://github.com/wpmmcc/wptsall-client-releases
+1. احصل على kit موقّع من https://github.com/wpmmcc/wptsall-client/releases
 2. أو ابنِ من المصدر: cargo build --release داخل client-wpplugin/source (ثنائي WebUI)، أو سلسلة أدوات Tauri داخل client-desktop (تطبيق سطح المكتب)
 3. شغّل ثنائي WebUI وافتح http://127.0.0.1:8977
 
@@ -45,9 +45,10 @@ WPTSALL Client هو العميل المرافق لإضافة WPMMCC ATS لوور
 تبقى كل الإعدادات وحالة المهام على جهازك (SQLite مع ملفات محلية). يتواصل العميل فقط مع موقع ووردبريس الذي ضبطته ونقطة نهاية المزوّد التي اخترتها. سجل التصحيح معطّل افتراضيًا؛ وتتيح صفحة الإعدادات تشغيل أو إيقاف السجلات المحلية أثناء التشغيل.
 
 ## التحديث
+- يستخدم فحص التحديثات صفحة GitHub Releases لهذا المستودع كقناة تحديث افتراضية — لا يتطلب أي إعداد
 - افتح الإعدادات في WebUI واستخدم فحص التحديثات — يتم تنزيل الإصدارات الجديدة كحزم kit موقّعة وتطبيقها في مكانها
 - يتم التحقق من كل حزمة kit بدقة قبل استبدال أي ملف: توقيع minisign ومجموع تدقيق SHA-256، مع حماية ضد الرجوع إلى إصدار أقدم. يُعاد تشغيل الخدمة تلقائيًا بعدها؛ وفي نظام Windows يُستبدل الملف الثنائي المشغّل بأمان مع إمكانية التراجع عند الفشل
-- بديل يدوي: نزّل أحدث مثبت من https://github.com/wpmmcc/wptsall-client-releases وشغّله فوق التثبيت الحالي
+- بديل يدوي: نزّل أحدث kit من https://github.com/wpmmcc/wptsall-client/releases وفك ضغطه فوق التثبيت الحالي
 
 ## إلغاء التثبيت
 - تتوفر أدوات إلغاء التثبيت لكل منتج ومنصة في مستودع الإصدارات: uninstall-webui.sh / uninstall-desktop.sh (Linux وmacOS) وملفات .ps1 المقابلة (Windows)
