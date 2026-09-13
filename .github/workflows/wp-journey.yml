@@ -80,7 +80,7 @@ concurrency:
 # plugin, not just the in-tree development copy.
 jobs:
   wp-client-journey:
-    name: WP 6.7 + plugin + dual client agents (pair / UI / uninstall)
+    name: WP 7.1 + plugin + dual client agents (pair / UI / uninstall)
     runs-on: ubuntu-latest
     timeout-minutes: 75
     services:
@@ -147,10 +147,10 @@ jobs:
           sudo install -m 0755 /tmp/wp-cli.phar /usr/local/bin/wp
           wp --allow-root --info | sed -n '1,4p'
 
-      - name: Install WordPress 6.7 + published plugin
+      - name: Install WordPress 7.1 + published plugin
         run: |
           set -euo pipefail
-          wp core download --version=6.7 --path="$WP_PATH" --allow-root
+          wp core download --version=7.1 --path="$WP_PATH" --allow-root
           wp config create --path="$WP_PATH" --dbname=wp --dbuser=root --dbpass=root \
             --dbhost=127.0.0.1:3306 --allow-root
           wp db create --path="$WP_PATH" --allow-root
@@ -616,17 +616,20 @@ jobs:
           # --- content plugins leg: 19 third-party plugins, full flow ------
           # The local Lab matrix's plugin set (project-specs.json; the 20th
           # project is wptsall itself = the core post leg above). Real
-          # plugins from wordpress.org: install + activate, incremental
-          # re-scan, then ONE dedicated relation (virtual site /zh-plugins/)
-          # binding every plugin model. 16 plugins translate their OWN CPT;
-          # elementor/wordpress-seo/advanced-custom-fields translate the
-          # standard CPTs they integrate with (page/post/product — the same
-          # shape the local project specs use). Version drift is accepted:
-          # a wordpress.org plugin changing its CPT surface breaks this leg
+          # plugins from wordpress.org, installed the same way the Lab does
+          # it (latest-stable.zip + install from file): the slug-lookup path
+          # enforces the plugin's declared requiresWP, and the 2026 plugin
+          # generation already declares WP >= 7.0 — the zip path installs
+          # what the Lab actually runs. WP 7.1 matches the public
+          # compat-matrix's newest cell. Version drift is accepted: a
+          # wordpress.org plugin changing its CPT surface breaks this leg
           # loudly and the fix is a pin.
           PLUGIN_SLUGS="woocommerce easy-digital-downloads bbpress tutor learnpress the-events-calendar wp-job-manager envira-gallery-lite seriously-simple-podcasting wp-recipe-maker elementor wordpress-seo advanced-custom-fields site-reviews give directorist lifterlms events-manager hivepress"
           for slug in $PLUGIN_SLUGS; do
-            wp plugin install "$slug" --activate --path="$WP_PATH" --allow-root </dev/null \
+            curl -fsSL --max-time 180 -o "/tmp/journey-plugin-$slug.zip" \
+              "https://downloads.wordpress.org/plugin/${slug}.latest-stable.zip" \
+              || { echo "plugin download failed: $slug" >&2; exit 1; }
+            wp plugin install "/tmp/journey-plugin-$slug.zip" --activate --path="$WP_PATH" --allow-root </dev/null \
               || { echo "plugin install failed: $slug" >&2; exit 1; }
             echo "plugin installed+active: $slug"
           done
