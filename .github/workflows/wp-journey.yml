@@ -52,10 +52,12 @@ concurrency:
 #                translate the standard CPTs they integrate with (page/
 #                post/product, mirroring the local project specs) → the
 #                same worker/mock loop translates all 19 items → WP-side
-#                per-plugin verifier (mapping + published target + markers)
-#                → Playwright renders EVERY translated plugin page in a
-#                real browser and asserts the zh_CN markers in the DOM,
-#                with one screenshot per plugin page.
+#                per-plugin verifier (mapping + published target + markers,
+#                content gated on the CPT's editor support) → Playwright
+#                renders EVERY translated plugin page in a real browser
+#                (static subresources aborted — the assertion targets the
+#                server-rendered document) and asserts the zh_CN markers in
+#                the DOM, with one screenshot per plugin page.
 #   ui ops     - Playwright (chromium) drives the served SPA: nav to Sites,
 #                the paired site is listed, nav to Tasks, the translation
 #                job card with done items, nav to Logs, the discovery
@@ -889,6 +891,20 @@ jobs:
           const OUTDIR = process.env.JOURNEY_PLUGIN_SHOTS;
           const browser = await chromium.launch();
           const page = await browser.newPage();
+          // With all 19 plugins active every page pulls dozens of assets
+          // through the single php -S router (each missing asset even boots
+          // WP), so domcontentloaded can exceed any sane timeout. The
+          // assertion targets the SERVER-RENDERED document (title element +
+          // body text), so static subresources are aborted; only the
+          // document itself loads.
+          await page.route('**/*', (route) => {
+            const req = route.request();
+            if (req.isNavigationRequest() || req.resourceType() === 'document') {
+              route.continue();
+              return;
+            }
+            route.abort();
+          });
           const failures = [];
           const step = (name, ok) => {
             console.log(`${ok ? 'PASS' : 'FAIL'}: ${name}`);
@@ -898,7 +914,7 @@ jobs:
             const url = WP + t.virtual_url;
             let ok = false, status = 0;
             try {
-              const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
               status = resp ? resp.status() : 0;
               // Rendered-DOM marker evidence: the translated title always
               // lands in the page <title> element; plugin-templated CPTs
