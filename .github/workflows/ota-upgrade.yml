@@ -111,19 +111,22 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           set -euo pipefail
-          if choco install -y --no-progress minisign 2>/dev/null && minisign -v; then
-            echo "minisign installed via chocolatey"
-            exit 0
-          fi
-          echo "chocolatey minisign unavailable — building from source" >&2
+          # Chocolatey ships minisign 0.8, which lacks `-W` (unencrypted
+          # key) — the ephemeral keypair generation would die at the
+          # password prompt. Build 0.11 from source instead (cmake + MSVC,
+          # both preinstalled; libsodium is fetched by CMake FetchContent).
           git clone --depth 1 https://github.com/jedisct1/minisign "$RUNNER_TEMP/minisign-src"
           cmake -S "$RUNNER_TEMP/minisign-src" -B "$RUNNER_TEMP/minisign-build"
           cmake --build "$RUNNER_TEMP/minisign-build" --config Release
           bin="$RUNNER_TEMP/minisign-build/Release/minisign.exe"
           [ -f "$bin" ] || bin="$RUNNER_TEMP/minisign-build/minisign.exe"
-          sudo cp "$bin" /usr/local/bin/minisign.exe 2>/dev/null \
-            || cp "$bin" /usr/local/bin/minisign.exe
+          [ -f "$bin" ] || { echo "minisign.exe not found after build" >&2; exit 1; }
+          cp "$bin" /usr/local/bin/minisign.exe
           minisign -v
+          # Prove -W works before the real keygen step depends on it.
+          minisign -G -W -p "$RUNNER_TEMP/check.pub" -s "$RUNNER_TEMP/check.key"
+          rm -f "$RUNNER_TEMP/check.pub" "$RUNNER_TEMP/check.key"
+          echo "minisign -W capable"
 
       - name: Resolve python (portable across the three runner OSes)
         run: |
@@ -179,17 +182,18 @@ jobs:
           minisign -Sm "$kit" -s "$key" -x "$kit.minisig"
 
           # Signed SHA256SUMS (python so the step is identical on all OSes).
+          # NOTE: every `python -c` stays single-line — YAML strips only the
+          # block base indent, so a continuation line indented deeper (e.g.
+          # inside a loop) would leak spaces into the python source.
           sums="$work/http/RELEASE-SHA256SUMS-webui.txt"
-          hash="$("$PY" -c 'import hashlib,sys
-          print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$kit")"
+          hash="$("$PY" -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$kit")"
           printf '%s  %s\n' "$hash" "kit-webui-$plat.tar.gz" > "$sums"
           minisign -Sm "$sums" -s "$key" -x "$sums.minisig"
 
           # Releases manifest: raw data object, canonicalized and signed the
           # same way the release-publish workflow signs the public channel
           # (sorted keys, compact JSON).
-          port="$("$PY" -c 'import socket
-          s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+          port="$("$PY" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
           echo "OTA_SERVER_PORT=$port" >> "$GITHUB_ENV"
           data="$work/releases-data.json"
           "$PY" - "$data" "$port" "$plat" <<'PY'
@@ -286,8 +290,7 @@ jobs:
           rm -rf "$home" && mkdir -p "$home/data"
           ui_port=18131
           bin="$ota/install/bin/wptsall-client$OTA_EXE"
-          before_mtime="$("$PY" -c 'import os,sys
-          print(int(os.stat(sys.argv[1]).st_mtime))' "$bin")"
+          before_mtime="$("$PY" -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$bin")"
           WPTSALL_WEB_UI=1 \
           WPTSALL_SERVER_BASE="http://127.0.0.1:$OTA_SERVER_PORT" \
           WPTSALL_WEB_UI_BIND="127.0.0.1:$ui_port" \
@@ -321,8 +324,7 @@ jobs:
           # response; wait for the install-root binary mtime to move.
           swapped=0
           for _ in $(seq 1 60); do
-            now_mtime="$("$PY" -c 'import os,sys
-            print(int(os.stat(sys.argv[1]).st_mtime))' "$bin")"
+            now_mtime="$("$PY" -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' "$bin")"
             if [ "$now_mtime" != "$before_mtime" ]; then swapped=1; break; fi
             sleep 0.5
           done
