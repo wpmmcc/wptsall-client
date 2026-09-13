@@ -215,8 +215,14 @@ jobs:
           ui_path=ui/webui
           triple=$triple
           EOF
+          # Exclude the sums file itself: the redirect creates SHA256SUMS
+          # (empty) before find walks, so a bare find would hash the empty
+          # file and sha256sum -c could never verify. Written via .tmp for
+          # the same reason.
           ( cd "$stage" \
-            && find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )
+            && find . -type f ! -name SHA256SUMS ! -name SHA256SUMS.tmp -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS.tmp \
+            && mv SHA256SUMS.tmp SHA256SUMS )
           # Relative tar paths only: Windows bsdtar treats absolute D:\...
           # arguments as host:file remotes.
           kit="kit-webui-$plat.tar.gz"
@@ -344,8 +350,14 @@ jobs:
           ui_path=ui/desktop
           triple=$triple
           EOF
+          # Exclude the sums file itself: the redirect creates SHA256SUMS
+          # (empty) before find walks, so a bare find would hash the empty
+          # file and sha256sum -c could never verify. Written via .tmp for
+          # the same reason.
           ( cd "$stage" \
-            && find . -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS )
+            && find . -type f ! -name SHA256SUMS ! -name SHA256SUMS.tmp -print0 \
+              | sort -z | xargs -0 sha256sum > SHA256SUMS.tmp \
+            && mv SHA256SUMS.tmp SHA256SUMS )
           kit="kit-desktop-$plat.tar.gz"
           ( cd "$stage_root" && tar -czf "$RUNNER_TEMP/$kit" wptsall-client )
           ( cd "$RUNNER_TEMP" && tar -tzf "$kit" > kit-list.txt )
