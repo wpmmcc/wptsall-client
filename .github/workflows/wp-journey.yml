@@ -724,38 +724,36 @@ jobs:
               $bind( $mid );
           }
 
-          # Rules: one per own-CPT plugin (on ITS model) + page (elementor
-          # item) + product (advanced-custom-fields item). The post rule for
-          # the wordpress-seo item already exists from the core leg.
+          # Rules: the product's own bulk generation — the same path the
+          # setup wizard / trigger-scan uses (create_rules_for_model first
+          # merges the model's scan_result fields into the template, THEN
+          # generates rules with proper caps: post_title/post_content as
+          # translate). Hand-rolled create_rule with post caps is rejected
+          # by the template constraint on fresh plugin models — their post
+          # objects carry no declared fields until the scan result is
+          # merged (runner round 2: rule_fields_not_in_template).
           if ( ! class_exists( 'WPTSALL\Models\Services\Translation_Rule_Service' ) ) {
               require_once trailingslashit( WP_PLUGIN_DIR ) . 'wpmmcc-ats/includes/models/services/class-translation-rule-service.php';
           }
           if ( ! class_exists( 'WPTSALL\Models\Services\Translation_Rule_Service' ) ) { $fail( 'Translation_Rule_Service unavailable' ); }
-          $rules_table = $wpdb->prefix . 'wptsall_translation_rules';
-          $mo_table = $wpdb->prefix . 'wptsall_model_objects';
-          $ensure_rule = static function ( int $mid, string $cpt ) use ( $wpdb, $rules_table, $mo_table ) {
-              $exists = (int) $wpdb->get_var( $wpdb->prepare(
-                  "SELECT id FROM {$rules_table} WHERE model_id = %d AND data_type = %s AND object_name = %s LIMIT 1",
-                  $mid, 'post', $cpt ) );
-              if ( $exists > 0 ) { return $exists; }
-              $result = WPTSALL\Models\Services\Translation_Rule_Service::create_rule( $mid, array(
-                  'name' => 'Journey ' . $cpt . ' Rule', 'url_pattern' => '?post_type=' . $cpt . '&p={id}',
-                  'url_type' => 'single', 'data_type' => 'post', 'object_name' => $cpt,
-                  'priority' => 10, 'is_active' => true,
-                  'field_capabilities' => array(
-                      'post_title'   => array( 'type' => 'translate', 'enabled' => true, 'content_format' => 'plain_text', 'storage' => 'post_column' ),
-                      'post_content' => array( 'type' => 'translate', 'enabled' => true, 'content_format' => 'rich_html', 'storage' => 'post_column' ),
-                  ),
-              ) );
-              if ( is_wp_error( $result ) ) { fwrite( STDERR, $result->get_error_message() . "\n" ); exit( 1 ); }
-              return is_array( $result ) ? (int) ( $result['id'] ?? 0 ) : (int) $result;
-          };
-          foreach ( $own as $slug => $cpt ) {
-              $ensure_rule( $model_id( $slug ), $cpt );
+          foreach ( array_merge( array( 'wordpress-blog' ), array_keys( $own ) ) as $slug ) {
+              $mid = $model_id( $slug );
+              $res = WPTSALL\Models\Services\Translation_Rule_Service::create_rules_for_model( $mid );
+              # The product flow tolerates per-object errors (e.g. non-public
+              # CPTs are skipped as not_publicly_accessible); the hard gate is
+              # that the objects the projects NEED have rules afterwards.
+              $need = 'wordpress-blog' === $slug ? array( 'post', 'page' ) : array( $own[ $slug ] );
+              foreach ( $need as $cpt ) {
+                  $has = (int) $wpdb->get_var( $wpdb->prepare(
+                      "SELECT COUNT(*) FROM {$wpdb->prefix}wptsall_translation_rules WHERE model_id = %d AND data_type = %s AND object_name = %s",
+                      $mid, 'post', $cpt ) );
+                  if ( $has <= 0 ) { $fail( "no rule generated for {$slug}/{$cpt}: " . wp_json_encode( $res ) ); }
+              }
+              echo 'rules ' . $slug . ': created=' . (int) ( $res['created'] ?? 0 )
+                  . ' updated=' . (int) ( $res['updated'] ?? 0 )
+                  . ' skipped=' . (int) ( $res['skipped'] ?? 0 )
+                  . ' errors=' . (int) ( $res['errors'] ?? 0 ) . "\n";
           }
-          $ensure_rule( $blog_model, 'page' );
-          $woo_model = $model_id( 'woocommerce' );
-          $ensure_rule( $woo_model, 'product' );
 
           # Seed one published item per project. bbpress topics need a forum
           # parent; everything else seeds bare (CPTs register on activation).
