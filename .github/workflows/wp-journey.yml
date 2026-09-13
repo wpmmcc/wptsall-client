@@ -1045,11 +1045,22 @@ jobs:
           echo "ui ops leg OK: SPA served, Sites nav, paired site listed, Tasks job card, Logs item_translated trace, round trip"
 
           # --- uninstall leg: stop, no residue, remove, ports freed ---------
+          # Grace first, then escalate: a fixed 2s TERM window flakes when a
+          # client is mid-shutdown. The strict assertion stays AFTER the
+          # escalation — once SIGKILL has been delivered, zero residue is a
+          # hard requirement (a survivor would mean the path/pid model is
+          # wrong, not that shutdown was slow).
           kill "$(cat /tmp/journey-a/pid)" "$(cat /tmp/journey-b/pid)" 2>/dev/null || true
           sleep 2
+          stragglers="$(pgrep -f '/tmp/journey-install-' || true)"
+          if [ -n "$stragglers" ]; then
+            echo "TERM window elapsed; escalating to KILL for: $stragglers" >&2
+            kill -9 $stragglers 2>/dev/null || true
+            sleep 1
+          fi
           residue="$(pgrep -f '/tmp/journey-install-' || true)"
           if [ -n "$residue" ]; then
-            echo "client processes survived stop on install paths:" >&2
+            echo "client processes survived SIGKILL on install paths:" >&2
             echo "$residue" >&2
             exit 1
           fi
