@@ -115,18 +115,25 @@ jobs:
           # Chocolatey ships minisign 0.8, which lacks `-W` (unencrypted
           # key) — the ephemeral keypair generation would die at the
           # password prompt. Building from source needs PkgConfig, which
-          # the Windows runner lacks; use the official prebuilt 0.12 zip.
+          # the Windows runner lacks; use the official prebuilt 0.12 zip
+          # (contains both aarch64 and x86_64 — pick the runner's arch).
+          case "$RUNNER_ARCH" in
+            X64|AMD64) arch=x86_64 ;;
+            ARM64) arch=aarch64 ;;
+            *) echo "unsupported runner arch $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
           url="https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip"
           curl -fsSL "$url" -o "$RUNNER_TEMP/minisign.zip"
           unzip -o "$RUNNER_TEMP/minisign.zip" -d "$RUNNER_TEMP/minisign-bin"
-          bin="$(find "$RUNNER_TEMP/minisign-bin" -name minisign.exe | head -n 1)"
-          [ -n "$bin" ] || { echo "minisign.exe not found in the zip" >&2; exit 1; }
+          bin="$RUNNER_TEMP/minisign-bin/minisign-win64/$arch/minisign.exe"
+          [ -f "$bin" ] || { echo "minisign.exe ($arch) not found in the zip" >&2; exit 1; }
+          mkdir -p /usr/local/bin
           cp "$bin" /usr/local/bin/minisign.exe
           minisign -v
           # Prove -W works before the real keygen step depends on it.
           minisign -G -W -p "$RUNNER_TEMP/check.pub" -s "$RUNNER_TEMP/check.key"
           rm -f "$RUNNER_TEMP/check.pub" "$RUNNER_TEMP/check.key"
-          echo "minisign -W capable"
+          echo "minisign -W capable ($arch)"
 
       - name: Resolve python (portable across the three runner OSes)
         run: |

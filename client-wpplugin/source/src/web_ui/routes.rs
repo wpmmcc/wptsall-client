@@ -1370,55 +1370,20 @@ async fn handle_perform_update(
     let encoded = serde_json::to_vec(&payload)?;
     let response = write_http_response(socket, "200 OK", "application/json", &encoded).await;
 
-    // Exit so the self-replace helper can finish the swap when something will
-    // restart us afterwards (BUG-UPD-01). Windows always restarts via the
-    // helper; Linux/macOS only when a systemd user unit / LaunchAgent exists.
-    // A manual dev run has neither — the old binary keeps serving from its
-    // mapped inode and the swapped file takes effect on the next start, so
-    // exiting there would leave the WebUI dead with nobody to revive it.
-    if restart_mechanism_available() {
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(400));
-            std::process::exit(0);
-        });
-    }
+    // Exit so the self-replace helper can finish the swap (BUG-UPD-01):
+    // Windows restarts via the helper's PowerShell; Linux/macOS webui
+    // installs restart through systemd/launchd, and the helper additionally
+    // nohup-relaunches the binary with the inherited environment when no
+    // service unit exists (manual runs, bare runners). Staying alive is not
+    // an option on macOS anyway: Darwin refuses both rename onto and unlink
+    // of a running executable (ETXTBSY), so the swap could never happen
+    // while this process lives.
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        std::process::exit(0);
+    });
 
     response
-}
-
-/// Whether a restart mechanism exists that will bring the WebUI back after
-/// this process exits: the Windows self-replace helper (always), a systemd
-/// user unit (Linux service installs), or a LaunchAgent (macOS installs).
-#[cfg(target_os = "windows")]
-fn restart_mechanism_available() -> bool {
-    true
-}
-
-#[cfg(target_os = "linux")]
-fn restart_mechanism_available() -> bool {
-    std::process::Command::new("systemctl")
-        .args(["--user", "cat", client_runtime_core::updater::webui_service_name()])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(target_os = "macos")]
-fn restart_mechanism_available() -> bool {
-    let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() {
-        return false;
-    }
-    let plist = format!(
-        "{home}/Library/LaunchAgents/{}.plist",
-        client_runtime_core::updater::webui_service_name()
-    );
-    std::path::Path::new(&plist).exists()
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn restart_mechanism_available() -> bool {
-    false
 }
 
 /// Download UI-only bundle, verify checksum, replace `ui/webui/` under install root.

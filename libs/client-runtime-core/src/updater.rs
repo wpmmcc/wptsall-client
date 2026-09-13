@@ -171,10 +171,18 @@ pub fn perform_self_replace(
             .parent()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| ".".to_string());
+        // Restart: the systemd user unit when it exists (service installs),
+        // otherwise a nohup relaunch with the helper's inherited
+        // environment — which is the client's own environment
+        // (WPTSALL_WEB_UI=1, bind/port, DB paths), so a service-less
+        // WebUI (manual run, bare runner) comes back on the new version.
         let restart = if is_desktop {
             format!("(nohup \"{cur}\" >/dev/null 2>&1 &) >/dev/null 2>&1")
         } else {
-            format!("systemctl --user start {svc} >/dev/null 2>&1 || true", svc = service_name)
+            format!(
+                "systemctl --user start {svc} >/dev/null 2>&1 || (nohup \"{cur}\" >/dev/null 2>&1 &) >/dev/null 2>&1",
+                svc = service_name
+            )
         };
         let script = format!(
             "sleep 0.5; \
@@ -235,8 +243,11 @@ pub fn perform_self_replace(
                 format!("(nohup \"{cur}\" >/dev/null 2>&1 &)")
             }
         } else {
+            // LaunchAgent first (service installs), otherwise a nohup
+            // relaunch with the inherited client environment — same
+            // reasoning as the Linux branch.
             format!(
-                "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{svc}.plist",
+                "launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/{svc}.plist 2>/dev/null || (nohup \"{cur}\" >/dev/null 2>&1 &)",
                 svc = service_name
             )
         };
