@@ -436,7 +436,10 @@ jobs:
           count=0
           for kit in "$rel"/kit-webui-*.tar.gz "$rel"/kit-desktop-*.tar.gz; do
             [ -f "$kit" ] || { echo "missing kit: $kit" >&2; exit 1; }
-            root="$(tar -tzf "$kit" | awk -F/ 'NF > 1 { print $1; exit }')"
+            # awk must NOT exit early: closing the pipe makes tar die with
+            # "stdout: write error" (EPIPE), which pipefail turns fatal.
+            # Consume the whole listing, print only the first entry.
+            root="$(tar -tzf "$kit" | awk -F/ 'NF > 1 && !seen { print $1; seen = 1 }')"
             kit_ver="$(tar -xOzf "$kit" "$root/VERSION-BINARY" | tr -d '\r\n')"
             kit_plat="$(tar -xOzf "$kit" "$root/PLATFORM.txt" | tr -d '\r\n')"
             base="$(basename "$kit" .tar.gz)"
