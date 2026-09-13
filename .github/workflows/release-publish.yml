@@ -226,7 +226,12 @@ jobs:
           # Relative tar paths only: Windows bsdtar treats absolute D:\...
           # arguments as host:file remotes.
           kit="kit-webui-$plat.tar.gz"
-          ( cd "$stage_root" && tar -czf "$RUNNER_TEMP/$kit" wptsall-client-webui )
+          # Create with a RELATIVE output name: Windows bsdtar treats
+          # absolute D:\... arguments as host:file remotes ("Cannot connect
+          # to D:"). mv (a real coreutils binary) handles the absolute
+          # destination fine.
+          ( cd "$stage_root" && tar -czf "$kit" wptsall-client-webui )
+          mv "$stage_root/$kit" "$RUNNER_TEMP/$kit"
           ( cd "$RUNNER_TEMP" && tar -tzf "$kit" > kit-list.txt )
           head -n 25 "$RUNNER_TEMP/kit-list.txt"
           ( cd "$stage" && sha256sum -c SHA256SUMS >/dev/null && echo 'in-kit SHA256SUMS verified' )
@@ -359,7 +364,10 @@ jobs:
               | sort -z | xargs -0 sha256sum > SHA256SUMS.tmp \
             && mv SHA256SUMS.tmp SHA256SUMS )
           kit="kit-desktop-$plat.tar.gz"
-          ( cd "$stage_root" && tar -czf "$RUNNER_TEMP/$kit" wptsall-client )
+          # Relative tar output for the same Windows bsdtar reason as the
+          # webui kit above.
+          ( cd "$stage_root" && tar -czf "$kit" wptsall-client )
+          mv "$stage_root/$kit" "$RUNNER_TEMP/$kit"
           ( cd "$RUNNER_TEMP" && tar -tzf "$kit" > kit-list.txt )
           head -n 25 "$RUNNER_TEMP/kit-list.txt"
           ( cd "$stage" && sha256sum -c SHA256SUMS >/dev/null && echo 'in-kit SHA256SUMS verified' )
