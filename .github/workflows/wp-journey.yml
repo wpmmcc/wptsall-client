@@ -26,8 +26,23 @@ concurrency:
 #   pair       - production pack issuance (wptsall_create_site_connection_pack,
 #                device-bound) + client /api/site-connections/import + WP-side
 #                single-claim verification + live site_status=active round trip
+#   translate  - the full product flow against an inline OpenAI-compatible
+#                mock (bounded runner port of the Lab mock-translate-api):
+#                WP translation side provisioned (zh_CN language, virtual
+#                site, relation, post rule, fresh source post) → client
+#                component bound to the mock + quick-test → discovery
+#                bootstrap → worker run-once until translated → WP-side
+#                post mapping + published target + 【zh_CN】 markers in
+#                title/content → plugin FRONTEND access check (virtual site
+#                route /zh-rt/<slug>/ renders 200 with markers, no route
+#                errors). The client's own REST surface (validate-token /
+#                site-relations / rules / content / translation-callback,
+#                secret-prefixed, device-token authed) IS the backend access
+#                the whole flow runs over.
 #   ui ops     - Playwright (chromium) drives the served SPA: nav to Sites,
-#                the paired site is listed, nav round trip; screenshot artifact
+#                the paired site is listed, nav to Tasks, the translation
+#                job card shows done items and the item row for the source
+#                post, nav round trip; screenshot artifact
 #   uninstall  - both clients stopped, no process residue on the exact
 #                install paths, install roots + data dirs removed, ports freed
 #
@@ -36,7 +51,11 @@ concurrency:
 #   manifest + kit, positive/negative/recovery rounds) on this same repo;
 #   desktop GUI window smoke (Xvfb + tauri-driver + WebKitWebDriver) stays on
 #   the local Lab lane (desktop runner coverage = compile + unit tests +
-#   headless integration via ci.yml).
+#   headless integration via ci.yml);
+#   the full multi-vendor mock-translate-api (per-vendor auth algorithms,
+#   media, fault profiles) stays on the local Lab lanes — the runner mock is
+#   the bounded OpenAI-compatible subset this flow needs (same request/
+#   response contract, same 【lang】 markers).
 #
 # The plugin under test is the PUBLISHED public repo (wpmmcc/wpmmcc-ats),
 # so this lane continuously proves the client works against the released
@@ -45,7 +64,7 @@ jobs:
   wp-client-journey:
     name: WP 6.7 + plugin + dual client agents (pair / UI / uninstall)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     services:
       mysql:
         image: mysql:8.0
@@ -167,6 +186,7 @@ jobs:
               WPTSALL_DB_PATH="/tmp/journey-$inst/wptsall.db" \
               WPTSALL_LOG_FILE="/tmp/journey-$inst/client.log" \
               WPTSALL_INSTALL_ROOT="/tmp/journey-install-$inst" \
+              WPTSALL_PROVIDER_ALLOWLIST="127.0.0.1,localhost" \
               "/tmp/journey-install-$inst/bin/wptsall-client" \
               > "/tmp/journey-$inst/stdout.log" 2>&1 &
             echo $! > "/tmp/journey-$inst/pid"
@@ -254,12 +274,308 @@ jobs:
           done
           echo "pair leg OK: both agents paired, packs single-claimed, sites live-active"
 
+          # --- translate leg: full product flow against an inline mock ------
+          # Bounded runner port of the Lab mock-translate-api: same
+          # OpenAI-compatible contract, same 【lang】 markers. The Lab mock
+          # (multi-vendor auth, media, fault profiles) stays local.
+          cat > /tmp/journey-mock.py <<'MOCKPY'
+          #!/usr/bin/env python3
+          import json, re, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          TAG = re.compile(r'(<[^>]*>)')
+
+          def wrap(text, lang):
+              out = []
+              for part in TAG.split(text):
+                  if part.startswith('<') and part.endswith('>'):
+                      out.append(part)
+                  elif part.strip():
+                      out.append('\u3010%s\u3011%s\u3010/%s\u3011' % (lang, part, lang))
+                  else:
+                      out.append(part)
+              return ''.join(out)
+
+          class H(BaseHTTPRequestHandler):
+              def _send(self, code, payload):
+                  body = json.dumps(payload).encode()
+                  self.send_response(code)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Content-Length', str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  if self.path in ('/health', '/api/v1/health'):
+                      self._send(200, {'ok': True})
+                  else:
+                      self._send(404, {'error': 'not_found'})
+
+              def do_POST(self):
+                  if self.path != '/v1/chat/completions':
+                      self._send(404, {'error': 'not_found'})
+                      return
+                  n = int(self.headers.get('Content-Length', '0'))
+                  req = json.loads(self.rfile.read(n) or b'{}')
+                  msgs = req.get('messages') or []
+                  user = next((m.get('content', '') for m in reversed(msgs)
+                               if m.get('role') == 'user'), '')
+                  lang = 'target'
+                  for m in msgs:
+                      if m.get('role') == 'system':
+                          c = str(m.get('content', ''))
+                          # Find " to " in a lowercased COPY but slice the
+                          # ORIGINAL, so "zh_CN" keeps its case (the WP-side
+                          # verify matches the marker case-sensitively).
+                          pos = c.lower().find(' to ')
+                          if pos >= 0:
+                              cand = c[pos + 4:].split()
+                              if cand:
+                                  lang = re.sub(r'[^A-Za-z0-9_-]', '', cand[0]) or 'target'
+                          break
+                  self._send(200, {
+                      'id': 'chatcmpl-journey', 'object': 'chat.completion',
+                      'created': 0, 'model': req.get('model', 'mock'),
+                      'choices': [{
+                          'index': 0,
+                          'message': {'role': 'assistant',
+                                      'content': wrap(str(user), lang)},
+                          'finish_reason': 'stop',
+                      }],
+                      'usage': {'prompt_tokens': 0, 'completion_tokens': 0,
+                                'total_tokens': 0},
+                  })
+
+              def log_message(self, fmt, *args):
+                  sys.stderr.write('[mock] ' + (fmt % args) + '\n')
+
+          HTTPServer(('127.0.0.1', 9099), H).serve_forever()
+          MOCKPY
+          nohup python3 /tmp/journey-mock.py > /tmp/journey-mock.log 2>&1 &
+          for _ in $(seq 1 20); do
+            curl -sf "http://127.0.0.1:9099/health" -o /dev/null && break; sleep 1
+          done
+          curl -sf "http://127.0.0.1:9099/health" -o /dev/null \
+            || { cat /tmp/journey-mock.log; echo "inline mock did not come up" >&2; exit 1; }
+          echo "inline translation mock up :9099"
+
+          # WP translation side: zh_CN language, virtual site v_client_rt
+          # (path /zh-rt/), wordpress-blog model, en_US->zh_CN relation,
+          # post translation rule, fresh source post. Idempotent; emits ONE
+          # JSON line (success envelope) with the ids.
+          cat > /tmp/journey-provision.php <<'PHP'
+          <?php
+          if ( ! defined( 'ABSPATH' ) ) { fwrite( STDERR, "wp eval-file only\n" ); exit( 1 ); }
+          global $wpdb;
+          $lang_table = $wpdb->prefix . 'wptsall_languages';
+          if ( ! (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$lang_table} WHERE code = %s", 'zh_CN' ) ) ) {
+              $wpdb->insert( $lang_table, array(
+                  'code' => 'zh_CN', 'slug' => 'zh', 'name' => '简体中文',
+                  'native_name' => '简体中文', 'locale' => 'zh_CN', 'flag' => 'cn',
+                  'direction' => 'ltr', 'sort_order' => 10, 'is_default' => 0, 'status' => 'active',
+              ) );
+          }
+          $vs_table = $wpdb->prefix . 'wptsall_virtual_sites';
+          $virtual_id = 'v_client_rt';
+          if ( ! (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$vs_table} WHERE id = %s", $virtual_id ) ) ) {
+              $wpdb->insert( $vs_table, array(
+                  'id' => $virtual_id, 'site_name' => 'Journey Translate 站',
+                  'site_path' => '/zh-rt/', 'site_language' => 'zh_CN',
+                  'source_blog_id' => 1, 'enable_blog_sync' => 1, 'status' => 'enabled',
+              ) );
+          }
+          $models_table = $wpdb->prefix . 'wptsall_models';
+          $model_id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$models_table} WHERE plugin_slug = %s LIMIT 1", 'wordpress-blog' ) );
+          if ( $model_id <= 0 ) {
+              $wpdb->insert( $models_table, array(
+                  'plugin_slug' => 'wordpress-blog', 'plugin_name' => 'WordPress Blog',
+                  'text_domain' => 'default', 'description' => 'WordPress Core blog functionality',
+                  'post_types' => wp_json_encode( array( 'post', 'page' ) ),
+                  'taxonomies' => wp_json_encode( array( 'category', 'post_tag' ) ),
+                  'status' => 'active', 'source_type' => 'auto', 'is_system' => 0,
+              ) );
+              $model_id = (int) $wpdb->insert_id;
+          }
+          $rel_table = $wpdb->prefix . 'wptsall_site_relations';
+          $rel_id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$rel_table} WHERE target_site_id = %s AND source_lang = %s AND target_lang = %s LIMIT 1", $virtual_id, 'en_US', 'zh_CN' ) );
+          if ( $rel_id <= 0 ) {
+              $wpdb->insert( $rel_table, array(
+                  'source_site_id' => 1, 'source_site_type' => 'wp', 'source_lang' => 'en_US',
+                  'source_theme_name' => 'Twenty Twenty-Five', 'source_theme_path' => 'twentytwentyfive',
+                  'template' => 'wordpress-blog', 'target_site_id' => $virtual_id,
+                  'target_site_type' => 'virtual', 'target_lang' => 'zh_CN',
+                  'target_theme_name' => 'Journey Translate 站', 'target_theme_path' => 'zh-rt',
+                  'media_handling' => 'copy', 'sync_mode' => 'new_only',
+                  'direction' => 'source_to_target', 'conflict_strategy' => 'source_wins',
+                  'status' => 'active',
+              ) );
+              $rel_id = (int) $wpdb->insert_id;
+          }
+          $rm_table = $wpdb->prefix . 'wptsall_relation_models';
+          if ( ! (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$rm_table} WHERE relation_id = %d AND model_id = %d", $rel_id, $model_id ) ) ) {
+              $wpdb->insert( $rm_table, array( 'relation_id' => $rel_id, 'model_id' => $model_id ) );
+          }
+          if ( ! class_exists( 'WPTSALL\Models\Services\Translation_Rule_Service' ) ) {
+              fwrite( STDERR, "Translation_Rule_Service unavailable\n" ); exit( 1 );
+          }
+          $rules_table = $wpdb->prefix . 'wptsall_translation_rules';
+          $rule_id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$rules_table} WHERE model_id = %d AND data_type = %s AND object_name = %s LIMIT 1", $model_id, 'post', 'post' ) );
+          if ( $rule_id <= 0 ) {
+              $result = WPTSALL\Models\Services\Translation_Rule_Service::create_rule( $model_id, array(
+                  'name' => 'Journey Post Rule', 'url_pattern' => '?post_type=post&p={id}',
+                  'url_type' => 'single', 'data_type' => 'post', 'object_name' => 'post',
+                  'priority' => 10, 'is_active' => true,
+                  'field_capabilities' => array(
+                      'post_title'   => array( 'type' => 'translate', 'enabled' => true, 'content_format' => 'plain_text', 'storage' => 'post_column' ),
+                      'post_content' => array( 'type' => 'translate', 'enabled' => true, 'content_format' => 'rich_html', 'storage' => 'post_column' ),
+                      'post_excerpt' => array( 'type' => 'translate', 'enabled' => true, 'content_format' => 'plain_text', 'storage' => 'post_column' ),
+                  ),
+              ) );
+              if ( is_wp_error( $result ) ) { fwrite( STDERR, $result->get_error_message() . "\n" ); exit( 1 ); }
+              $rule_id = is_array( $result ) ? (int) ( $result['id'] ?? 0 ) : (int) $result;
+          }
+          $stamp = gmdate( 'Ymd-His' );
+          $post_title = 'Journey Translate Post ' . $stamp;
+          $post_id = wp_insert_post( array(
+              'post_title' => $post_title,
+              'post_content' => "<!-- wp:paragraph -->\n<p>This post was published after the relation and translation rule were provisioned. The client should discover it and translate it to Chinese.</p>\n<!-- /wp:paragraph -->\n",
+              'post_status' => 'publish', 'post_type' => 'post', 'post_author' => 1,
+          ), true );
+          if ( is_wp_error( $post_id ) ) { fwrite( STDERR, $post_id->get_error_message() . "\n" ); exit( 1 ); }
+          wp_send_json_success( array(
+              'relation_id' => $rel_id, 'rule_id' => $rule_id, 'model_id' => $model_id,
+              'post_id' => (int) $post_id, 'post_title' => $post_title,
+          ) );
+          PHP
+          cp /tmp/journey-provision.php "$WP_PATH/journey-provision.php"
+          PROVISION="$(wp eval-file "$WP_PATH/journey-provision.php" --path="$WP_PATH" --allow-root | tail -n 1)"
+          JOURNEY_RELATION_ID="$(echo "$PROVISION" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("success"), d; print(d["data"]["relation_id"])')"
+          JOURNEY_POST_ID="$(echo "$PROVISION" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("success"), d; print(d["data"]["post_id"])')"
+          echo "provisioned relation=$JOURNEY_RELATION_ID post=$JOURNEY_POST_ID"
+
+          # Client A: bind an openai-compatible component to the inline mock
+          # (same API sequence as the Lab client-content-roundtrip lane).
+          COMPONENT_ID="journey-openai-mock"
+          MOCK_URL="http://127.0.0.1:9099/v1/chat/completions"
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/components/local/install-from-catalog" \
+            -H 'Content-Type: application/json' \
+            -d "{\"entry_id\":\"openai-compatible\",\"local_id\":\"$COMPONENT_ID\",\"name\":\"Journey OpenAI Mock\"}" -o /dev/null
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/vendor-keys" \
+            -H 'Content-Type: application/json' \
+            -d "{\"id\":\"$COMPONENT_ID-key\",\"vendor_id\":\"openai\",\"label\":\"journey\",\"auth_values\":{\"api_key\":\"mock-translate-dev-key-2026\"},\"enabled\":true}" -o /dev/null
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/components/local/$COMPONENT_ID/versions" \
+            -H 'Content-Type: application/json' \
+            -d "{\"version\":\"v1\",\"key_ids\":[\"$COMPONENT_ID-key\"],\"auth_type\":\"key\"}" -o /dev/null || true
+          curl -sf -X PUT "http://127.0.0.1:$JOURNEY_A_PORT/api/components/local/$COMPONENT_ID" \
+            -H 'Content-Type: application/json' -d '{"enabled":true}' -o /dev/null
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/components/bindings/upsert" \
+            -H 'Content-Type: application/json' \
+            -d "{\"component_id\":\"$COMPONENT_ID\",\"auth\":{\"api_key\":\"mock-translate-dev-key-2026\"},\"key_ids\":[\"$COMPONENT_ID-key\"],\"request_overrides\":{\"url\":\"$MOCK_URL\",\"body\":{\"model\":\"mock-openai-v1\"}}}" -o /dev/null
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/rule-component-bindings/upsert" \
+            -H 'Content-Type: application/json' \
+            -d "{\"scope\":\"global\",\"slot_key\":\"plain_text\",\"component_id\":\"$COMPONENT_ID\"}" -o /dev/null
+          echo "component bound to inline mock"
+
+          # Quick-test: the component must translate through the mock and
+          # return the zh_CN markers before anything else runs.
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/components/local/$COMPONENT_ID/quick-test" \
+            -H 'Content-Type: application/json' \
+            -d "{\"api_key\":\"mock-translate-dev-key-2026\",\"auth_values\":{\"api_key\":\"mock-translate-dev-key-2026\"},\"config_overrides\":{\"request.url\":\"$MOCK_URL\",\"request.body.model\":\"mock-openai-v1\"},\"text\":\"Hello world\",\"source_lang\":\"en_US\",\"target_lang\":\"zh_CN\"}" \
+            | grep -q 'zh_CN' \
+            || { echo "quick-test did not return zh_CN mock output" >&2; exit 1; }
+          echo "quick-test ok (mock markers present)"
+
+          # WP-side verifier: post mapping + published target + markers, and
+          # the virtual frontend URL for the target post. Env-driven.
+          cat > /tmp/journey-verify-translate.php <<'PHP'
+          <?php
+          if ( ! defined( 'ABSPATH' ) ) { fwrite( STDERR, "wp eval-file only\n" ); exit( 1 ); }
+          global $wpdb;
+          $relation_id = (int) getenv( 'JOURNEY_RELATION_ID' );
+          $post_id     = (int) getenv( 'JOURNEY_POST_ID' );
+          $out = static function ( array $d ) { echo wp_json_encode( $d, JSON_UNESCAPED_SLASHES ) . "\n"; };
+          if ( $relation_id <= 0 || $post_id <= 0 ) { $out( array( 'pass' => false, 'error' => 'input' ) ); exit( 1 ); }
+          $pm_table = $wpdb->prefix . 'wptsall_post_mappings';
+          $mapping  = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$pm_table} WHERE source_post_id = %d AND relation_id = %d LIMIT 1", $post_id, $relation_id ), ARRAY_A );
+          if ( empty( $mapping ) ) { $out( array( 'pass' => false, 'error' => 'no_mapping' ) ); exit( 1 ); }
+          $target_post_id = (int) $mapping['target_post_id'];
+          $target = get_post( $target_post_id );
+          if ( ! $target || 'publish' !== $target->post_status ) { $out( array( 'pass' => false, 'error' => 'target_not_published' ) ); exit( 1 ); }
+          $checks = array(
+              'title_marker'   => false !== mb_strpos( $target->post_title, '【zh_CN】' ),
+              'content_marker' => false !== mb_strpos( $target->post_content, '【zh_CN】' ),
+          );
+          $virtual_url = '';
+          $prefix = trim( (string) $wpdb->get_var( $wpdb->prepare( "SELECT target_theme_path FROM {$wpdb->prefix}wptsall_site_relations WHERE id = %d", $relation_id ) ), '/' );
+          if ( '' !== $prefix && '' !== (string) $target->post_name ) {
+              $virtual_url = '/' . $prefix . '/' . $target->post_name . '/';
+          }
+          $virtual_tagged = (string) get_post_meta( $target_post_id, '_wptsall_virtual_site_id', true );
+          $pass = ! in_array( false, $checks, true );
+          $out( array(
+              'pass' => $pass, 'relation_id' => $relation_id, 'post_id' => $post_id,
+              'target_post_id' => $target_post_id, 'checks' => $checks,
+              'virtual_url' => $virtual_url, 'virtual_site_tag' => $virtual_tagged,
+          ) );
+          exit( $pass ? 0 : 1 );
+          PHP
+          cp /tmp/journey-verify-translate.php "$WP_PATH/journey-verify-translate.php"
+
+          wp_translate_done() {
+            JOURNEY_RELATION_ID="$JOURNEY_RELATION_ID" JOURNEY_POST_ID="$JOURNEY_POST_ID" \
+              wp eval-file "$WP_PATH/journey-verify-translate.php" --path="$WP_PATH" --allow-root \
+              > /tmp/journey-translate-verify.json 2>/dev/null
+          }
+
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/discovery-tasks/bootstrap" -o /dev/null
+          TRANSLATED=0
+          for round in $(seq 1 8); do
+            if wp_translate_done; then TRANSLATED=1; break; fi
+            curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/worker/run-once" \
+              -H 'Content-Type: application/json' \
+              -d '{"max_iterations":15,"max_elapsed_secs":120,"max_items_per_run":60}' -o /dev/null || true
+            if wp_translate_done; then TRANSLATED=1; break; fi
+            echo "translate round $round: not yet done WP-side; continuing"
+          done
+          if [ "$TRANSLATED" != "1" ]; then
+            cat /tmp/journey-translate-verify.json 2>/dev/null || true
+            tail -n 40 /tmp/journey-a/client.log 2>/dev/null || true
+            tail -n 20 /tmp/journey-mock.log 2>/dev/null || true
+            echo "post $JOURNEY_POST_ID was not translated" >&2
+            exit 1
+          fi
+          echo "translate ok: $(cat /tmp/journey-translate-verify.json)"
+
+          # Plugin FRONTEND access: the virtual site route must render the
+          # translated post (200 + markers + no route errors).
+          VIRTUAL_URL="$(python3 -c 'import json; print(json.load(open("/tmp/journey-translate-verify.json"))["virtual_url"])')"
+          if [ -z "$VIRTUAL_URL" ]; then
+            echo "verifier produced no virtual_url" >&2; exit 1
+          fi
+          # No curl -f here on purpose: a non-200 must reach the status
+          # branch below so the log shows which status came back.
+          curl -s -o /tmp/journey-virtual-page.html -w '%{http_code}' "$WP_URL$VIRTUAL_URL" > /tmp/journey-virtual-status.txt
+          VSTATUS="$(cat /tmp/journey-virtual-status.txt)"
+          if [ "$VSTATUS" != "200" ]; then
+            echo "virtual frontend $VIRTUAL_URL -> $VSTATUS" >&2; exit 1
+          fi
+          grep -q '【zh_CN】' /tmp/journey-virtual-page.html \
+            || { echo "virtual frontend page lacks zh_CN markers; first 600 bytes:" >&2
+                 head -c 600 /tmp/journey-virtual-page.html >&2; echo >&2; exit 1; }
+          if grep -q 'url_pattern_not_registered' /tmp/journey-virtual-page.html; then
+            echo "virtual frontend page has route errors" >&2; exit 1
+          fi
+          echo "frontend access ok: $VIRTUAL_URL rendered with markers"
+          echo "translate leg OK: discovery -> mock translation -> WP write-back -> frontend render all green"
+
           # --- UI ops leg: real browser against the served WebUI ------------
           cat > "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs" <<'EOF'
           import { chromium } from '@playwright/test';
           const BASE = process.env.JOURNEY_WEBUI_BASE;
           const SITE_URL = process.env.JOURNEY_SITE_URL;
+          const POST_ID = process.env.JOURNEY_POST_ID;
           const OUT = process.env.JOURNEY_SHOT;
+          const OUT_TASKS = process.env.JOURNEY_SHOT_TASKS;
           const browser = await chromium.launch();
           const page = await browser.newPage();
           const failures = [];
@@ -279,6 +595,29 @@ jobs:
             listed = true;
           } catch { listed = false; }
           step(`bound site ${SITE_URL} listed on Sites page`, listed);
+          // Tasks page: the translation job card + the item row for the
+          // source post prove the full flow reached the client UI.
+          const tasksNav = page.getByRole('button', { name: 'Tasks', exact: true });
+          await tasksNav.waitFor({ state: 'visible', timeout: 15000 });
+          await tasksNav.click();
+          const domainEl = page.getByText('127.0.0.1:8080', { exact: false }).first();
+          let jobOk = false, cardText = '';
+          try {
+            await domainEl.waitFor({ state: 'visible', timeout: 15000 });
+            const jobBtn = domainEl.locator('xpath=ancestor::button[1]');
+            cardText = await jobBtn.innerText();
+            jobOk = /[1-9]\d*\s*\/\s*\d+/.test(cardText);
+          } catch { jobOk = false; }
+          step('translation job card shows >= 1 done item', jobOk);
+          let itemOk = false;
+          try {
+            await domainEl.locator('xpath=ancestor::button[1]').click();
+            await page.locator('td', { hasText: POST_ID }).first()
+              .waitFor({ state: 'visible', timeout: 15000 });
+            itemOk = true;
+          } catch { itemOk = false; }
+          step(`translated item row for post ${POST_ID} visible`, itemOk);
+          await page.screenshot({ path: OUT_TASKS, fullPage: true });
           await page.getByRole('button', { name: 'Overview', exact: true }).click();
           await page.waitForTimeout(300);
           step('navigated back to Overview', true);
@@ -292,10 +631,12 @@ jobs:
           EOF
           JOURNEY_WEBUI_BASE="http://127.0.0.1:$JOURNEY_A_PORT" \
           JOURNEY_SITE_URL="$WP_URL" \
+          JOURNEY_POST_ID="$JOURNEY_POST_ID" \
           JOURNEY_SHOT="$RUNNER_TEMP/journey-ui-sites.png" \
+          JOURNEY_SHOT_TASKS="$RUNNER_TEMP/journey-ui-tasks.png" \
             node "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
           rm -f "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
-          echo "ui ops leg OK: SPA served, Sites nav, paired site listed"
+          echo "ui ops leg OK: SPA served, Sites nav, paired site listed, Tasks shows translated item, round trip"
 
           # --- uninstall leg: stop, no residue, remove, ports freed ---------
           kill "$(cat /tmp/journey-a/pid)" "$(cat /tmp/journey-b/pid)" 2>/dev/null || true
@@ -320,13 +661,16 @@ jobs:
           echo "uninstall leg OK: no process residue, roots + data removed, ports freed"
 
           pkill -f 'php -S 127.0.0.1:8080' 2>/dev/null || true
-          echo "JOURNEY OK: install -> pair -> UI ops -> uninstall (dual agents) all green"
+          pkill -f 'journey-mock.py' 2>/dev/null || true
+          echo "JOURNEY OK: install -> pair -> translate (full flow vs mock) -> UI ops -> uninstall (dual agents) all green"
 
-      - name: Upload UI screenshot
+      - name: Upload UI screenshots
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: journey-ui-sites
-          path: ${{ runner.temp }}/journey-ui-sites.png
+          name: journey-ui
+          path: |
+            ${{ runner.temp }}/journey-ui-sites.png
+            ${{ runner.temp }}/journey-ui-tasks.png
           if-no-files-found: ignore
