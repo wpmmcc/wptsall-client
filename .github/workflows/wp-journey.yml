@@ -41,8 +41,9 @@ concurrency:
 #                the whole flow runs over.
 #   ui ops     - Playwright (chromium) drives the served SPA: nav to Sites,
 #                the paired site is listed, nav to Tasks, the translation
-#                job card shows done items and the item row for the source
-#                post, nav round trip; screenshot artifact
+#                job card with done items, nav to Logs, the pipeline
+#                sync_done trace for the source post; nav round trip;
+#                screenshot artifacts
 #   uninstall  - both clients stopped, no process residue on the exact
 #                install paths, install roots + data dirs removed, ports freed
 #
@@ -187,6 +188,7 @@ jobs:
               WPTSALL_LOG_FILE="/tmp/journey-$inst/client.log" \
               WPTSALL_INSTALL_ROOT="/tmp/journey-install-$inst" \
               WPTSALL_PROVIDER_ALLOWLIST="127.0.0.1,localhost" \
+              WPTSALL_LOG_ENABLED="1" \
               "/tmp/journey-install-$inst/bin/wptsall-client" \
               > "/tmp/journey-$inst/stdout.log" 2>&1 &
             echo $! > "/tmp/journey-$inst/pid"
@@ -621,28 +623,51 @@ jobs:
             listed = true;
           } catch { listed = false; }
           step(`bound site ${SITE_URL} listed on Sites page`, listed);
-          // Tasks page: the translation job card + the item row for the
-          // source post prove the full flow reached the client UI.
+          // Tasks page: the discovery job cards prove the translation run
+          // surfaced in the client's task UI. Post translations stream
+          // through the inline discover -> translate -> callback pipeline
+          // and do NOT create item rows (translation_items only holds the
+          // config_i18n review flow), so the post's client-side trace is
+          // asserted on the Logs page below.
           const tasksNav = page.getByRole('button', { name: 'Tasks', exact: true });
           await tasksNav.waitFor({ state: 'visible', timeout: 15000 });
           await tasksNav.click();
-          const domainEl = page.getByText('127.0.0.1:8080', { exact: false }).first();
-          let jobOk = false, cardText = '';
+          const jobCards = page.locator('button').filter({ hasText: '127.0.0.1:8080' });
+          let jobOk = false;
           try {
-            await domainEl.waitFor({ state: 'visible', timeout: 15000 });
-            const jobBtn = domainEl.locator('xpath=ancestor::button[1]');
-            cardText = await jobBtn.innerText();
-            jobOk = /[1-9]\d*\s*\/\s*\d+/.test(cardText);
+            await jobCards.first().waitFor({ state: 'visible', timeout: 15000 });
+            const cardCount = await jobCards.count();
+            for (let i = 0; i < cardCount; i++) {
+              if (/[1-9]\d*\s*\/\s*\d+/.test(await jobCards.nth(i).innerText())) {
+                jobOk = true;
+                break;
+              }
+            }
           } catch { jobOk = false; }
-          step('translation job card shows >= 1 done item', jobOk);
-          let itemOk = false;
+          step('translation job card visible with >= 1 done item', jobOk);
+          // Logs page: the pipeline.sync_done event for the source post is
+          // the client-side trace of the translation (object_id = WP post
+          // id, the last key in the formatted detail).
+          const logsNav = page.getByRole('button', { name: 'Logs', exact: true });
+          await logsNav.waitFor({ state: 'visible', timeout: 15000 });
+          await logsNav.click();
+          await page.locator('#logs-limit-input').fill('1000');
+          await page.getByRole('button', { name: 'Load Logs', exact: true }).click();
+          await page.locator('#log-container .font-mono > div').first()
+            .waitFor({ state: 'visible', timeout: 15000 });
+          await page.getByPlaceholder('Filter Placeholder').fill('sync_done');
+          const logLines = page.locator('#log-container .font-mono > div');
+          const syncCount = await logLines
+            .filter({ hasText: /object_id=\d+/ }).count();
+          step(`pipeline sync_done events visible (${syncCount} lines)`, syncCount > 0);
+          let postOk = false;
           try {
-            await domainEl.locator('xpath=ancestor::button[1]').click();
-            await page.locator('td', { hasText: POST_ID }).first()
-              .waitFor({ state: 'visible', timeout: 15000 });
-            itemOk = true;
-          } catch { itemOk = false; }
-          step(`translated item row for post ${POST_ID} visible`, itemOk);
+            await logLines
+              .filter({ hasText: new RegExp('object_id=' + POST_ID + '(\\s|$)') })
+              .first().waitFor({ state: 'visible', timeout: 10000 });
+            postOk = true;
+          } catch { postOk = false; }
+          step(`client log shows sync_done for post ${POST_ID}`, postOk);
           await page.screenshot({ path: OUT_TASKS, fullPage: true });
           await page.getByRole('button', { name: 'Overview', exact: true }).click();
           await page.waitForTimeout(300);
@@ -659,10 +684,10 @@ jobs:
           JOURNEY_SITE_URL="$WP_URL" \
           JOURNEY_POST_ID="$JOURNEY_POST_ID" \
           JOURNEY_SHOT="$RUNNER_TEMP/journey-ui-sites.png" \
-          JOURNEY_SHOT_TASKS="$RUNNER_TEMP/journey-ui-tasks.png" \
+          JOURNEY_SHOT_TASKS="$RUNNER_TEMP/journey-ui-translate.png" \
             node "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
           rm -f "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
-          echo "ui ops leg OK: SPA served, Sites nav, paired site listed, Tasks shows translated item, round trip"
+          echo "ui ops leg OK: SPA served, Sites nav, paired site listed, Tasks job card, Logs sync_done trace, round trip"
 
           # --- uninstall leg: stop, no residue, remove, ports freed ---------
           kill "$(cat /tmp/journey-a/pid)" "$(cat /tmp/journey-b/pid)" 2>/dev/null || true
@@ -698,5 +723,5 @@ jobs:
           name: journey-ui
           path: |
             ${{ runner.temp }}/journey-ui-sites.png
-            ${{ runner.temp }}/journey-ui-tasks.png
+            ${{ runner.temp }}/journey-ui-translate.png
           if-no-files-found: ignore
