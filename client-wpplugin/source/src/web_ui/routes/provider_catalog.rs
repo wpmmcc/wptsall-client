@@ -532,7 +532,9 @@ fn builtin_catalog() -> Value {
                 "curtime": "{{computed.curtime}}"
             }
         },
-        "response": { "translated_text_path": "translation.0" },
+        // Official zhiyun shape: errorCode "0" = success (string) — the
+        // runner treats "0"/"ok"/"success"/"" as non-errors on error_path.
+        "response": { "translated_text_path": "translation.0", "error_path": "errorCode" },
         "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
         "editable_params": [
             { "path": "request.url", "scope": "config", "type": "string", "required": true },
@@ -706,7 +708,9 @@ fn builtin_catalog() -> Value {
             "headers": { "Content-Type": "application/json" },
             "body": [{ "Text": "{{input.text}}" }]
         },
-        "response": { "translated_text_path": "0.Translations.0.Text" },
+        // Official v3 response shape: lowercase `translations[].text`
+        // (matches microsoft_translator entry and the real API).
+        "response": { "translated_text_path": "0.translations.0.text" },
         "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
         "editable_params": [
             { "path": "request.url", "scope": "config", "type": "string", "required": true },
