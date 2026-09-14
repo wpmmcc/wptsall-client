@@ -15,12 +15,29 @@ use rusqlite::Connection;
 use std::path::Path;
 
 pub(crate) fn open_db(path: &str) -> Result<Connection> {
+    open_db_with_busy_timeout(path, std::time::Duration::from_secs(5))
+}
+
+/// open_db with an explicit busy_timeout for lock-heavy callers. The
+/// timeout is applied BEFORE the WAL pragma and schema DDL, so it also
+/// bounds open_db's own statements under contention. (Rationale: saturated
+/// CI runners can blow past rusqlite's 5s default — observed twice on the
+/// bursty 8-thread concurrent-writers probe: insert-time DatabaseBusy on
+/// the v2.1.3 tag run, then open-time DatabaseBusy in
+/// per-thread open_db (DDL + WAL) on windows-latest 2026-09-14 even with
+/// the post-open raise to 30s, because that raise landed after open_db's
+/// internal statements had already run.)
+pub(crate) fn open_db_with_busy_timeout(
+    path: &str,
+    timeout: std::time::Duration,
+) -> Result<Connection> {
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
     let conn = Connection::open(path)?;
+    conn.busy_timeout(timeout)?;
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
     schema::create_tables(&conn)?;
     Ok(conn)
@@ -208,15 +225,19 @@ mod tests {
         for t in 0..THREADS {
             let p = path_str.clone();
             handles.push(std::thread::spawn(move || {
-                let conn = open_db(&p).expect("per-thread open_db (DDL + WAL)");
-                // Saturated CI runners can blow past rusqlite's default 5s
-                // busy_timeout under bursty IO (observed: DatabaseBusy on the
-                // v2.1.3 tag run). This test proves WAL integrity — every
-                // write lands — not that 5s specifically always suffices;
-                // the default itself is pinned by
-                // open_db_busy_timeout_default_provides_bounded_wait.
-                conn.busy_timeout(std::time::Duration::from_secs(30))
-                    .expect("raise test busy_timeout");
+                // 30s busy_timeout covering open_db's OWN WAL/DDL statements
+                // too (not just post-open inserts): saturated CI runners can
+                // blow past the 5s default under bursty IO (observed:
+                // insert-time DatabaseBusy on the v2.1.3 tag run; open-time
+                // DatabaseBusy on windows-latest 2026-09-14). This test
+                // proves WAL integrity — every write lands — not that 5s
+                // specifically always suffices; the 5s default itself is
+                // pinned by open_db_busy_timeout_default_provides_bounded_wait.
+                let conn = open_db_with_busy_timeout(
+                    &p,
+                    std::time::Duration::from_secs(30),
+                )
+                .expect("per-thread open_db (DDL + WAL)");
                 for i in 0..INSERTS {
                     conn.execute(
                         "INSERT INTO concurrent_probe (thread_id, seq) VALUES (?1, ?2)",
