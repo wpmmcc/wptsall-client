@@ -28,21 +28,45 @@ export interface ProviderCatalogData {
   catalog_version: string | null;
   items: ProviderCatalogItem[];
   offline: boolean;
+  available_version?: string | null;
 }
 
-export const listProviderCatalog = (params: { q?: string; vendor_id?: string } = {}) => {
+export const listProviderCatalog = (params: { q?: string; vendor_id?: string; check?: boolean } = {}) => {
   const query = new URLSearchParams();
   if (params.q?.trim()) query.set('q', params.q.trim());
   if (params.vendor_id?.trim()) query.set('vendor_id', params.vendor_id.trim());
+  if (params.check) query.set('check', '1');
   const suffix = query.toString() ? `?${query.toString()}` : '';
   return apiFetch<ProviderCatalogData>(`/api/provider-catalog${suffix}`);
 };
 
 export const refreshProviderCatalog = () =>
-  apiFetch<{ catalog_version: string | null; template_count: number; source: string; verified: boolean; offline: boolean }>(
+  apiFetch<{ catalog_version: string | null; available_version?: string | null; template_count: number; source: string; verified: boolean; offline: boolean }>(
     '/api/provider-catalog/refresh',
     { method: 'POST', body: {} },
   );
+
+export interface ProviderCatalogVersion {
+  version: string;
+  released_at?: string | null;
+  entries_count?: number | null;
+  entries_sha256?: string | null;
+}
+
+export interface ProviderCatalogVersionsData {
+  source: string;
+  versions: ProviderCatalogVersion[];
+  last_error?: string;
+}
+
+export const listProviderCatalogVersions = () =>
+  apiFetch<ProviderCatalogVersionsData>('/api/provider-catalog/versions');
+
+export const installProviderCatalogVersion = (version: string) =>
+  apiFetch<Record<string, unknown>>('/api/provider-catalog/install-version', {
+    method: 'POST',
+    body: { version, confirm: true },
+  });
 
 export const installCatalogTemplate = (data: {
   entry_id: string;
@@ -85,6 +109,29 @@ export const listCloudApiTypes = () =>
 
 export const listVendorKeys = (vendor_id?: string) =>
   apiFetch<{ items: VendorKeyItem[] }>(`/api/vendor-keys${vendor_id ? '?vendor_id=' + encodeURIComponent(vendor_id) : ''}`);
+
+export interface ProviderTestRequest {
+  vendor_id?: string;
+  key_id?: string;
+  auth_values?: Record<string, string>;
+  base_url?: string;
+  model?: string;
+  text?: string;
+  source_lang?: string;
+  target_lang?: string;
+}
+
+export interface ProviderTestData {
+  healthy: boolean;
+  latency_ms: number;
+  translated_text?: string;
+  model_resolved?: string;
+  vendor_id?: string;
+  base_url_used?: string;
+}
+
+export const testProvider = (body: ProviderTestRequest) =>
+  apiFetch<ProviderTestData>('/api/providers/test', { method: 'POST', body });
 
 export const createVendorKey = (data: {
   id: string;

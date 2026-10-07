@@ -1,11 +1,13 @@
 use super::*;
 
+use crate::web_ui::routes::errors::err_public;
+
 pub(in crate::web_ui::routes) async fn handle_local_components_list(
     socket: &mut TcpStream,
     _state: &Arc<Mutex<WebUiState>>,
     query: &str,
 ) -> anyhow::Result<()> {
-    let doc = load_local_components_runtime_doc();
+    let doc = load_local_components_runtime_doc()?;
     let params = parse_query_string(query);
     let q = params.get("q").map(|s| s.to_lowercase());
     let kind_filter = params.get("kind").map(|s| s.to_lowercase());
@@ -115,7 +117,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_detail(
     _state: &Arc<Mutex<WebUiState>>,
     id: &str,
 ) -> anyhow::Result<()> {
-    let doc = load_local_components_runtime_doc();
+    let doc = load_local_components_runtime_doc()?;
     let Some(comp) = doc.components.get(id) else {
         return write_not_found_response(socket, "NOT_FOUND", "component not found").await;
     };
@@ -443,15 +445,18 @@ pub(in crate::web_ui::routes) async fn handle_local_component_create_v2(
         None
     };
 
-    let (template_json, source_template_updated_at, source_template_api_version) =
-        if let Some(template_json) = template_json {
-            (Some(template_json), None, None)
-        } else if !crate::config::server_control_plane_enabled() {
-            // P0-LF-03 5.5: creating a non-OpenAI component without an inline
-            // template never downloads a server snapshot in local mode; it is
-            // a local validation error (install from the signed local catalog
-            // or provide template_json instead).
-            return write_error_response_with_status(
+    let (template_json, source_template_updated_at, source_template_api_version) = if let Some(
+        template_json,
+    ) =
+        template_json
+    {
+        (Some(template_json), None, None)
+    } else if !crate::config::server_control_plane_enabled() {
+        // P0-LF-03 5.5: creating a non-OpenAI component without an inline
+        // template never downloads a server snapshot in local mode; it is
+        // a local validation error (install from the signed local catalog
+        // or provide template_json instead).
+        return write_error_response_with_status(
                 socket,
                 "422 Unprocessable Entity",
                 "COMPONENT_TEMPLATE_REQUIRED",
@@ -460,48 +465,46 @@ pub(in crate::web_ui::routes) async fn handle_local_component_create_v2(
                 ),
             )
             .await;
-        } else {
-            match fetch_server_template_snapshot_for_local_component(state, &template_id, &kind)
-                .await
-            {
-                Ok((snapshot, server_component)) => {
-                    if let Some(server_vendor_id) = server_component
+    } else {
+        match fetch_server_template_snapshot_for_local_component(state, &template_id, &kind).await {
+            Ok((snapshot, server_component)) => {
+                if let Some(server_vendor_id) = server_component
+                    .as_ref()
+                    .and_then(|component| component.vendor_id.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    vendor_id = server_vendor_id.to_string();
+                }
+                (
+                    Some(snapshot),
+                    server_component
                         .as_ref()
-                        .and_then(|component| component.vendor_id.as_deref())
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                    {
-                        vendor_id = server_vendor_id.to_string();
-                    }
-                    (
-                        Some(snapshot),
-                        server_component
-                            .as_ref()
-                            .and_then(|component| component.updated_at.clone()),
-                        server_component
-                            .as_ref()
-                            .and_then(|component| component.api_version.clone()),
-                    )
-                }
-                Err(err) => {
-                    if let Some(upstream) = err.downcast_ref::<UpstreamApiError>() {
-                        let status = upstream.status.clone();
-                        let code = upstream.code.clone();
-                        let message = upstream.message.clone();
-                        return write_error_response_with_status(socket, &status, &code, &message)
-                            .await;
-                    }
-                    return write_error_response(
-                        socket,
-                        "COMPONENT_TEMPLATE_NOT_FOUND",
-                        &format!("{:#}", err),
-                    )
-                    .await;
-                }
+                        .and_then(|component| component.updated_at.clone()),
+                    server_component
+                        .as_ref()
+                        .and_then(|component| component.api_version.clone()),
+                )
             }
-        };
+            Err(err) => {
+                if let Some(upstream) = err.downcast_ref::<UpstreamApiError>() {
+                    let status = upstream.status.clone();
+                    let code = upstream.code.clone();
+                    let message = upstream.message.clone();
+                    return write_error_response_with_status(socket, &status, &code, &message)
+                        .await;
+                }
+                return write_error_response(
+                    socket,
+                    "COMPONENT_TEMPLATE_NOT_FOUND",
+                    &err_public(&err),
+                )
+                .await;
+            }
+        }
+    };
 
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     if doc.components.contains_key(&id) {
         return write_conflict_response(socket, "DUPLICATE_ID", "component id already exists")
             .await;
@@ -533,6 +536,10 @@ pub(in crate::web_ui::routes) async fn handle_local_component_create_v2(
         },
     );
     save_local_components_runtime_doc(&doc)?;
+    // Component-set changes can make structural-skipped content servable:
+    // clear the permanent skips so the next cycle re-attempts it.
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global("info", "component.created", json!({ "component_id": id }));
     let payload = json!({ "success": true, "data": { "id": id } });
     write_http_response(
         socket,
@@ -551,7 +558,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_update_v2(
 ) -> anyhow::Result<()> {
     let req: Value = serde_json::from_slice(body)
         .with_context(|| "invalid PUT /api/components/local/:id json payload")?;
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let Some(comp) = doc.components.get_mut(id) else {
         return write_not_found_response(socket, "NOT_FOUND", "component not found").await;
     };
@@ -758,7 +765,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_update_v2(
                 return write_error_response(
                     socket,
                     "COMPONENT_TEMPLATE_NOT_FOUND",
-                    &format!("{:#}", err),
+                    &err_public(&err),
                 )
                 .await;
             }
@@ -766,6 +773,10 @@ pub(in crate::web_ui::routes) async fn handle_local_component_update_v2(
     }
     comp.updated_at = Some(format!("{}", unix_ts()));
     save_local_components_runtime_doc(&doc)?;
+    // Component-set changes can make structural-skipped content servable:
+    // clear the permanent skips so the next cycle re-attempts it.
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global("info", "component.updated", json!({ "component_id": id }));
     let payload = json!({ "success": true, "data": { "id": id } });
     write_http_response(
         socket,
@@ -798,9 +809,15 @@ pub(in crate::web_ui::routes) async fn handle_local_component_delete_v2(
         .await;
     }
 
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let removed = doc.components.remove(id).is_some();
     save_local_components_runtime_doc(&doc)?;
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "warn",
+        "component.deleted",
+        json!({ "component_id": id, "deleted": removed }),
+    );
     let payload = json!({ "success": true, "data": { "id": id, "deleted": removed } });
     write_http_response(
         socket,
@@ -818,6 +835,11 @@ pub(in crate::web_ui::routes) async fn handle_local_component_refresh_snapshot(
 ) -> anyhow::Result<()> {
     match refresh_local_component_snapshot_from_server(state, id).await {
         Ok(component) => {
+            crate::logging::log_event_global(
+                "info",
+                "component.snapshot_refreshed",
+                json!({ "component_id": id }),
+            );
             let payload = json!({
                 "success": true,
                 "data": {
@@ -845,7 +867,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_refresh_snapshot(
             write_error_response(
                 socket,
                 "COMPONENT_SNAPSHOT_REFRESH_FAILED",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await
         }
@@ -916,7 +938,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_export(
     _state: &Arc<Mutex<WebUiState>>,
     id: &str,
 ) -> anyhow::Result<()> {
-    let doc = load_local_components_runtime_doc();
+    let doc = load_local_components_runtime_doc()?;
     match doc.components.get(id) {
         Some(comp) => {
             // Export is public/redacted by default.  Credentials are not
@@ -935,6 +957,11 @@ pub(in crate::web_ui::routes) async fn handle_local_component_export(
                 "redacted_fields": redacted_fields,
                 "component": public_component,
             });
+            crate::logging::log_event_global(
+                "info",
+                "component.exported",
+                json!({ "component_id": id, "export_mode": "public" }),
+            );
             let payload = json!({ "success": true, "data": export_payload });
             write_http_response(
                 socket,
@@ -1001,7 +1028,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_import(
             .await;
     }
 
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let overwrite = doc.components.contains_key(&comp_id);
     doc.components.insert(comp_id.clone(), comp);
     save_local_components_runtime_doc(&doc)?;
@@ -1010,6 +1037,11 @@ pub(in crate::web_ui::routes) async fn handle_local_component_import(
         "success": true,
         "data": { "id": comp_id, "overwrite": overwrite }
     });
+    crate::logging::log_event_global(
+        "info",
+        "component.imported",
+        json!({ "component_id": comp_id, "overwrite": overwrite }),
+    );
     write_http_response(
         socket,
         "200 OK",
@@ -1096,10 +1128,16 @@ pub(in crate::web_ui::routes) async fn handle_install_server_template_to_local(
         template_json: None,
     };
 
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let overwrite = doc.components.contains_key(&comp_id);
     doc.components.insert(comp_id.clone(), local_comp);
     save_local_components_runtime_doc(&doc)?;
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "info",
+        "component.created",
+        json!({ "component_id": comp_id, "source": "server_template" }),
+    );
 
     let payload = json!({
         "success": true,

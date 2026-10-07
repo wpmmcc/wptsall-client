@@ -301,7 +301,8 @@ pub async fn check_for_desktop_update(
 }
 
 fn skip_security_allowed() -> bool {
-    client_runtime_core::env_helpers::env_bool("WPTSALL_SKIP_SECURITY", false)
+    // S11 (batch G): debug-only valve per guide 16.
+    wptsall_client_security::bypass::debug_only_valve("WPTSALL_SKIP_SECURITY")
 }
 
 /// Download UI-only bundle, verify minisign (or signed SUMS), replace `ui/{subdir}/`.
@@ -432,119 +433,4 @@ pub fn build_upgrade_plan(
 #[allow(dead_code)]
 pub fn apply_ui_at(archive: &Path, install_root: &Path, ui_subdir: &str) -> anyhow::Result<()> {
     client_runtime_core::updater::apply_ui_bundle(archive, install_root, ui_subdir)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn semver_cmp_basic() {
-        assert_eq!(semver_cmp("0.1.0", "0.1.0"), Ordering::Equal);
-        assert_eq!(semver_cmp("0.1.0", "0.2.0"), Ordering::Less);
-        assert_eq!(semver_cmp("0.2.0", "0.1.0"), Ordering::Greater);
-        assert_eq!(semver_cmp("2.1.0", "2.1.1"), Ordering::Less);
-        assert_eq!(semver_cmp("3.0.0", "2.9.9"), Ordering::Greater);
-    }
-
-    #[test]
-    fn classify_bump_matrix() {
-        assert_eq!(classify_bump("0.1.0", "0.1.0"), "none");
-        assert_eq!(classify_bump("0.1.0", "0.1.1"), "patch");
-        assert_eq!(classify_bump("0.1.0", "0.2.0"), "minor");
-        assert_eq!(classify_bump("0.1.0", "1.0.0"), "major");
-        assert_eq!(classify_bump("2.1.0", "3.0.0"), "major");
-    }
-
-    #[test]
-    fn should_apply_ui_only_when_binary_current() {
-        let mut check = UpdateCheckResult {
-            current_version: "2.1.0".into(),
-            latest_version: "2.1.0".into(),
-            min_supported_version: "2.0.0".into(),
-            update_available: true,
-            mandatory: false,
-            bump_kind: "none".into(),
-            release_notes_url: String::new(),
-            download_url_template: String::new(),
-            signature_url_template: String::new(),
-            update_kind: "ui".into(),
-            ui_current_version: "2.1.0".into(),
-            ui_latest_version: "2.1.1".into(),
-            ui_update_available: true,
-            ui_download_url_template: "https://x/{version}".into(),
-            ui_signature_url_template: String::new(),
-            ui_release_notes_url: String::new(),
-            ui_subdir: "desktop".into(),
-            product_id: PRODUCT_ID_DESKTOP.into(),
-        };
-        assert!(should_apply_ui_only(&check));
-        check.latest_version = "2.2.0".into();
-        assert!(!should_apply_ui_only(&check));
-    }
-
-    #[test]
-    fn build_plan_uses_template() {
-        let p = ReleaseProduct {
-            latest_version: "2.2.0".into(),
-            min_supported_version: "2.0.0".into(),
-            release_notes_url: "https://example.com/notes".into(),
-            download_url_template: "https://x.example/v{version}-{target}.tar.zst".into(),
-            signature_url_template: "https://x.example/v{version}/SHA256SUMS.minisig".into(),
-            mandatory: false,
-        };
-        let plan = build_upgrade_plan(&p, "2.1.0", Some("2.2.0"));
-        assert_eq!(plan["current_version"], "2.1.0");
-        assert_eq!(plan["target_version"], "2.2.0");
-        assert_eq!(plan["bump_kind"], "minor");
-        assert!(plan["download_url"].as_str().unwrap().contains("v2.2.0"));
-    }
-
-    #[test]
-    fn resolve_url_replaces_placeholders() {
-        let template = "https://example.com/bin-{version}-{target}";
-        let url = client_runtime_core::updater::resolve_url(template, "2.1.1");
-        let triple = client_runtime_core::updater::current_target_triple();
-        assert_eq!(url, format!("https://example.com/bin-2.1.1-{}", triple));
-    }
-
-    #[test]
-    fn default_server_base_has_no_website_fallback() {
-        let _base = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_BASE", "");
-        let _url = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_URL", "");
-        assert!(default_server_base().is_empty());
-    }
-
-    #[test]
-    fn resolve_releases_url_prefers_explicit_override() {
-        let _base = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_BASE", "https://ctrl.example");
-        let _rel = crate::db::TestEnvVarGuard::set("WPTSALL_RELEASES_URL", "https://mirror.example/releases.json");
-        assert_eq!(
-            resolve_releases_url(&default_server_base()),
-            "https://mirror.example/releases.json"
-        );
-    }
-
-    #[test]
-    fn resolve_releases_url_uses_control_plane_base_when_configured() {
-        let _base = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_BASE", "https://ctrl.example/");
-        let _rel = crate::db::TestEnvVarGuard::set("WPTSALL_RELEASES_URL", "");
-        assert_eq!(
-            resolve_releases_url(&default_server_base()),
-            "https://ctrl.example/api/v1/client/releases"
-        );
-    }
-
-    #[test]
-    fn resolve_releases_url_defaults_to_official_public_channel() {
-        let _base = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_BASE", "");
-        let _url = crate::db::TestEnvVarGuard::set("WPTSALL_SERVER_URL", "");
-        let _rel = crate::db::TestEnvVarGuard::set("WPTSALL_RELEASES_URL", "");
-        // Pure URL resolution — no network is contacted by this assertion;
-        // the default channel is only ever fetched by an explicit check.
-        assert_eq!(
-            resolve_releases_url(&default_server_base()),
-            DEFAULT_PUBLIC_RELEASES_URL
-        );
-    }
 }

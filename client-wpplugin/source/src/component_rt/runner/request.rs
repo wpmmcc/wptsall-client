@@ -2,9 +2,27 @@ use anyhow::Context;
 use reqwest::Method;
 use serde_json::json;
 
-use crate::logging::snippet;
-
 use super::*;
+
+pub(super) fn component_transport_error(
+    stage: &str,
+    component_id: &str,
+    error: reqwest::Error,
+) -> anyhow::Error {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else {
+        "transport"
+    };
+    // reqwest's source chain can contain the original URL, even when an
+    // outer context has redacted it. Do not attach that chain to diagnostics.
+    anyhow!(
+        "{} failed (component={}, kind={})",
+        stage,
+        component_id,
+        kind
+    )
+}
 
 pub(super) async fn invoke_component_api(
     client: &Client,
@@ -14,12 +32,69 @@ pub(super) async fn invoke_component_api(
     ctx: &HashMap<String, String>,
     sign_result: SignResult,
 ) -> anyhow::Result<Value> {
+    invoke_component_api_with_source(
+        client,
+        runtime,
+        request_spec,
+        rendered_url,
+        ctx,
+        sign_result,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn invoke_component_api_with_source(
+    client: &Client,
+    runtime: &ComponentRuntime,
+    request_spec: &ComponentRequest,
+    rendered_url: &str,
+    ctx: &HashMap<String, String>,
+    sign_result: SignResult,
+    source: Option<SourceRequest<'_>>,
+) -> anyhow::Result<Value> {
+    let budget = HttpBudget::new(
+        request_spec.http_limits.as_ref(),
+        HttpResponseKind::Json,
+        &runtime.template.id,
+    )?;
+    budget
+        .wait(invoke_component_api_with_budget(
+            client,
+            runtime,
+            request_spec,
+            rendered_url,
+            ctx,
+            sign_result,
+            source,
+            &budget,
+        ))
+        .await?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn invoke_component_api_with_budget(
+    client: &Client,
+    runtime: &ComponentRuntime,
+    request_spec: &ComponentRequest,
+    rendered_url: &str,
+    ctx: &HashMap<String, String>,
+    sign_result: SignResult,
+    source: Option<SourceRequest<'_>>,
+    budget: &HttpBudget<'_>,
+) -> anyhow::Result<Value> {
     let method = Method::from_bytes(request_spec.method.as_bytes())
         .with_context(|| format!("unsupported method: {}", request_spec.method))?;
     let url = rendered_url;
     assert_provider_url_allowed(url)?;
 
     let mut request = client.request(method, url);
+
+    // GAP-06 收尾: run 级 trace 挂在供应商请求上（含 mock 消费面）——
+    // 组件模板头与签名头在其后追加，不冲突；无 run 时不挂，保持线上兼容。
+    if let Some(trace_id) = crate::auth::current_run_trace_id() {
+        request = request.header(crate::config::TRACE_ID_HEADER, trace_id);
+    }
 
     let body_type = request_spec.body_type.as_deref().unwrap_or("json");
 
@@ -64,7 +139,7 @@ pub(super) async fn invoke_component_api(
             }
             "multipart" => {
                 let rendered = render_template_value(body, ctx);
-                let form = value_to_multipart_form_async(
+                let form = value_to_multipart_form_with_source(
                     client,
                     runtime
                         .template
@@ -73,6 +148,7 @@ pub(super) async fn invoke_component_api(
                         .and_then(|c| c.max_file_size_mb)
                         .unwrap_or(0),
                     &rendered,
+                    source,
                 )
                 .await?;
                 request = request.multipart(form);
@@ -84,12 +160,19 @@ pub(super) async fn invoke_component_api(
         }
     }
 
-    let safe_url = redact_url_secrets(url);
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("component request failed ({})", safe_url))?;
+    let response = request.send().await.map_err(|error| {
+        component_transport_error("component request", &runtime.template.id, error)
+    })?;
     assert_provider_redirect_origin(url, response.url())?;
+    // N-2 (07 audit, 12 批 A3): with provider_redirect_policy armed, a
+    // stopped-at-30x response means a cross-origin redirect was refused —
+    // report it explicitly instead of letting the redirect body fail later
+    // as an opaque parse error.
+    if response.status().is_redirection() {
+        return Err(anyhow!(
+            "provider redirect crossed host boundary (not followed)"
+        ));
+    }
     let status = response.status();
     let retry_after_ms = response
         .headers()
@@ -99,63 +182,34 @@ pub(super) async fn invoke_component_api(
         .and_then(|raw| raw.parse::<u64>().ok())
         .filter(|v| *v > 0)
         .map(|secs| secs.saturating_mul(1000));
-    let body_text = response
-        .text()
-        .await
-        .with_context(|| format!("component response read failed ({})", safe_url))?;
-    let body_json: Value = match serde_json::from_str(&body_text) {
-        Ok(value) => value,
-        Err(_) if status.is_success() => json!({ "body": body_text }),
-        Err(_) => {
-            let retry_after_note = retry_after_ms
-                .map(|v| format!(", retry_after_ms={}", v))
-                .unwrap_or_default();
-            return Err(anyhow!(
-                "component api non-2xx (status={}, message={}{})",
-                status,
-                snippet(&body_text),
-                retry_after_note
-            ));
-        }
-    };
-
     if !status.is_success() {
-        let error_path = runtime
-            .template
-            .response
-            .error_path
-            .as_deref()
-            .unwrap_or("error.message");
-        let full_err_msg = extract_json_path_string(&body_json, error_path).unwrap_or_else(|| {
-            let body_preview: String = body_json.to_string().chars().take(200).collect();
-            format!(
-                "component api call failed (error_path '{}' not found, body_preview={})",
-                error_path, body_preview
-            )
-        });
-        let truncated_msg: String = full_err_msg.chars().take(200).collect();
         let retry_after_note = retry_after_ms
             .map(|v| format!(", retry_after_ms={}", v))
             .unwrap_or_default();
         return Err(anyhow!(
-            "component api non-2xx (status={}, message={}{})",
+            "component api non-2xx (status={}, component={}{})",
             status,
-            truncated_msg,
+            runtime.template.id,
             retry_after_note
         ));
     }
+
+    let bytes = budget.read(response).await?;
+    // reqwest's charset feature is disabled in the shared products.
+    let body_text = String::from_utf8_lossy(&bytes);
+    let body_json: Value =
+        serde_json::from_str(&body_text).unwrap_or_else(|_| json!({ "body": body_text }));
 
     // Some providers return HTTP 200 for logical/auth errors and place details
     // under response.error_path. Detect and surface them as runtime errors
     // before translation output extraction.
     if let Some(error_path) = runtime.template.response.error_path.as_deref() {
-        if let Some(logical_error) = extract_component_logical_error(&body_json, error_path) {
-            let truncated_msg: String = logical_error.chars().take(200).collect();
+        if extract_component_logical_error(&body_json, error_path).is_some() {
             return Err(anyhow!(
-                "component api logical error (status={}, error_path='{}', message={})",
+                "component api logical error (status={}, component={}, error_path='{}')",
                 status,
-                error_path,
-                truncated_msg
+                runtime.template.id,
+                error_path
             ));
         }
     }
@@ -177,12 +231,68 @@ pub(super) async fn invoke_component_api_binary(
     ctx: &HashMap<String, String>,
     sign_result: SignResult,
 ) -> anyhow::Result<BinaryResponseAsset> {
+    invoke_component_api_binary_with_source(
+        client,
+        runtime,
+        request_spec,
+        rendered_url,
+        ctx,
+        sign_result,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn invoke_component_api_binary_with_source(
+    client: &Client,
+    runtime: &ComponentRuntime,
+    request_spec: &ComponentRequest,
+    rendered_url: &str,
+    ctx: &HashMap<String, String>,
+    sign_result: SignResult,
+    source: Option<SourceRequest<'_>>,
+) -> anyhow::Result<BinaryResponseAsset> {
+    let budget = HttpBudget::new(
+        request_spec.http_limits.as_ref(),
+        HttpResponseKind::Binary,
+        &runtime.template.id,
+    )?;
+    budget
+        .wait(invoke_component_api_binary_with_budget(
+            client,
+            runtime,
+            request_spec,
+            rendered_url,
+            ctx,
+            sign_result,
+            source,
+            &budget,
+        ))
+        .await?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn invoke_component_api_binary_with_budget(
+    client: &Client,
+    runtime: &ComponentRuntime,
+    request_spec: &ComponentRequest,
+    rendered_url: &str,
+    ctx: &HashMap<String, String>,
+    sign_result: SignResult,
+    source: Option<SourceRequest<'_>>,
+    budget: &HttpBudget<'_>,
+) -> anyhow::Result<BinaryResponseAsset> {
     let method = Method::from_bytes(request_spec.method.as_bytes())
         .with_context(|| format!("unsupported method: {}", request_spec.method))?;
     let url = rendered_url;
     assert_provider_url_allowed(url)?;
 
     let mut request = client.request(method, url);
+
+    // GAP-06 收尾: run 级 trace（同 invoke_component_api，二进制资产路径）。
+    if let Some(trace_id) = crate::auth::current_run_trace_id() {
+        request = request.header(crate::config::TRACE_ID_HEADER, trace_id);
+    }
 
     let body_type = request_spec.body_type.as_deref().unwrap_or("json");
 
@@ -225,7 +335,7 @@ pub(super) async fn invoke_component_api_binary(
             }
             "multipart" => {
                 let rendered = render_template_value(body, ctx);
-                let form = value_to_multipart_form_async(
+                let form = value_to_multipart_form_with_source(
                     client,
                     runtime
                         .template
@@ -234,6 +344,7 @@ pub(super) async fn invoke_component_api_binary(
                         .and_then(|c| c.max_file_size_mb)
                         .unwrap_or(0),
                     &rendered,
+                    source,
                 )
                 .await?;
                 request = request.multipart(form);
@@ -245,13 +356,27 @@ pub(super) async fn invoke_component_api_binary(
         }
     }
 
-    let safe_url = redact_url_secrets(url);
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("component request failed ({})", safe_url))?;
+    let response = request.send().await.map_err(|error| {
+        component_transport_error("component request", &runtime.template.id, error)
+    })?;
     assert_provider_redirect_origin(url, response.url())?;
+    // N-2 (07 audit, 12 批 A3): with provider_redirect_policy armed, a
+    // stopped-at-30x response means a cross-origin redirect was refused —
+    // report it explicitly instead of letting the redirect body fail later
+    // as an opaque parse error.
+    if response.status().is_redirection() {
+        return Err(anyhow!(
+            "provider redirect crossed host boundary (not followed)"
+        ));
+    }
     let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!(
+            "component api non-2xx (status={}, component={})",
+            status,
+            runtime.template.id
+        ));
+    }
     let filename = response
         .headers()
         .get(reqwest::header::CONTENT_DISPOSITION)
@@ -266,20 +391,7 @@ pub(super) async fn invoke_component_api_binary(
                 Some(trimmed.to_string())
             }
         });
-    let body_bytes = response
-        .bytes()
-        .await
-        .with_context(|| format!("component response read failed ({})", safe_url))?
-        .to_vec();
-
-    if !status.is_success() {
-        let body_preview = snippet(&String::from_utf8_lossy(&body_bytes));
-        return Err(anyhow!(
-            "component api non-2xx (status={}, body_preview={})",
-            status,
-            body_preview
-        ));
-    }
+    let body_bytes = budget.read(response).await?;
 
     Ok(BinaryResponseAsset {
         bytes: body_bytes,
@@ -287,7 +399,7 @@ pub(super) async fn invoke_component_api_binary(
     })
 }
 
-fn extract_component_logical_error(value: &Value, error_path: &str) -> Option<String> {
+pub(super) fn extract_component_logical_error(value: &Value, error_path: &str) -> Option<String> {
     let v = extract_json_path(value, error_path)?;
     match v {
         Value::Null => None,
@@ -634,15 +746,27 @@ pub(super) async fn value_to_multipart_form_async(
     max_file_size_mb: u32,
     value: &serde_json::Value,
 ) -> anyhow::Result<reqwest::multipart::Form> {
+    value_to_multipart_form_with_source(client, max_file_size_mb, value, None).await
+}
+
+pub(super) async fn value_to_multipart_form_with_source(
+    client: &Client,
+    max_file_size_mb: u32,
+    value: &serde_json::Value,
+    source: Option<SourceRequest<'_>>,
+) -> anyhow::Result<reqwest::multipart::Form> {
     let mut form = reqwest::multipart::Form::new();
 
-    let max_bytes = if max_file_size_mb > 0 {
+    let mut max_bytes = if max_file_size_mb > 0 {
         (max_file_size_mb as u64)
             .saturating_mul(1024)
             .saturating_mul(1024)
     } else {
         0
     };
+    if let Some(source) = source {
+        max_bytes = crate::component_rt::file_limits::strictest(max_bytes, source.byte_budget);
+    }
 
     let Some(obj) = value.as_object() else {
         return Ok(form.text("payload".to_string(), value.to_string()));
@@ -662,7 +786,19 @@ pub(super) async fn value_to_multipart_form_async(
             .map(str::trim);
 
         if let Some(file_ref) = file_ref {
-            let asset = fetch_source_asset(client, file_ref, max_bytes).await?;
+            let asset = match source
+                .filter(|source| source.reference.trim() == file_ref)
+                .and_then(|source| source.verified)
+            {
+                Some(asset) => std::borrow::Cow::Borrowed(asset),
+                None => {
+                    std::borrow::Cow::Owned(fetch_source_asset(client, file_ref, max_bytes).await?)
+                }
+            };
+            anyhow::ensure!(
+                max_bytes == 0 || u64::try_from(asset.bytes.len())? <= max_bytes,
+                "multipart source exceeds selected credential byte budget"
+            );
             let content_bytes = asset.bytes.clone();
             let filename = asset.filename.clone();
             let mut part =

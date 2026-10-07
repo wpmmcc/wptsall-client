@@ -4,7 +4,7 @@ use tokio::sync::Mutex;
 
 use crate::types::WebUiState;
 
-use super::errors::{write_error_response, write_session_required};
+use super::errors::{err_public, write_error_response, write_session_required};
 use super::http::write_http_response;
 
 /// GET /api/platform/products — proxy to server platform product list API.
@@ -48,7 +48,12 @@ pub(super) async fn handle_platform_products(
             write_http_response(socket, &status_line, "application/json", &body).await
         }
         Err(err) => {
-            write_error_response(socket, "PRODUCTS_FETCH_FAILED", &format!("{:#}", err)).await
+            write_error_response(
+                socket,
+                "PRODUCTS_FETCH_FAILED",
+                &err_public(&anyhow::Error::from(err)),
+            )
+            .await
         }
     }
 }
@@ -97,7 +102,12 @@ pub(super) async fn handle_platform_entitlements(
             write_http_response(socket, &status_line, "application/json", &body).await
         }
         Err(err) => {
-            write_error_response(socket, "ENTITLEMENTS_FETCH_FAILED", &format!("{:#}", err)).await
+            write_error_response(
+                socket,
+                "ENTITLEMENTS_FETCH_FAILED",
+                &err_public(&anyhow::Error::from(err)),
+            )
+            .await
         }
     }
 }

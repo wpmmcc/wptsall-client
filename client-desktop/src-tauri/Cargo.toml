@@ -5,6 +5,10 @@ edition = "2021"
 description = "WPTSALL translation client desktop application"
 authors = ["WPMM <info@wpmm.cc>"]
 
+# Test targets live in the private test tree and are re-attached to this
+# manifest only inside the owned test overlay (autotests stay disabled).
+autotests = false
+
 [lib]
 name = "wptsall_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]

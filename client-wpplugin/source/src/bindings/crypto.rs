@@ -18,6 +18,34 @@ const WPTC_MAGIC: &[u8; 4] = b"WPTC";
 const WPTC_VERSION: u8 = 0x01;
 const WPTC_HEADER_LEN: usize = 4 + 1 + 12;
 
+/// S3 / SEC-02 (07 audit, 12 批 A5): the DB-loaded device identity,
+/// registered once at process boot (WebUI / worker entrypoints) so
+/// `bindings_secret()` can derive a default encryption key without the
+/// caller threading a DB connection into every file write. First
+/// registration wins (idempotent for multi-entrypoint processes); explicit
+/// env sources still take precedence. RwLock<Option<_>> (not OnceLock) so
+/// the test seam can drop the registration again.
+static DEFAULT_DEVICE_ID: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Register the process-wide default device identity for key derivation
+/// (S3/SEC-02). Called from boot paths after the device_id is resolved
+/// from the DB (or an explicit override). No-op for empty values and after
+/// a first registration.
+pub(crate) fn set_default_device_id(device_id: &str) {
+    let trimmed = device_id.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut guard = DEFAULT_DEVICE_ID
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        *guard = Some(trimmed.to_string());
+    }
+}
+
+
+
 pub(crate) fn bindings_secret() -> Option<String> {
     if let Ok(s) = env::var("WPTSALL_COMPONENT_BINDINGS_SECRET") {
         let s = s.trim().to_string();
@@ -33,6 +61,18 @@ pub(crate) fn bindings_secret() -> Option<String> {
         }
     }
 
+    // S3/SEC-02: the boot-registered DB identity is the default source —
+    // before this existed, WebUI/worker never wired the DB-loaded
+    // device_id into the crypto layer and every at-rest credential stayed
+    // in plain text (the SEC-02 known-red pin).
+    if let Some(id) = DEFAULT_DEVICE_ID
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Some(derive_bindings_secret_from_device_id(&id));
+    }
+
     None
 }
 
@@ -43,6 +83,17 @@ fn derive_bindings_secret_from_device_id(device_id: &str) -> String {
     hk.expand(b"bindings-secret-from-device-id-v1", &mut key)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     key.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+}
+
+pub(crate) fn derive_retained_asset_key(id: &[u8; 16]) -> anyhow::Result<[u8; 32]> {
+    let secret =
+        bindings_secret().ok_or_else(|| anyhow!("retained assets require a bindings key"))?;
+    let master = derive_bindings_crypto_key(&secret);
+    let hkdf = Hkdf::<Sha256>::new(Some(id), &master);
+    let mut key = [0; 32];
+    hkdf.expand(b"wptsall-retained-assets-aes256gcm-v1", &mut key)
+        .map_err(|_| anyhow!("derive retained asset key failed"))?;
+    Ok(key)
 }
 
 pub(crate) fn load_encrypted_or_plain(file_path: &Path) -> anyhow::Result<String> {
@@ -68,9 +119,8 @@ pub(crate) fn load_encrypted_or_plain(file_path: &Path) -> anyhow::Result<String
 }
 
 pub(crate) fn encrypt_for_save(plain_json: &str) -> anyhow::Result<Vec<u8>> {
-    let Some(secret) = bindings_secret() else {
-        return Ok(plain_json.as_bytes().to_vec());
-    };
+    let secret = bindings_secret()
+        .ok_or_else(|| anyhow!("cannot save encrypted configuration without a bindings key"))?;
 
     let key = derive_bindings_crypto_key(&secret);
     let mut nonce_bytes = [0u8; 12];

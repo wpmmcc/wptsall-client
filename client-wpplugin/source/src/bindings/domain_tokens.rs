@@ -4,34 +4,35 @@ use std::path::Path;
 
 use anyhow::Context;
 
-use super::{encrypt_for_save, load_encrypted_or_plain};
+use super::{save_encrypted_file, load_encrypted_or_plain};
 use crate::logging::session_token_prefix;
 use crate::types::{
-    DomainStatusItem, DomainTokenBindingEntry, DomainTokenBindingStatusItem, DomainTokenBindingsDoc,
+    DomainStatusItem, DomainTokenBindingEntry, DomainTokenBindingStatusItem,
+    DomainTokenBindingsDoc, PluginIdentity,
 };
+
+/// Current persisted schema version of `DomainTokenBindingsDoc`
+/// (Identity Contract v1.1 §4).
+pub(super) const DOMAIN_BINDINGS_VERSION: u32 = 3;
 
 pub(super) fn load_domain_token_bindings(path: &str) -> anyhow::Result<DomainTokenBindingsDoc> {
     let file_path = Path::new(path);
-    if let Some(parent) = file_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create bindings dir failed: {}", parent.display()))?;
-        }
-    }
-
-    if !file_path.exists() {
+    // Reading missing configuration does not publish a new document. In
+    // particular, recovery at full quota must remain a read-only operation.
+    if matches!(fs::symlink_metadata(file_path), Err(ref error)
+        if error.kind() == std::io::ErrorKind::NotFound)
+    {
         let doc = DomainTokenBindingsDoc {
-            version: 2,
+            version: DOMAIN_BINDINGS_VERSION,
             domains: std::collections::HashMap::new(),
         };
-        save_domain_token_bindings(path, &doc)?;
         return Ok(doc);
     }
 
     let decrypted_raw = load_encrypted_or_plain(file_path)?;
     if decrypted_raw.trim().is_empty() {
         return Ok(DomainTokenBindingsDoc {
-            version: 2,
+            version: DOMAIN_BINDINGS_VERSION,
             domains: std::collections::HashMap::new(),
         });
     }
@@ -57,11 +58,37 @@ pub(super) fn load_domain_token_bindings(path: &str) -> anyhow::Result<DomainTok
         }
         doc.version = 2;
     }
+    // Identity Contract v1.1 §4 (C-1): v2 -> v3 migration via the shared
+    // backfill (same semantics as the SQLite cache loader).
+    if doc.version < 3 {
+        apply_v3_identity_backfill(&mut doc);
+    }
     doc.domains.retain(|key, entry| {
         let normalized = normalize_domain_base(key);
         !normalized.is_empty() && !entry.wp_client_token.trim().is_empty()
     });
     Ok(doc)
+}
+
+/// Identity Contract v1.1 §4 (C-1): backfill v3 identity fields on a pre-v3
+/// doc. Legacy entries can only be wpmmcc-ats sites (the wpmmcc plugin did
+/// not exist when they were bound), so the identity defaults to `wpmmcc_ats`
+/// with `identity_verified_at = None` — the next worker heartbeat re-verifies
+/// and overwrites with the live value. Idempotent: a v3 doc is a no-op.
+/// Shared by the file loader and the SQLite cache loader so both persistence
+/// sources produce identical v3 semantics.
+pub(super) fn apply_v3_identity_backfill(doc: &mut DomainTokenBindingsDoc) {
+    if doc.version >= 3 {
+        return;
+    }
+    for entry in doc.domains.values_mut() {
+        if entry.plugin_identity.is_none() {
+            entry.plugin_identity = Some(PluginIdentity::WpmmccAts);
+        }
+        entry.identity_verified_at = None;
+        entry.identity_capabilities = None;
+    }
+    doc.version = 3;
 }
 
 pub(super) fn save_domain_token_bindings(
@@ -91,25 +118,17 @@ pub(super) fn save_domain_token_bindings(
             DomainTokenBindingEntry {
                 wp_client_token: entry.wp_client_token.trim().to_string(),
                 route_secret: entry.route_secret.trim().to_string(),
+                // Identity fields (contract §4) are preserved verbatim on save.
+                plugin_identity: entry.plugin_identity,
+                identity_verified_at: entry.identity_verified_at,
+                identity_capabilities: entry.identity_capabilities,
             },
         );
     }
 
     let encoded = serde_json::to_string_pretty(&normalized)
         .with_context(|| "encode domain token bindings json failed".to_string())?;
-    let output = encrypt_for_save(&encoded)?;
-    fs::write(file_path, output).with_context(|| {
-        format!(
-            "write domain token bindings file failed: {}",
-            file_path.display()
-        )
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    save_encrypted_file(file_path, &encoded)
 }
 
 pub(super) fn normalize_api_base_url_key(input: &str) -> String {
@@ -192,6 +211,27 @@ pub(super) fn resolve_route_secret_for_domain(
     None
 }
 
+/// Resolve the full binding entry (including identity fields, contract §4)
+/// for a domain, mirroring the token/secret resolution key order.
+pub(super) fn resolve_entry_for_domain<'a>(
+    api_base_url: &str,
+    bindings_doc: &'a DomainTokenBindingsDoc,
+) -> Option<&'a DomainTokenBindingEntry> {
+    let domain_base = normalize_domain_base(api_base_url);
+    if let Some(entry) = bindings_doc.domains.get(&domain_base) {
+        if !entry.wp_client_token.trim().is_empty() {
+            return Some(entry);
+        }
+    }
+    let legacy_key = normalize_api_base_url_key(api_base_url);
+    if let Some(entry) = bindings_doc.domains.get(&legacy_key) {
+        if !entry.wp_client_token.trim().is_empty() {
+            return Some(entry);
+        }
+    }
+    None
+}
+
 pub(super) fn build_wp_base_url(domain_base: &str, route_secret: &str) -> Option<String> {
     let secret = route_secret.trim();
     if secret.is_empty() {
@@ -199,6 +239,31 @@ pub(super) fn build_wp_base_url(domain_base: &str, route_secret: &str) -> Option
     }
     let base = domain_base.trim().trim_end_matches('/');
     Some(format!("{}/wp-json/wptsall/v2/{}/client", base, secret))
+}
+
+/// Identity-aware verification base (Identity Contract v1.1 §2/§3): the
+/// binding's expected identity selects the endpoint family the live ping
+/// verifies against. ATS sites answer on the secret-bearing wptsall client
+/// base; wpmmcc sites on the secret-prefixed wpmmcc/v1 sync base. The
+/// response shape (`data.plugin_identity` + capability fields) is the same
+/// by contract, so [`verify_identity`] works against either.
+pub(crate) fn build_verify_base_url(
+    domain_base: &str,
+    route_secret: &str,
+    identity: &crate::types::PluginIdentity,
+) -> Option<String> {
+    use crate::types::PluginIdentity;
+    match identity {
+        PluginIdentity::WpmmccAts => build_wp_base_url(domain_base, route_secret),
+        PluginIdentity::Wpmmcc => {
+            let secret = route_secret.trim();
+            if secret.is_empty() {
+                return None;
+            }
+            let base = domain_base.trim().trim_end_matches('/');
+            Some(format!("{}/wp-json/wpmmcc/v1/{}/sync", base, secret))
+        }
+    }
 }
 
 pub(super) fn domain_token_binding_status_items(
@@ -217,6 +282,11 @@ pub(super) fn domain_token_binding_status_items(
                 token_prefix: session_token_prefix(token),
                 token_len: token.len(),
                 route_secret_set: !entry.route_secret.trim().is_empty(),
+                plugin_identity: entry
+                    .plugin_identity
+                    .as_ref()
+                    .map(|identity| identity.as_wire_str().to_string()),
+                identity_verified_at: entry.identity_verified_at.clone(),
             })
         })
         .collect();

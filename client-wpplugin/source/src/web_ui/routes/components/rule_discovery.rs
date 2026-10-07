@@ -14,7 +14,13 @@ use super::super::errors::{maybe_write_upstream_api_error, write_session_require
 use super::super::http::write_http_response;
 
 const RULE_DISCOVERY_HTTP_TIMEOUT_SECS: u64 = 12;
-const RULE_DISCOVERY_MAX_RELATIONS_PER_DOMAIN: usize = 8;
+// §67 recheck (tasks/cursor CURSOR-COMMERCIAL-USE-RECHECK-20260929): the
+// rule-binding discovery used to hard-cap each domain at 8 relations "for UI
+// responsiveness", which silently hid 14 of 22 live relations from the
+// binding screen (virtual sites + network subsites were invisible there).
+// Real sites carry tens of relations; keep a generous bound so pathological
+// installs still truncate, but realistic sets render whole.
+const RULE_DISCOVERY_MAX_RELATIONS_PER_DOMAIN: usize = 200;
 
 #[derive(Debug, Serialize)]
 struct RuleDiscoveryFieldSummary {
@@ -205,6 +211,7 @@ pub(crate) async fn handle_rule_component_binding_discovery(
                 &relations_url,
                 &wp_client_token,
                 &worker_id,
+                &device_id,
                 route_secret.as_deref(),
             ),
         )
@@ -268,6 +275,7 @@ pub(crate) async fn handle_rule_component_binding_discovery(
                     &rules_url,
                     &wp_client_token,
                     &worker_id,
+                    &device_id,
                     route_secret.as_deref(),
                 ),
             )

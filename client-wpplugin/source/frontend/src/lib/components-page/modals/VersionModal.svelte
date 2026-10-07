@@ -4,6 +4,7 @@
     VersionFormState,
   } from '../types';
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../../modal-a11y';
 
   export let open = false;
   export let component: LocalComp | null = null;
@@ -22,12 +23,14 @@
 {#if open && component}
   <div
     class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-    role="button"
+    role="dialog"
+    aria-modal="true"
     tabindex="0"
     aria-label={$_('version_modal.close_modal')}
     onclick={(e) => {
       if (e.target === e.currentTarget) onClose();
     }}
+    use:modalA11y={{ onClose }}
     onkeydown={(e) => handleBackdropKeydown(e, onClose)}>
     <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-sm">
       <h4 class="font-semibold text-gray-900 mb-4">

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::web_ui::routes::errors::err_public;
+
 #[derive(Clone, Debug)]
 pub(crate) struct SigningKeyMaterial {
     pub(crate) pem: String,
@@ -250,7 +252,7 @@ pub(crate) async fn handle_components_template(
             write_error_response(
                 socket,
                 "COMPONENT_TEMPLATE_LOAD_FAILED",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await
         }

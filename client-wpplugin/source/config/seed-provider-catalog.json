@@ -1,0 +1,1654 @@
+{
+  "schema": "wptsall-provider-catalog-manifest.v2",
+  "template_schema": "wptsall-provider-template.v2",
+  "catalog_version": "1.0.0",
+  "created_at": "2026-09-17T00:00:00Z",
+  "entries_count": 15,
+  "entries_sha256": "368be68ea626916189b395febbe8cee6161bd675c4c6846a7e29261844a0596b",
+  "entries": [
+    {
+      "family": "http_mt",
+      "id": "alibaba",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "access_key",
+                "required": true
+              },
+              {
+                "name": "secret_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "response.translated_text_path",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:alibaba"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "AccessKeyId": "YOUR_ACCESS_KEY",
+                "Action": "TranslateGeneral",
+                "FormatType": "text",
+                "Signature": "SAMPLE-SIGN",
+                "SourceLanguage": "en",
+                "SourceText": "Hello, world.",
+                "TargetLanguage": "zh"
+              },
+              "headers": {
+                "Content-Type": "application/x-www-form-urlencoded"
+              },
+              "method": "POST",
+              "url": "https://mt.cn-hangzhou.aliyuncs.com/api/translate/web"
+            },
+            "response": {
+              "Data": {
+                "TranslatedText": "你好，世界。"
+              }
+            }
+          },
+          "forked_from": null,
+          "id": "alibaba-translate-v1",
+          "name": "Alibaba Cloud Translate",
+          "request": {
+            "body": {
+              "AccessKeyId": "{{auth.access_key}}",
+              "Action": "TranslateGeneral",
+              "FormatType": "text",
+              "Signature": "{{computed.sign}}",
+              "SourceLanguage": "{{input.source_lang}}",
+              "SourceText": "{{input.text}}",
+              "TargetLanguage": "{{input.target_lang}}"
+            },
+            "body_type": "form",
+            "headers": {
+              "Content-Type": "application/x-www-form-urlencoded"
+            },
+            "method": "POST",
+            "url": "https://mt.cn-hangzhou.aliyuncs.com/api/translate/web"
+          },
+          "response": {
+            "translated_text_path": "Data.TranslatedText"
+          },
+          "sign": {
+            "algorithm": "alibaba_v1",
+            "concat": [
+              {
+                "ctx_key": "auth.access_key",
+                "param_name": "AccessKeyId"
+              },
+              {
+                "param_name": "Action",
+                "value": "TranslateGeneral"
+              },
+              {
+                "param_name": "FormatType",
+                "value": "text"
+              },
+              {
+                "ctx_key": "input.source_lang",
+                "param_name": "SourceLanguage"
+              },
+              {
+                "ctx_key": "input.text",
+                "param_name": "SourceText"
+              },
+              {
+                "ctx_key": "input.target_lang",
+                "param_name": "TargetLanguage"
+              }
+            ]
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "alibaba"
+    },
+    {
+      "family": "openai_compatible",
+      "id": "anthropic-openai-compat",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html",
+              "json_structured",
+              "serialized_php"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "request.body.model",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:anthropic-openai-compat"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "messages": [
+                  {
+                    "content": "You are a professional translator. Translate the following text from en to zh. Output only the translation.",
+                    "role": "system"
+                  },
+                  {
+                    "content": "Hello, world.",
+                    "role": "user"
+                  }
+                ],
+                "model": "claude-sonnet-4-20250514",
+                "temperature": 0.1
+              },
+              "headers": {
+                "Authorization": "Bearer YOUR_API_KEY",
+                "Content-Type": "application/json"
+              },
+              "method": "POST",
+              "url": "https://api.anthropic.com/v1/chat/completions"
+            },
+            "response": {
+              "choices": [
+                {
+                  "message": {
+                    "content": "你好，世界。"
+                  }
+                }
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "anthropic-openai-compat-v1",
+          "name": "Anthropic via OpenAI-compatible gateway",
+          "request": {
+            "body": {
+              "messages": [
+                {
+                  "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+                  "role": "system"
+                },
+                {
+                  "content": "{{input.text}}",
+                  "role": "user"
+                }
+              ],
+              "model": "claude-sonnet-4-20250514",
+              "temperature": 0.1
+            },
+            "headers": {
+              "Authorization": "Bearer {{auth.api_key}}",
+              "Content-Type": "application/json"
+            },
+            "method": "POST",
+            "url": "https://api.anthropic.com/v1/chat/completions"
+          },
+          "response": {
+            "translated_text_path": "choices.0.message.content"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "anthropic"
+    },
+    {
+      "family": "http_mt",
+      "id": "baidu",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "app_id",
+                "required": true
+              },
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:baidu"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "appid": "YOUR_APP_ID",
+                "from": "en",
+                "q": "Hello, world.",
+                "salt": "1730000000",
+                "sign": "SAMPLE-SIGN",
+                "to": "zh"
+              },
+              "headers": {
+                "Content-Type": "application/x-www-form-urlencoded"
+              },
+              "method": "POST",
+              "url": "https://fanyi-api.baidu.com/api/trans/vip/translate"
+            },
+            "response": {
+              "trans_result": [
+                {
+                  "dst": "你好，世界。"
+                }
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "baidu-translate-v1",
+          "name": "Baidu Translate (Open API)",
+          "request": {
+            "body": {
+              "appid": "{{auth.app_id}}",
+              "from": "{{input.source_lang}}",
+              "q": "{{input.text}}",
+              "salt": "{{computed.salt}}",
+              "sign": "{{computed.sign}}",
+              "to": "{{input.target_lang}}"
+            },
+            "body_type": "form",
+            "headers": {
+              "Content-Type": "application/x-www-form-urlencoded"
+            },
+            "method": "POST",
+            "url": "https://fanyi-api.baidu.com/api/trans/vip/translate"
+          },
+          "response": {
+            "translated_text_path": "trans_result.0.dst"
+          },
+          "sign": {
+            "algorithm": "md5",
+            "concat": [
+              "auth.app_id",
+              "input.text",
+              "computed.salt",
+              "auth.api_key"
+            ],
+            "salt_type": "random_int"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "baidu"
+    },
+    {
+      "family": "http_mt",
+      "id": "deepl",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "language_map": {
+              "ar": "AR",
+              "bg": "BG",
+              "cs": "CS",
+              "da": "DA",
+              "de": "DE",
+              "el": "EL",
+              "en": "EN",
+              "en_GB": "EN-GB",
+              "en_US": "EN",
+              "es": "ES",
+              "et": "ET",
+              "fi": "FI",
+              "fr": "FR",
+              "hu": "HU",
+              "id": "ID",
+              "it": "IT",
+              "ja": "JA",
+              "ko": "KO",
+              "lt": "LT",
+              "lv": "LV",
+              "nb": "NB",
+              "nl": "NL",
+              "pl": "PL",
+              "pt": "PT",
+              "pt_BR": "PT-BR",
+              "ro": "RO",
+              "ru": "RU",
+              "sk": "SK",
+              "sl": "SL",
+              "sv": "SV",
+              "tr": "TR",
+              "uk": "UK",
+              "zh": "ZH",
+              "zh_CN": "ZH",
+              "zh_TW": "ZH"
+            },
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "response.translated_text_path",
+              "required": false,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [],
+            "tier": "schema-only",
+            "verified_at": null
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "source_lang": "en",
+                "target_lang": "zh",
+                "text": [
+                  "Hello, world."
+                ]
+              },
+              "headers": {
+                "Authorization": "DeepL-Auth-Key YOUR_API_KEY"
+              },
+              "method": "POST",
+              "url": "https://api-free.deepl.com/v2/translate"
+            },
+            "response": {
+              "translations": [
+                {
+                  "text": "你好，世界。"
+                }
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "deepl-v2",
+          "name": "DeepL API v2",
+          "request": {
+            "body": {
+              "source_lang": "{{input.source_lang}}",
+              "target_lang": "{{input.target_lang}}",
+              "text": [
+                "{{input.text}}"
+              ]
+            },
+            "headers": {
+              "Authorization": "DeepL-Auth-Key {{auth.api_key}}"
+            },
+            "method": "POST",
+            "url": "https://api-free.deepl.com/v2/translate"
+          },
+          "response": {
+            "translated_text_path": "translations.0.text"
+          },
+          "type": "text",
+          "version": "1.0.1"
+        }
+      ],
+      "vendor_id": "deepl"
+    },
+    {
+      "family": "openai_compatible",
+      "id": "deepseek",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html",
+              "json_structured",
+              "serialized_php"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "request.body.model",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:deepseek"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "messages": [
+                  {
+                    "content": "You are a professional translator. Translate the following text from en to zh. Output only the translation.",
+                    "role": "system"
+                  },
+                  {
+                    "content": "Hello, world.",
+                    "role": "user"
+                  }
+                ],
+                "model": "deepseek-chat",
+                "temperature": 0.1
+              },
+              "headers": {
+                "Authorization": "Bearer YOUR_API_KEY",
+                "Content-Type": "application/json"
+              },
+              "method": "POST",
+              "url": "https://api.deepseek.com/v1/chat/completions"
+            },
+            "response": {
+              "choices": [
+                {
+                  "message": {
+                    "content": "你好，世界。"
+                  }
+                }
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "deepseek-chat-completions-v1",
+          "name": "DeepSeek Chat Completions",
+          "request": {
+            "body": {
+              "messages": [
+                {
+                  "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+                  "role": "system"
+                },
+                {
+                  "content": "{{input.text}}",
+                  "role": "user"
+                }
+              ],
+              "model": "deepseek-chat",
+              "temperature": 0.1
+            },
+            "headers": {
+              "Authorization": "Bearer {{auth.api_key}}",
+              "Content-Type": "application/json"
+            },
+            "method": "POST",
+            "url": "https://api.deepseek.com/v1/chat/completions"
+          },
+          "response": {
+            "translated_text_path": "choices.0.message.content"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "deepseek"
+    },
+    {
+      "family": "openai_compatible",
+      "id": "google-gemini-openai",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html",
+              "json_structured",
+              "serialized_php"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "request.body.model",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:google-gemini-openai"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "messages": [
+                  {
+                    "content": "You are a professional translator. Translate the following text from en to zh. Output only the translation.",
+                    "role": "system"
+                  },
+                  {
+                    "content": "Hello, world.",
+                    "role": "user"
+                  }
+                ],
+                "model": "gemini-2.0-flash",
+                "temperature": 0.1
+              },
+              "headers": {
+                "Authorization": "Bearer YOUR_API_KEY",
+                "Content-Type": "application/json"
+              },
+              "method": "POST",
+              "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+            },
+            "response": {
+              "choices": [
+                {
+                  "message": {
+                    "content": "你好，世界。"
+                  }
+                }
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "google-gemini-openai-v1",
+          "name": "Google Gemini (OpenAI-compatible)",
+          "request": {
+            "body": {
+              "messages": [
+                {
+                  "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+                  "role": "system"
+                },
+                {
+                  "content": "{{input.text}}",
+                  "role": "user"
+                }
+              ],
+              "model": "gemini-2.0-flash",
+              "temperature": 0.1
+            },
+            "headers": {
+              "Authorization": "Bearer {{auth.api_key}}",
+              "Content-Type": "application/json"
+            },
+            "method": "POST",
+            "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+          },
+          "response": {
+            "translated_text_path": "choices.0.message.content"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "google_gemini"
+    },
+    {
+      "family": "http_mt",
+      "id": "google-translate",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "response.translated_text_path",
+              "required": false,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [],
+            "tier": "schema-only",
+            "verified_at": null
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "q": "Hello, world.",
+                "source": "en",
+                "target": "zh"
+              },
+              "headers": {
+                "Content-Type": "application/json",
+                "x-goog-api-key": "YOUR_API_KEY"
+              },
+              "method": "POST",
+              "url": "https://translation.googleapis.com/language/translate/v2"
+            },
+            "response": {
+              "data": {
+                "translations": [
+                  {
+                    "translatedText": "你好，世界。"
+                  }
+                ]
+              }
+            }
+          },
+          "forked_from": null,
+          "id": "google-translate-v2",
+          "name": "Google Cloud Translation (Basic)",
+          "request": {
+            "body": {
+              "q": "{{input.text}}",
+              "source": "{{input.source_lang}}",
+              "target": "{{input.target_lang}}"
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "x-goog-api-key": "{{auth.api_key}}"
+            },
+            "method": "POST",
+            "url": "https://translation.googleapis.com/language/translate/v2"
+          },
+          "response": {
+            "translated_text_path": "data.translations.0.translatedText"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "google_translate"
+    },
+    {
+      "family": "openai_compatible",
+      "id": "groq",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html",
+              "json_structured",
+              "serialized_php"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "request.body.model",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:groq"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "messages": [
+                  {
+                    "content": "You are a professional translator. Translate the following text from en to zh. Output only the translation.",
+                    "role": "system"
+                  },
+                  {
+                    "content": "Hello, world.",
+                    "role": "user"
+                  }
+                ],
+                "model": "llama-3.3-70b-versatile",
+                "temperature": 0.1
+              },
+              "headers": {
+                "Authorization": "Bearer YOUR_API_KEY",
+                "Content-Type": "application/json"
+              },
+              "method": "POST",
+              "url": "https://api.groq.com/openai/v1/chat/completions"
+            },
+            "response": {
+              "choices": [
+                {
+                  "message": {
+                    "content": "你好，世界。"
+                  }
+                }
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "groq-chat-completions-v1",
+          "name": "Groq Chat Completions",
+          "request": {
+            "body": {
+              "messages": [
+                {
+                  "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+                  "role": "system"
+                },
+                {
+                  "content": "{{input.text}}",
+                  "role": "user"
+                }
+              ],
+              "model": "llama-3.3-70b-versatile",
+              "temperature": 0.1
+            },
+            "headers": {
+              "Authorization": "Bearer {{auth.api_key}}",
+              "Content-Type": "application/json"
+            },
+            "method": "POST",
+            "url": "https://api.groq.com/openai/v1/chat/completions"
+          },
+          "response": {
+            "translated_text_path": "choices.0.message.content"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "groq"
+    },
+    {
+      "family": "http_mt",
+      "id": "microsoft-translator",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:microsoft-translator"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": [
+                {
+                  "text": "Hello, world."
+                }
+              ],
+              "headers": {
+                "Content-Type": "application/json",
+                "Ocp-Apim-Subscription-Key": "YOUR_API_KEY"
+              },
+              "method": "POST",
+              "url": "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from=en&to=zh"
+            },
+            "response": [
+              {
+                "translations": [
+                  {
+                    "text": "你好，世界。"
+                  }
+                ]
+              }
+            ]
+          },
+          "forked_from": null,
+          "id": "microsoft-translator-v3",
+          "name": "Microsoft Translator v3",
+          "request": {
+            "body": [
+              {
+                "text": "{{input.text}}"
+              }
+            ],
+            "headers": {
+              "Content-Type": "application/json",
+              "Ocp-Apim-Subscription-Key": "{{auth.api_key}}"
+            },
+            "method": "POST",
+            "url": "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}"
+          },
+          "response": {
+            "translated_text_path": "0.translations.0.text"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "microsoft_translator"
+    },
+    {
+      "family": "openai_compatible",
+      "id": "mistral",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html",
+              "json_structured",
+              "serialized_php"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "request.body.model",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:mistral"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "messages": [
+                  {
+                    "content": "You are a professional translator. Translate the following text from en to zh. Output only the translation.",
+                    "role": "system"
+                  },
+                  {
+                    "content": "Hello, world.",
+                    "role": "user"
+                  }
+                ],
+                "model": "mistral-large-latest",
+                "temperature": 0.1
+              },
+              "headers": {
+                "Authorization": "Bearer YOUR_API_KEY",
+                "Content-Type": "application/json"
+              },
+              "method": "POST",
+              "url": "https://api.mistral.ai/v1/chat/completions"
+            },
+            "response": {
+              "choices": [
+                {
+                  "message": {
+                    "content": "你好，世界。"
+                  }
+                }
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "mistral-chat-completions-v1",
+          "name": "Mistral AI Chat Completions",
+          "request": {
+            "body": {
+              "messages": [
+                {
+                  "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+                  "role": "system"
+                },
+                {
+                  "content": "{{input.text}}",
+                  "role": "user"
+                }
+              ],
+              "model": "mistral-large-latest",
+              "temperature": 0.1
+            },
+            "headers": {
+              "Authorization": "Bearer {{auth.api_key}}",
+              "Content-Type": "application/json"
+            },
+            "method": "POST",
+            "url": "https://api.mistral.ai/v1/chat/completions"
+          },
+          "response": {
+            "translated_text_path": "choices.0.message.content"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "mistral"
+    },
+    {
+      "family": "openai_compatible",
+      "id": "ollama",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html",
+              "json_structured",
+              "serialized_php"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "request.body.model",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:ollama"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "messages": [
+                  {
+                    "content": "You are a professional translator. Translate the following text from en to zh. Output only the translation.",
+                    "role": "system"
+                  },
+                  {
+                    "content": "Hello, world.",
+                    "role": "user"
+                  }
+                ],
+                "model": "llama3.2",
+                "temperature": 0.1
+              },
+              "headers": {
+                "Authorization": "Bearer YOUR_API_KEY",
+                "Content-Type": "application/json"
+              },
+              "method": "POST",
+              "url": "http://127.0.0.1:11434/v1/chat/completions"
+            },
+            "response": {
+              "choices": [
+                {
+                  "message": {
+                    "content": "你好，世界。"
+                  }
+                }
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "ollama-chat-v1",
+          "name": "Ollama (local OpenAI-compatible)",
+          "request": {
+            "body": {
+              "messages": [
+                {
+                  "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+                  "role": "system"
+                },
+                {
+                  "content": "{{input.text}}",
+                  "role": "user"
+                }
+              ],
+              "model": "llama3.2",
+              "temperature": 0.1
+            },
+            "headers": {
+              "Authorization": "Bearer {{auth.api_key}}",
+              "Content-Type": "application/json"
+            },
+            "method": "POST",
+            "url": "http://127.0.0.1:11434/v1/chat/completions"
+          },
+          "response": {
+            "translated_text_path": "choices.0.message.content"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "ollama"
+    },
+    {
+      "family": "openai_compatible",
+      "id": "openai-compatible",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "api_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html",
+              "json_structured",
+              "serialized_php"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "request.body.model",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:openai-compatible"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "messages": [
+                  {
+                    "content": "You are a professional translator. Translate the following text from en to zh. Output only the translation.",
+                    "role": "system"
+                  },
+                  {
+                    "content": "Hello, world.",
+                    "role": "user"
+                  }
+                ],
+                "model": "gpt-4o-mini",
+                "temperature": 0.1
+              },
+              "headers": {
+                "Authorization": "Bearer YOUR_API_KEY",
+                "Content-Type": "application/json"
+              },
+              "method": "POST",
+              "url": "https://api.openai.com/v1/chat/completions"
+            },
+            "response": {
+              "choices": [
+                {
+                  "message": {
+                    "content": "你好，世界。"
+                  }
+                }
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "openai-compatible-chat-completions-v1",
+          "name": "OpenAI Chat Completions",
+          "request": {
+            "body": {
+              "messages": [
+                {
+                  "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+                  "role": "system"
+                },
+                {
+                  "content": "{{input.text}}",
+                  "role": "user"
+                }
+              ],
+              "model": "gpt-4o-mini",
+              "temperature": 0.1
+            },
+            "headers": {
+              "Authorization": "Bearer {{auth.api_key}}",
+              "Content-Type": "application/json"
+            },
+            "method": "POST",
+            "url": "https://api.openai.com/v1/chat/completions"
+          },
+          "response": {
+            "translated_text_path": "choices.0.message.content"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "openai"
+    },
+    {
+      "family": "http_mt",
+      "id": "tencent",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "secret_id",
+                "required": true
+              },
+              {
+                "name": "secret_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "response.translated_text_path",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:tencent"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "Source": "en",
+                "SourceText": "Hello, world.",
+                "Target": "zh"
+              },
+              "headers": {
+                "Content-Type": "application/json",
+                "X-TC-Action": "TextTranslate",
+                "X-TC-Region": "ap-guangzhou",
+                "X-TC-Version": "2018-03-21"
+              },
+              "method": "POST",
+              "url": "https://tmt.tencentcloudapi.com"
+            },
+            "response": {
+              "Response": {
+                "TargetText": "你好，世界。"
+              }
+            }
+          },
+          "forked_from": null,
+          "id": "tencent-cloud-translate-v3",
+          "name": "Tencent Cloud Translate (TC3)",
+          "request": {
+            "body": {
+              "Source": "{{input.source_lang}}",
+              "SourceText": "{{input.text}}",
+              "Target": "{{input.target_lang}}"
+            },
+            "headers": {
+              "Content-Type": "application/json",
+              "X-TC-Action": "TextTranslate",
+              "X-TC-Region": "ap-guangzhou",
+              "X-TC-Version": "2018-03-21"
+            },
+            "method": "POST",
+            "url": "https://tmt.tencentcloudapi.com"
+          },
+          "response": {
+            "translated_text_path": "Response.TargetText"
+          },
+          "sign": {
+            "algorithm": "tc3_hmac_sha256",
+            "service": "tmt"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "tencent"
+    },
+    {
+      "family": "http_mt",
+      "id": "volcengine",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "access_key",
+                "required": true
+              },
+              {
+                "name": "secret_key",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "response.translated_text_path",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:volcengine"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "SourceLanguage": "en",
+                "SourceText": "Hello, world.",
+                "TargetLanguage": "zh"
+              },
+              "headers": {
+                "Content-Type": "application/json"
+              },
+              "method": "POST",
+              "url": "https://translate.volcengineapi.com"
+            },
+            "response": {
+              "Translation": "你好，世界。"
+            }
+          },
+          "forked_from": null,
+          "id": "volcengine-translate-v1",
+          "name": "Volcengine Translate (SigV4 variant)",
+          "request": {
+            "body": {
+              "SourceLanguage": "{{input.source_lang}}",
+              "SourceText": "{{input.text}}",
+              "TargetLanguage": "{{input.target_lang}}"
+            },
+            "headers": {
+              "Content-Type": "application/json"
+            },
+            "method": "POST",
+            "url": "https://translate.volcengineapi.com"
+          },
+          "response": {
+            "translated_text_path": "Translation"
+          },
+          "sign": {
+            "algorithm": "volcengine_hmac_sha256",
+            "region": "cn-north-1",
+            "service": "translate"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "volcengine"
+    },
+    {
+      "family": "http_mt",
+      "id": "youdao",
+      "kind": "provider-template-pack",
+      "source": "official-repo",
+      "templates": [
+        {
+          "api_version": "1.0.0",
+          "auth": {
+            "fields": [
+              {
+                "name": "app_key",
+                "required": true
+              },
+              {
+                "name": "app_secret",
+                "required": true
+              }
+            ]
+          },
+          "constraints": {
+            "split_strategy": "paragraph",
+            "supported_content_formats": [
+              "plain_text",
+              "rich_html"
+            ]
+          },
+          "editable_params": [
+            {
+              "path": "request.url",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            },
+            {
+              "path": "response.translated_text_path",
+              "required": true,
+              "scope": "config",
+              "type": "string"
+            }
+          ],
+          "evidence": {
+            "cases": [
+              "dual-ui-catalog-112:catalog:youdao"
+            ],
+            "tier": "mock-verified",
+            "verified_at": "2026-09-12T00:00:00Z"
+          },
+          "examples": {
+            "request": {
+              "body": {
+                "appKey": "YOUR_APP_KEY",
+                "curtime": "1730000000",
+                "from": "en",
+                "q": "Hello, world.",
+                "salt": "1730000000",
+                "sign": "SAMPLE-SIGN",
+                "signType": "v3",
+                "to": "zh"
+              },
+              "headers": {
+                "Content-Type": "application/x-www-form-urlencoded"
+              },
+              "method": "POST",
+              "url": "https://openapi.youdao.com/api"
+            },
+            "response": {
+              "errorCode": "0",
+              "translation": [
+                "你好，世界。"
+              ]
+            }
+          },
+          "forked_from": null,
+          "id": "youdao-translate-v1",
+          "name": "Youdao Translate",
+          "request": {
+            "body": {
+              "appKey": "{{auth.app_key}}",
+              "curtime": "{{computed.curtime}}",
+              "from": "{{input.source_lang}}",
+              "q": "{{input.text}}",
+              "salt": "{{computed.salt}}",
+              "sign": "{{computed.sign}}",
+              "signType": "v3",
+              "to": "{{input.target_lang}}"
+            },
+            "body_type": "form",
+            "headers": {
+              "Content-Type": "application/x-www-form-urlencoded"
+            },
+            "method": "POST",
+            "url": "https://openapi.youdao.com/api"
+          },
+          "response": {
+            "error_path": "errorCode",
+            "translated_text_path": "translation.0"
+          },
+          "sign": {
+            "algorithm": "sha256",
+            "concat": [
+              "auth.app_key",
+              "computed.input_truncated",
+              "computed.salt",
+              "computed.curtime",
+              "auth.app_secret"
+            ],
+            "extra_computed": {
+              "curtime": "unix_timestamp",
+              "input_truncated": "youdao_truncate"
+            },
+            "salt_type": "uuid"
+          },
+          "type": "text",
+          "version": "1.0.0"
+        }
+      ],
+      "vendor_id": "youdao"
+    }
+  ]
+}

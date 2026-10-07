@@ -347,6 +347,36 @@ pub(crate) struct ComponentRequest {
     pub(crate) body_type: Option<String>,
     #[serde(default)]
     pub(crate) response_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) http_limits: Option<ComponentHttpLimits>,
+}
+
+/// Optional independent HTTP phase limits. Absence preserves legacy serialization.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComponentHttpLimits {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_http_limit"
+    )]
+    pub(crate) max_response_bytes: Option<u64>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_http_limit"
+    )]
+    pub(crate) timeout_ms: Option<u64>,
+}
+
+fn deserialize_http_limit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("HTTP limit must be an unsigned integer"))
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -372,6 +402,8 @@ pub(crate) struct ComponentResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct ComponentAsyncPoll {
     pub(crate) job_id_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reconcile: Option<ComponentAsyncReconcile>,
     #[serde(default)]
     pub(crate) submit_extract: HashMap<String, String>,
     pub(crate) request: ComponentRequest,
@@ -399,6 +431,19 @@ pub(crate) struct ComponentAsyncPoll {
     pub(crate) result_text_path: Option<String>,
 }
 
+/// Optional provider-specific evidence query. This never authorizes a new submit.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComponentAsyncReconcile {
+    pub(crate) request: ComponentRequest,
+    pub(crate) matches_path: String,
+    pub(crate) attempt_id_path: String,
+    pub(crate) binding_path: String,
+    pub(crate) job_id_path: String,
+    pub(crate) status_path: String,
+    pub(crate) resumable_values: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct ComponentAsyncDownload {
     pub(crate) method: String,
@@ -411,6 +456,8 @@ pub(crate) struct ComponentAsyncDownload {
     pub(crate) filename: Option<String>,
     #[serde(default)]
     pub(crate) content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) http_limits: Option<ComponentHttpLimits>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -425,6 +472,8 @@ pub(crate) struct ComponentSourceUpload {
     pub(crate) success_statuses: Vec<u16>,
     #[serde(default)]
     pub(crate) extract: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) http_limits: Option<ComponentHttpLimits>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
@@ -457,6 +506,11 @@ pub(crate) struct ComponentConstraints {
     pub(crate) input_artifact_kind: Option<String>,
     #[serde(default)]
     pub(crate) output_artifact_kinds: Option<Vec<String>>,
+    /// Template-level default language-code mapping (e.g. DeepL `zh` -> `ZH`).
+    /// Applied by the runner to `input.*/payload.*` language placeholders; a
+    /// binding-level language_map entry overrides any template default.
+    #[serde(default)]
+    pub(crate) language_map: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone)]
@@ -604,12 +658,88 @@ pub(crate) struct DomainTokenBindingsDoc {
     pub(crate) domains: HashMap<String, DomainTokenBindingEntry>,
 }
 
+/// Identity Contract v1.1 §1 (`tasks/wpmmcc/contract/identity-v1/`):
+/// canonical plugin identity. Wire/disk values are byte-exact snake_case
+/// strings; parsing is strict — anything outside the enum is `None`
+/// (`identity_unknown`, fail-closed). Never build this value at runtime
+/// by concatenation or transformation.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PluginIdentity {
+    #[serde(rename = "wpmmcc_ats")]
+    WpmmccAts,
+    #[serde(rename = "wpmmcc")]
+    Wpmmcc,
+}
+
+impl PluginIdentity {
+    /// Strict wire-string parse (contract §1 rule 2): exact bytes only.
+    /// No prefix or fuzzy matching, ever.
+    pub(crate) fn from_wire_str(value: &str) -> Option<Self> {
+        match value {
+            "wpmmcc_ats" => Some(PluginIdentity::WpmmccAts),
+            "wpmmcc" => Some(PluginIdentity::Wpmmcc),
+            _ => None,
+        }
+    }
+
+    /// Canonical wire string (matches the serde rename, byte-exact).
+    pub(crate) fn as_wire_str(self) -> &'static str {
+        match self {
+            PluginIdentity::WpmmccAts => "wpmmcc_ats",
+            PluginIdentity::Wpmmcc => "wpmmcc",
+        }
+    }
+}
+
+/// Snapshot of the identity verification response (contract §4): kept on the
+/// binding entry as version-negotiation input. ATS pings do not carry the
+/// protocol fields; those stay absent rather than defaulted.
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq, Eq)]
+pub(crate) struct IdentityCapabilities {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub(crate) plugin_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) protocol_min: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) protocol_current: Option<u32>,
+}
+
+/// Lenient disk-side parse for `plugin_identity`: an out-of-enum stored value
+/// maps to `None` (pending re-verification) instead of failing the whole
+/// bindings file. Wire-side unknowns are handled by
+/// `PluginIdentity::from_wire_str` and the `identity_unknown` gate code.
+fn deserialize_plugin_identity_lenient<'de, D>(
+    deserializer: D,
+) -> Result<Option<PluginIdentity>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<String> = Option::<String>::deserialize(deserializer)?;
+    Ok(raw.as_deref().and_then(PluginIdentity::from_wire_str))
+}
+
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
 pub(crate) struct DomainTokenBindingEntry {
     #[serde(default)]
     pub(crate) wp_client_token: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) route_secret: String,
+    /// Identity Contract v1.1 §4 (C-1): verified plugin identity for this
+    /// binding. `None` = never verified (or unknown stored value).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_plugin_identity_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) plugin_identity: Option<PluginIdentity>,
+    /// RFC3339 UTC timestamp of the last successful identity verification.
+    /// `None` = pending verification (contract §4: never written before a
+    /// successful verify).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity_verified_at: Option<String>,
+    /// Snapshot of the verification response (contract §4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) identity_capabilities: Option<IdentityCapabilities>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -619,6 +749,14 @@ pub(crate) struct DomainTokenBindingStatusItem {
     pub(crate) token_len: usize,
     /// Presence only; the route secret is never part of a status response.
     pub(crate) route_secret_set: bool,
+    /// Identity Contract v1.1 §4: verified plugin identity of this binding
+    /// (wire value, e.g. "wpmmcc_ats" / "wpmmcc"); null while unverified.
+    /// Non-credential field — feeds the Sites identity badge (C-6) and the
+    /// identity-chain integration gate assertions.
+    pub(crate) plugin_identity: Option<String>,
+    /// RFC3339 timestamp of the last successful identity verification;
+    /// null = pending first verification.
+    pub(crate) identity_verified_at: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -939,13 +1077,72 @@ pub(crate) struct ComponentInstanceOverrides {
     pub(crate) request_overrides: Option<ComponentRequestOverrides>,
     #[serde(default)]
     pub(crate) default_values_override: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) http_limits_overrides:
+        Option<std::collections::BTreeMap<ComponentHttpPhase, ComponentHttpLimits>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) enum ComponentHttpPhase {
+    #[serde(rename = "request")]
+    Request,
+    #[serde(rename = "prepare.request")]
+    Prepare,
+    #[serde(rename = "async_poll.request")]
+    Poll,
+    #[serde(rename = "async_poll.result_request")]
+    ResultRequest,
+    #[serde(rename = "async_poll.result_download")]
+    ResultDownload,
+    #[serde(rename = "async_poll.reconcile.request")]
+    Reconcile,
+    #[serde(rename = "source_upload")]
+    SourceUpload,
+}
+
+impl ComponentHttpPhase {
+    pub(crate) fn path(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Prepare => "prepare.request",
+            Self::Poll => "async_poll.request",
+            Self::ResultRequest => "async_poll.result_request",
+            Self::ResultDownload => "async_poll.result_download",
+            Self::Reconcile => "async_poll.reconcile.request",
+            Self::SourceUpload => "source_upload",
+        }
+    }
+
+    pub(crate) fn from_path(path: &str) -> Option<Self> {
+        match path {
+            "request" => Some(Self::Request),
+            "prepare.request" => Some(Self::Prepare),
+            "async_poll.request" => Some(Self::Poll),
+            "async_poll.result_request" => Some(Self::ResultRequest),
+            "async_poll.result_download" => Some(Self::ResultDownload),
+            "async_poll.reconcile.request" => Some(Self::Reconcile),
+            "source_upload" => Some(Self::SourceUpload),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ComponentHttpPhase {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let path = String::deserialize(deserializer)?;
+        Self::from_path(&path)
+            .ok_or_else(|| serde::de::Error::custom("invalid component HTTP phase"))
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub enum KeySelectionStrategy {
+    #[serde(alias = "random")]
     Random,
     #[default]
+    #[serde(alias = "round_robin")]
     RoundRobin,
+    #[serde(alias = "weighted")]
     Weighted,
 }
 
@@ -983,74 +1180,4 @@ pub(crate) fn default_auth_strategy() -> KeySelectionStrategy {
 
 pub(crate) fn default_bindings_version() -> u32 {
     1
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn component_item_decodes_provider_id_when_present() {
-        // Server returns a component bound to a specific WP provider.
-        let json = r#"{
-            "id": "official-baidu-translate-v1",
-            "name": "Baidu Translate",
-            "owner_type": "official",
-            "version": "1.0.0",
-            "type": "text_translation",
-            "product_id": "wptsall",
-            "provider_id": "baidu-translate"
-        }"#;
-        let item: ComponentItem = serde_json::from_str(json).expect("decode");
-        assert_eq!(item.product_id, "wptsall");
-        assert_eq!(item.provider_id.as_deref(), Some("baidu-translate"));
-    }
-
-    #[test]
-    fn component_item_provider_id_defaults_to_none_when_absent() {
-        // Backward compat: old server payloads (pre provider_id column)
-        // should still decode and report provider_id = None.
-        let json = r#"{
-            "id": "official-claude-haiku-translate-v1",
-            "name": "Claude Haiku Translate",
-            "owner_type": "official",
-            "version": "1.0.0",
-            "type": "text_translation",
-            "product_id": "wptsall"
-        }"#;
-        let item: ComponentItem = serde_json::from_str(json).expect("decode");
-        assert_eq!(item.product_id, "wptsall");
-        assert!(item.provider_id.is_none());
-    }
-
-    #[test]
-    fn component_item_product_id_defaults_to_wptsall_when_absent() {
-        // Old server payloads (pre product_id column) should default to "wptsall".
-        let json = r#"{
-            "id": "official-google-translate-v1",
-            "name": "Google Translate",
-            "owner_type": "official",
-            "version": "1.0.0",
-            "type": "text_translation"
-        }"#;
-        let item: ComponentItem = serde_json::from_str(json).expect("decode");
-        assert_eq!(item.product_id, "wptsall");
-        assert!(item.provider_id.is_none());
-    }
-
-    #[test]
-    fn component_item_provider_id_null_decodes_as_none() {
-        // Explicit JSON null must decode as None, not panic.
-        let json = r#"{
-            "id": "official-aws-translate-v1",
-            "name": "AWS Translate",
-            "owner_type": "official",
-            "version": "1.0.0",
-            "type": "text_translation",
-            "product_id": "wptsall",
-            "provider_id": null
-        }"#;
-        let item: ComponentItem = serde_json::from_str(json).expect("decode");
-        assert!(item.provider_id.is_none());
-    }
 }

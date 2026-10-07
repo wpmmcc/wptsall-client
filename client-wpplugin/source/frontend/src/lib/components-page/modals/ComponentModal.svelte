@@ -5,6 +5,7 @@
     OpenAiPreset,
   } from '../types';
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../../modal-a11y';
 
   export let open = false;
   export let editingComp: LocalComp | null = null;
@@ -24,12 +25,14 @@
 {#if open}
   <div
     class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-    role="button"
+    role="dialog"
+    aria-modal="true"
     tabindex="0"
     aria-label={$_('comp_modal.close_modal')}
     onclick={(e) => {
       if (e.target === e.currentTarget) onClose();
     }}
+    use:modalA11y={{ onClose }}
     onkeydown={(e) => handleBackdropKeydown(e, onClose)}>
     <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
       <h3 class="font-semibold text-gray-900 mb-4">
@@ -157,13 +160,16 @@
           </div>
         {:else}
           <label for={componentModalFieldId('template-id')} class="block text-xs text-gray-500 mb-1">
-            {$_('comp_modal.server_template_id')}
+            {$_('comp_modal.server_template_id')} <span class="text-red-500 font-bold">*</span>
           </label>
           <input
             id={componentModalFieldId('template-id')}
             bind:value={compForm.template_id}
             placeholder={$_('comp_modal.placeholder_template_id')}
-            class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" />
+            class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
+          <p class="text-[11px] text-gray-400 mt-0.5">
+            {$_('comp_modal.template_id_hint')}
+          </p>
           <div class="flex gap-2">
             <div class="flex-1">
               <label for={componentModalFieldId('vendor-id')} class="block text-xs text-gray-500 mb-1">

@@ -9,6 +9,12 @@ pub(crate) fn create_tables(conn: &Connection) -> Result<()> {
             value      TEXT NOT NULL DEFAULT ''
         );
 
+        CREATE TABLE IF NOT EXISTS retained_capacity (
+            unit_key       TEXT PRIMARY KEY NOT NULL,
+            reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes > 0),
+            created_at     INTEGER NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS task_queue_state (
             api_base_url    TEXT NOT NULL,
             task_id         INTEGER NOT NULL,
@@ -183,7 +189,75 @@ pub(crate) fn create_tables(conn: &Connection) -> Result<()> {
             created_at    INTEGER NOT NULL DEFAULT 0,
             status        TEXT NOT NULL DEFAULT 'pending',
             UNIQUE(domain, relation_id, object_type, object_id)
-        );",
+        );
+
+        -- GAP-04 (tasks/client/06 §2.4, 批 I 2026-09-23): async provider
+        -- jobs (video / document translation components with async_poll)
+        -- previously lived only on the runner's stack — a client restart
+        -- mid-poll orphaned the paid remote job and the WP write-back.
+        -- One row per resumable translation unit (field×chunk, per lane).
+        -- status 'polling' = resumable (skip re-submit, continue polling);
+        -- 'failed' rows are retained; boot inventory never age-deletes them.
+        -- ctx_json is a FULL context snapshot (auth + computed.*) so resume
+        -- is exact, not an equivalence assumption — the DB is already the
+        -- at-rest credential home (S3/SEC-02) and rows delete on closure.
+        CREATE TABLE IF NOT EXISTS async_jobs (
+            domain        TEXT NOT NULL,
+            relation_id   INTEGER NOT NULL,
+            object_type   TEXT NOT NULL DEFAULT 'post_type',
+            object_id     INTEGER NOT NULL,
+            field_name    TEXT NOT NULL DEFAULT '',
+            chunk_index   INTEGER NOT NULL DEFAULT 0,
+            lane          TEXT NOT NULL DEFAULT 'text',
+            component_id  TEXT NOT NULL DEFAULT '',
+            job_id        TEXT NOT NULL DEFAULT '',
+            ctx_json      TEXT NOT NULL DEFAULT '{}',
+            source_lang   TEXT NOT NULL DEFAULT '',
+            target_lang   TEXT NOT NULL DEFAULT '',
+            status        TEXT NOT NULL DEFAULT 'polling',
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            error         TEXT NOT NULL DEFAULT '',
+            created_at    INTEGER NOT NULL DEFAULT 0,
+            updated_at    INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (domain, relation_id, object_type, object_id, field_name, chunk_index, lane)
+        );
+        CREATE INDEX IF NOT EXISTS idx_aj_status_updated ON async_jobs(status, updated_at);
+
+        -- 批 R (P2P pair 状态机, tasks/5.3falsh2/12 冻结表销账): relay 泳道
+        -- 在途单元行级恢复。async_jobs 的恢复骑 WP outbox re-offer；relay
+        -- 的回调面是目标站 /sync/push，无 re-offer 机制——崩溃后在途单元
+        -- 只能靠本表恢复。每行 (pair_id, canonical_uuid) 一个单元：
+        -- phase 'shipping' = 可恢复（ctx_json = 已付费翻译快照 + 逐资产
+        -- 媒体 url 映射 + 包 action；relayed_json = 原 relayed packet——
+        -- 回执优先，仅证明零效果时重传原包）；ack/park 终态
+        -- 原子归档原证据后删活跃行；错误行保持 shipping（恢复跳过已付费阶
+        -- 段）；未解决的快照不按年龄删除。
+        CREATE TABLE IF NOT EXISTS sync_inflight (
+            pair_id        TEXT NOT NULL,
+            canonical_uuid TEXT NOT NULL,
+            phase          TEXT NOT NULL DEFAULT 'shipping',
+            ctx_json       TEXT NOT NULL DEFAULT '{}',
+            relayed_json   TEXT NOT NULL DEFAULT '',
+            attempts       INTEGER NOT NULL DEFAULT 0,
+            error          TEXT NOT NULL DEFAULT '',
+            created_at     INTEGER NOT NULL DEFAULT 0,
+            updated_at     INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (pair_id, canonical_uuid)
+        );
+        CREATE INDEX IF NOT EXISTS idx_si_phase_updated ON sync_inflight(phase, updated_at);
+        CREATE TABLE IF NOT EXISTS sync_delivery_archive (
+            evidence_key   TEXT PRIMARY KEY NOT NULL,
+            pair_id        TEXT NOT NULL,
+            canonical_uuid TEXT NOT NULL,
+            ctx_json       TEXT NOT NULL,
+            relayed_json   TEXT NOT NULL,
+            attempts       INTEGER NOT NULL,
+            error          TEXT NOT NULL,
+            created_at     INTEGER NOT NULL,
+            updated_at     INTEGER NOT NULL,
+            closed_at      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sda_pair_entity ON sync_delivery_archive(pair_id, canonical_uuid);",
     )?;
 
     // Idempotent schema upgrades for existing databases (columns added in later versions).

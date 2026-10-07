@@ -1,5 +1,6 @@
 <script lang="ts">
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../../modal-a11y';
   import type {
     AuthExtraPreset,
     OAuthFormState,
@@ -24,12 +25,14 @@
 {#if open}
   <div
     class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-    role="button"
+    role="dialog"
+    aria-modal="true"
     tabindex="0"
     aria-label={$_('oauth_modal.close_modal')}
     onclick={(e) => {
       if (e.target === e.currentTarget) onClose();
     }}
+    use:modalA11y={{ onClose }}
     onkeydown={(e) => handleBackdropKeydown(e, onClose)}>
     <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-lg max-h-[90vh] overflow-y-auto">
       <h3 class="font-semibold text-gray-900 mb-4">

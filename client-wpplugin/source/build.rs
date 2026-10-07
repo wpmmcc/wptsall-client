@@ -32,17 +32,24 @@ fn main() {
     };
     let frontend_dir = Path::new("frontend");
 
-    let run = |args: &[&str], hint: &str| {
-        match Command::new(npm).args(args).current_dir(frontend_dir).status() {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(format!("`npm {}` exited with {status}", args.join(" "))),
-            Err(_) => Err(format!("could not run `{npm}` {}", hint)),
-        }
+    let run = |args: &[&str], hint: &str| match Command::new(npm)
+        .args(args)
+        .current_dir(frontend_dir)
+        .status()
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("`npm {}` exited with {status}", args.join(" "))),
+        Err(_) => Err(format!("could not run `{npm}` {}", hint)),
     };
 
     // `npm ci` is the CI-equivalent, reproducible install; fall back to
     // `npm install` for throwaway checkouts without the lockfile workflow.
-    if run(&["ci", "--no-audit", "--no-fund"], "(is Node.js installed and on PATH?)").is_err() {
+    if run(
+        &["ci", "--no-audit", "--no-fund"],
+        "(is Node.js installed and on PATH?)",
+    )
+    .is_err()
+    {
         if run(&["install", "--no-audit", "--no-fund"], "").is_err() {
             panic!(
                 "frontend/dist/index.html is missing and the WebUI frontend could not be built.\n\

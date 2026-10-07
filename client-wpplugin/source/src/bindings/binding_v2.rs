@@ -1,7 +1,6 @@
 //! P1-D portable binding v2: semantic keys, migration, pack numeric-id guards.
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -323,13 +322,15 @@ fn ensure_site_entry<'a>(
 ) -> &'a mut SiteBindingEntry {
     let origin = normalize_domain_base(&site.site_origin);
     let key = site_key_from_origin(&origin);
-    site_bindings.entry(key).or_insert_with(|| SiteBindingEntry {
-        site_ref: SiteRef {
-            site_origin: origin,
-        },
-        relations: HashMap::new(),
-        rules: HashMap::new(),
-    })
+    site_bindings
+        .entry(key)
+        .or_insert_with(|| SiteBindingEntry {
+            site_ref: SiteRef {
+                site_origin: origin,
+            },
+            relations: HashMap::new(),
+            rules: HashMap::new(),
+        })
 }
 
 /// Migrate a v1 doc to v2 using discovery. Writes `*.v1.bak.*.json` next to `path` when provided.
@@ -359,14 +360,15 @@ pub(crate) fn migrate_rule_bindings_v1_to_v2(
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            let backup = path.with_extension(format!("v1.bak.{ts}.json"));
-            fs::copy(path, &backup).with_context(|| {
-                format!(
-                    "backup v1 rule bindings failed: {} -> {}",
-                    path.display(),
-                    backup.display()
-                )
-            })?;
+            let backup = path.with_extension(format!(
+                "v1.bak.{ts}.{}.json",
+                uuid::Uuid::new_v4().simple()
+            ));
+            let plain = super::crypto::load_encrypted_or_plain(path)
+                .context("read v1 rule bindings backup source failed")?;
+            let encrypted = super::crypto::encrypt_for_save(&plain)?;
+            super::atomic_file::install_new(&backup, &encrypted)
+                .context("save encrypted v1 rule bindings backup failed")?;
             backup.display().to_string()
         } else {
             String::new()
@@ -496,16 +498,7 @@ pub(crate) fn migrate_rule_bindings_v1_to_v2(
     if let Some(path) = path {
         let encoded =
             serde_json::to_string_pretty(&out).context("encode migrated rule bindings failed")?;
-        let tmp = path.with_extension("v2.tmp.json");
-        fs::write(&tmp, &encoded)
-            .with_context(|| format!("write migrated bindings temp failed: {}", tmp.display()))?;
-        fs::rename(&tmp, path).with_context(|| {
-            format!(
-                "atomic replace migrated bindings failed: {} -> {}",
-                tmp.display(),
-                path.display()
-            )
-        })?;
+        super::save_encrypted_file(path, &encoded)?;
     }
 
     let issue_count = out.migration_issues.len();
@@ -663,240 +656,5 @@ pub(crate) fn resolve_rule_bindings_with_context<'a>(
         outcome: BindingResolveOutcome::Unresolved,
         component_id: None,
         semantic_key: None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sample_relation() -> RelationRef {
-        RelationRef {
-            source_lang: "en_US".into(),
-            target_lang: "zh_CN".into(),
-            target_site_type: "virtual".into(),
-            template: "default".into(),
-        }
-    }
-
-    #[test]
-    fn relation_semantic_key_is_stable() {
-        let a = relation_semantic_key(&sample_relation());
-        let mut flipped = sample_relation();
-        flipped.source_lang = "EN_us".into();
-        let b = relation_semantic_key(&flipped);
-        assert_eq!(a, b);
-        assert!(a.starts_with("relation:"));
-    }
-
-    #[test]
-    fn component_semantic_key_includes_family_fields() {
-        let key = component_semantic_key(&ComponentSemanticRef {
-            vendor_id: "OpenAI".into(),
-            template_id: "openai-compatible-chat-completions-v1".into(),
-            kind: "text".into(),
-            version: "1.0.0".into(),
-        });
-        assert!(key.starts_with("component:"));
-    }
-
-    #[test]
-    fn migrate_unique_discovery_moves_numeric_into_site_bindings() {
-        let mut doc = RuleComponentBindingsDoc::default();
-        doc.version = 1;
-        doc.relation_bindings.insert(
-            "12".into(),
-            HashMap::from([("plain_text".into(), "comp-rel".into())]),
-        );
-        doc.rule_bindings.insert(
-            "128".into(),
-            HashMap::from([("plain_text".into(), "comp-rule".into())]),
-        );
-        doc.global_defaults
-            .insert("plain_text".into(), "comp-global".into());
-
-        let discovery = BindingDiscoveryIndex {
-            sites: vec![SiteDiscoveryIndex {
-                site_origin: "https://shop.example".into(),
-                relations: vec![DiscoveredRelationIdentity {
-                    legacy_id: 12,
-                    relation_ref: sample_relation(),
-                }],
-                rules: vec![DiscoveredRuleIdentity {
-                    legacy_id: 128,
-                    relation_legacy_id: Some(12),
-                    rule_ref: RuleRef {
-                        plugin_slug: "woocommerce".into(),
-                        name: "Product".into(),
-                        data_type: "post_type".into(),
-                        object_name: "product".into(),
-                        source_group: "content_objects".into(),
-                        routing_profile: "default".into(),
-                        delivery_target: "post".into(),
-                        content_format: "plain_text".into(),
-                    },
-                }],
-            }],
-        };
-
-        let (migrated, report) =
-            migrate_rule_bindings_v1_to_v2(None, &doc, &discovery).expect("migrate");
-        assert_eq!(migrated.version, 2);
-        assert!(migrated.relation_bindings.is_empty());
-        assert!(migrated.rule_bindings.is_empty());
-        assert_eq!(report.migrated_relations, 1);
-        assert_eq!(report.migrated_rules, 1);
-        assert_eq!(report.issue_count, 0);
-        assert_eq!(
-            migrated.global_defaults.get("plain_text").map(String::as_str),
-            Some("comp-global")
-        );
-        assert!(!migrated.site_bindings.is_empty());
-    }
-
-    #[test]
-    fn migrate_without_discovery_quarantines_numeric_entries() {
-        let mut doc = RuleComponentBindingsDoc::default();
-        doc.version = 1;
-        doc.relation_bindings.insert(
-            "12".into(),
-            HashMap::from([("plain_text".into(), "comp-rel".into())]),
-        );
-        let (migrated, report) =
-            migrate_rule_bindings_v1_to_v2(None, &doc, &BindingDiscoveryIndex::default())
-                .expect("migrate");
-        assert_eq!(migrated.version, 2);
-        assert_eq!(report.migrated_relations, 0);
-        assert_eq!(report.issue_count, 1);
-        assert_eq!(migrated.migration_issues[0].code, "unresolved_relation");
-    }
-
-    #[test]
-    fn public_pack_sanitizer_strips_numeric_maps() {
-        let mut doc = RuleComponentBindingsDoc::default();
-        doc.relation_bindings.insert(
-            "12".into(),
-            HashMap::from([("plain_text".into(), "comp".into())]),
-        );
-        doc.plugin_bindings.insert(
-            "woocommerce".into(),
-            HashMap::from([("plain_text".into(), "comp-woo".into())]),
-        );
-        let (sanitized, warnings) = sanitize_rule_bindings_for_public_pack(&doc);
-        assert!(sanitized.relation_bindings.is_empty());
-        assert!(sanitized.rule_bindings.is_empty());
-        assert!(sanitized.plugin_bindings.contains_key("woocommerce"));
-        assert!(!warnings.is_empty());
-        assert!(pack_has_cross_site_numeric_risk(&doc));
-        assert!(!pack_has_cross_site_numeric_risk(&sanitized));
-    }
-
-    #[test]
-    fn resolve_prefers_semantic_rule_over_plugin() {
-        let relation = sample_relation();
-        let rel_key = relation_semantic_key(&relation);
-        let rule_ref = RuleRef {
-            plugin_slug: "woocommerce".into(),
-            name: "Product".into(),
-            data_type: "post_type".into(),
-            object_name: "product".into(),
-            ..RuleRef::default()
-        };
-        let rule_key = rule_semantic_key(&rel_key, &rule_ref);
-        let site_origin = "https://shop.example";
-        let site_key = site_key_from_origin(site_origin);
-
-        let mut doc = RuleComponentBindingsDoc {
-            version: 2,
-            ..Default::default()
-        };
-        doc.plugin_bindings.insert(
-            "woocommerce".into(),
-            HashMap::from([("plain_text".into(), "comp-plugin".into())]),
-        );
-        let mut site = SiteBindingEntry {
-            site_ref: SiteRef {
-                site_origin: site_origin.into(),
-            },
-            ..Default::default()
-        };
-        site.rules.insert(
-            rule_key.clone(),
-            RuleBindingEntry {
-                semantic_key: rule_key.clone(),
-                relation_key: rel_key,
-                rule_ref,
-                legacy_id_hint: Some(128),
-                slots: HashMap::from([("plain_text".into(), "comp-rule".into())]),
-            },
-        );
-        doc.site_bindings.insert(site_key.clone(), site);
-
-        let result = resolve_rule_bindings_with_context(
-            &doc,
-            &BindingResolveContext {
-                site_key: Some(&site_key),
-                rule_semantic_key: Some(&rule_key),
-                plugin_slug: Some("woocommerce"),
-                task_type: "text",
-                content_format: Some("plain_text"),
-                allow_legacy_numeric: false,
-                ..Default::default()
-            },
-        );
-        assert_eq!(result.outcome, BindingResolveOutcome::ResolvedRule);
-        assert_eq!(result.component_id, Some("comp-rule"));
-    }
-
-    #[test]
-    fn resolve_does_not_use_foreign_site_legacy_hint() {
-        let site_a = site_key_from_origin("https://a.example");
-        let site_b = site_key_from_origin("https://b.example");
-        let mut doc = RuleComponentBindingsDoc {
-            version: 2,
-            ..Default::default()
-        };
-        let mut site = SiteBindingEntry::default();
-        site.relations.insert(
-            "relation:deadbeef".into(),
-            RelationBindingEntry {
-                semantic_key: "relation:deadbeef".into(),
-                relation_ref: sample_relation(),
-                legacy_id_hint: Some(12),
-                slots: HashMap::from([("plain_text".into(), "comp-a".into())]),
-            },
-        );
-        doc.site_bindings.insert(site_a, site);
-
-        let result = resolve_rule_bindings_with_context(
-            &doc,
-            &BindingResolveContext {
-                site_key: Some(&site_b),
-                relation_id: Some(12),
-                task_type: "text",
-                content_format: Some("plain_text"),
-                allow_legacy_numeric: true,
-                ..Default::default()
-            },
-        );
-        assert_eq!(result.outcome, BindingResolveOutcome::Unresolved);
-        assert!(result.component_id.is_none());
-    }
-
-    #[test]
-    fn strip_numeric_on_import_removes_cross_site_ids() {
-        let mut doc = RuleComponentBindingsDoc::default();
-        doc.relation_bindings.insert(
-            "99".into(),
-            HashMap::from([("plain_text".into(), "x".into())]),
-        );
-        doc.plugin_bindings.insert(
-            "acf".into(),
-            HashMap::from([("plain_text".into(), "y".into())]),
-        );
-        let skipped = strip_numeric_maps_on_import(&mut doc);
-        assert_eq!(skipped, vec!["relation:99".to_string()]);
-        assert!(doc.relation_bindings.is_empty());
-        assert!(doc.plugin_bindings.contains_key("acf"));
     }
 }

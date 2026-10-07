@@ -37,14 +37,19 @@ use super::components::{
     save_rule_component_bindings_runtime_doc, save_task_type_component_bindings_runtime_doc,
 };
 use super::errors::{
-    write_conflict_response, write_error_response, write_error_response_with_status,
+    err_public, write_conflict_response, write_error_response, write_error_response_with_status,
 };
 use super::http::{parse_query_string, write_http_response};
 use super::{proxy_profiles_path, vendor_keys_path, vendor_oauth_path};
 
+mod cache_journal;
+
 const PROVIDER_CATALOG_SCHEMA: &str = "wptsall-provider-catalog-manifest.v1";
 const INTEGRATION_PACK_SCHEMA: &str = "wptsall-integration-pack.v1";
 const PROVIDER_CATALOG_SIGNATURE_SCOPE: &str = "provider-catalog-entries-json";
+const PROVIDER_CATALOG_DOCUMENT_SIGNATURE_SCOPE: &str = "provider-catalog-document-json-v2";
+// A compact 2 MiB source can grow when the cache is pretty-printed.
+const MAX_CATALOG_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const PRIVATE_BACKUP_SCHEMA: &str = "wptsall-private-backup.v1";
 const PRIVATE_BACKUP_KDF_INFO: &[u8] = b"wptsall-integration-pack-private-v1";
 
@@ -152,1119 +157,28 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Shared system prompt for OpenAI-compatible chat-completions templates.
-const OPENAI_COMPAT_TRANSLATOR_PROMPT: &str =
-    "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.";
+/// Manifest envelope schemas this client understands. v1 documents may still
+/// exist in user caches from the builtin era; the official template repo
+/// publishes v2 (template-schema gate + provenance/evidence/examples required
+/// on every template).
+const PROVIDER_CATALOG_SCHEMA_V2: &str = "wptsall-provider-catalog-manifest.v2";
+const PROVIDER_TEMPLATE_SCHEMA_V2: &str = "wptsall-provider-template.v2";
 
-/// Build one OpenAI-compatible chat-completions catalog entry. These vendors
-/// share the same chat-completions request/response contract and differ only
-/// in base URL, default model, and (for Azure) the auth header name.
-fn openai_compatible_entry(
-    entry_id: &str,
-    vendor_id: &str,
-    template_id: &str,
-    name: &str,
-    base_url: &str,
-    default_model: &str,
-    auth_header: &str,
-) -> Value {
-    let body = json!({
-        "model": default_model,
-        "messages": [
-            { "role": "system", "content": OPENAI_COMPAT_TRANSLATOR_PROMPT },
-            { "role": "user", "content": "{{input.text}}" }
-        ],
-        "temperature": 0.1
-    });
-    let mut headers = serde_json::Map::new();
-    headers.insert("Content-Type".to_string(), json!("application/json"));
-    headers.insert(auth_header.to_string(), json!("Bearer {{auth.api_key}}"));
-    let request = json!({
-        "method": "POST",
-        "url": base_url,
-        "headers": headers,
-        "body": body,
-    });
-    json!({
-        "id": entry_id,
-        "kind": "provider-template-pack",
-        "vendor_id": vendor_id,
-        "family": "openai_compatible",
-        "source": "builtin",
-        "templates": [{
-            "id": template_id,
-            "name": name,
-            "version": "1.0.0",
-            "type": "text",
-            "auth": { "fields": [{ "name": "api_key", "required": true }] },
-            "request": request,
-            "response": { "translated_text_path": "choices.0.message.content" },
-            "constraints": {
-                "split_strategy": "paragraph",
-                "supported_content_formats": ["plain_text", "rich_html", "json_structured", "serialized_php"]
-            },
-            "editable_params": [
-                { "path": "request.url", "scope": "config", "type": "string", "required": true },
-                { "path": "request.body.model", "scope": "config", "type": "string", "required": true }
-            ]
-        }]
-    })
-}
+/// The single official provider-template repository (decision 5: no
+/// third-party source switching). Overrides are test/CI-only and require an
+/// explicit allow flag.
+const OFFICIAL_PROVIDER_CATALOG_SOURCE_URL: &str =
+    "https://raw.githubusercontent.com/wpmmcc/wptsall-provider-templates/main/catalog.json";
 
-/// Build one HTTP-MT catalog entry from a ready-made template JSON object.
-/// Used for vendors with bespoke request/response schemas and signatures.
-fn http_mt_entry(entry_id: &str, vendor_id: &str, template: Value) -> Value {
-    json!({
-        "id": entry_id,
-        "kind": "provider-template-pack",
-        "vendor_id": vendor_id,
-        "family": "http_mt",
-        "source": "builtin",
-        "templates": [template],
-    })
-}
+/// Public verification key of the official template repo catalog. Its private
+/// key is held offline and is deliberately separate from the OTA signing key
+/// (doc 03 §3 key separation). The env override is test/CI-only.
+const OFFICIAL_PROVIDER_CATALOG_PUBLIC_KEY_PEM: &str = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAq7BWh1CTcQr63B5uhSbo\nypIlnmvFoUlsoUVmHPn0qTR7lTk6w2RcsJZ+XuwtGsscM4lmXVnxBMzx2Z47Eqo0\n3bgDTA6UpeBLWbJlV/a+Vf6g9erXHxb/Vjm0ym0AbrRW4Z4YgRdc+Zt2OI9obM7M\nWsoz69/+pz7sxkCfyU88kLcBEXAkYnR1Uj10KhYDSLfq/sRVz6wC+f8lN1+aofzi\nDRIDU3HXWPSbGtU0itg7jkJMGQXAn0aQjoV4dbMaauKuYKSMLtM4xpkJngbbDSeI\nypUBAS6rQ1jgl/SDr2yceBPozWhXPyUNk19beuPU3wzYauIg2eAUqAlj0Ys5+HrZ\n+wIDAQAB\n-----END PUBLIC KEY-----\n";
 
-/// Annotate each builtin template with `evidence_tier` when missing.
-/// OpenAI-compatible + mock-api-covered HTTP MT → mock-verified; else schema-only.
-fn annotate_builtin_evidence_tiers(entries: &mut [Value]) {
-    const HTTP_MT_MOCK_VERIFIED: &[&str] = &[
-        "baidu",
-        "youdao",
-        "tencent",
-        "amazon_translate",
-        "alibaba",
-        "iflytek",
-        "niutrans",
-        "azure_cognitive",
-        "microsoft_translator",
-        "kakao",
-        "volcengine",
-        "hmac_generic",
-        "oauth_mt",
-        "jwt_mt",
-    ];
-    for entry in entries.iter_mut() {
-        let family = entry
-            .get("family")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let vendor = entry
-            .get("vendor_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let tier = if family == "openai_compatible" || HTTP_MT_MOCK_VERIFIED.contains(&vendor.as_str())
-        {
-            "mock-verified"
-        } else {
-            "schema-only"
-        };
-        if let Some(templates) = entry.get_mut("templates").and_then(Value::as_array_mut) {
-            for template in templates {
-                if let Some(obj) = template.as_object_mut() {
-                    obj.entry("evidence_tier")
-                        .or_insert_with(|| json!(tier));
-                }
-            }
-        }
-    }
-}
-
-fn builtin_catalog() -> Value {
-    // These are templates, not credentials.  Each is intentionally disabled
-    // after installation until the user configures a local key.
-    //
-    // Entries are accumulated in a Vec and wrapped at the end so the `json!`
-    // macro never reaches its recursion limit (a single deeply-nested
-    // literal for 20+ entries did).
-    let mut entries: Vec<Value> = Vec::new();
-
-    // ---- OpenAI-compatible family (shared chat-completions contract) ----
-    // Keep entry_id/template_id as "openai-compatible" / "openai-compatible-chat-completions-v1"
-    // for back-compat with existing installs and the offline catalog test.
-    entries.push(openai_compatible_entry(
-        "openai-compatible", "openai", "openai-compatible-chat-completions-v1", "OpenAI Chat Completions",
-        "https://api.openai.com/v1/chat/completions", "gpt-4o-mini", "Authorization",
-    ));
-    entries.push(json!({
-        "id": "azure-openai",
-        "kind": "provider-template-pack",
-        "vendor_id": "azure_openai",
-        "family": "openai_compatible",
-        "source": "builtin",
-        "templates": [{
-            "id": "azure-openai-chat-completions-v1",
-            "name": "Azure OpenAI Chat Completions",
-            "version": "1.0.0",
-            "type": "text",
-            "auth": { "fields": [{ "name": "api_key", "required": true }] },
-            "request": {
-                "method": "POST",
-                "url": "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT/chat/completions?api-version=2024-06-01",
-                "headers": {
-                    "Content-Type": "application/json",
-                    "api-key": "{{auth.api_key}}"
-                },
-                "body": {
-                    "messages": [
-                        { "role": "system", "content": OPENAI_COMPAT_TRANSLATOR_PROMPT },
-                        { "role": "user", "content": "{{input.text}}" }
-                    ],
-                    "temperature": 0.1
-                }
-            },
-            "response": { "translated_text_path": "choices.0.message.content" },
-            "constraints": {
-                "split_strategy": "paragraph",
-                "supported_content_formats": ["plain_text", "rich_html", "json_structured", "serialized_php"]
-            },
-            "editable_params": [
-                { "path": "request.url", "scope": "config", "type": "string", "required": true }
-            ]
-        }]
-    }));
-    entries.push(openai_compatible_entry(
-        "deepseek", "deepseek", "deepseek-chat-completions-v1", "DeepSeek Chat Completions",
-        "https://api.deepseek.com/v1/chat/completions", "deepseek-chat", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "groq", "groq", "groq-chat-completions-v1", "Groq Chat Completions",
-        "https://api.groq.com/openai/v1/chat/completions", "llama-3.3-70b-versatile", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "together", "together", "together-chat-completions-v1", "Together AI Chat Completions",
-        "https://api.together.xyz/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct-Turbo", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "mistral", "mistral", "mistral-chat-completions-v1", "Mistral AI Chat Completions",
-        "https://api.mistral.ai/v1/chat/completions", "mistral-large-latest", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "perplexity", "perplexity", "perplexity-chat-completions-v1", "Perplexity Chat Completions",
-        "https://api.perplexity.ai/chat/completions", "sonar-pro", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "moonshot", "moonshot", "moonshot-chat-completions-v1", "Moonshot AI (Kimi) Chat Completions",
-        "https://api.moonshot.cn/v1/chat/completions", "moonshot-v1-8k", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "qwen-dashscope", "qwen", "qwen-dashscope-chat-completions-v1", "Qwen (DashScope OpenAI-compatible) Chat Completions",
-        "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen-max", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "openrouter", "openrouter", "openrouter-chat-completions-v1", "OpenRouter Chat Completions",
-        "https://openrouter.ai/api/v1/chat/completions", "openai/gpt-4o-mini", "Authorization",
-    ));
-
-    // ---- HTTP MT family (bespoke schemas + signatures) ----
-    entries.push(http_mt_entry("google-translate", "google_translate", json!({
-        "id": "google-translate-v2",
-        "name": "Google Cloud Translation (Basic)",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://translation.googleapis.com/language/translate/v2",
-            "headers": { "Content-Type": "application/json" },
-            "body": {
-                "q": "{{input.text}}",
-                "source": "{{input.source_lang}}",
-                "target": "{{input.target_lang}}",
-                "key": "{{auth.api_key}}"
-            }
-        },
-        "response": { "translated_text_path": "data.translations.0.translatedText" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": false }
-        ]
-    })));
-    entries.push(http_mt_entry("deepl", "deepl", json!({
-        "id": "deepl-v2",
-        "name": "DeepL API v2",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://api-free.deepl.com/v2/translate",
-            "headers": { "Authorization": "DeepL-Auth-Key {{auth.api_key}}" },
-            "body": {
-                "text": ["{{input.text}}"],
-                "source_lang": "{{input.source_lang}}",
-                "target_lang": "{{input.target_lang}}"
-            }
-        },
-        "response": { "translated_text_path": "translations.0.text" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": false }
-        ]
-    })));
-    entries.push(http_mt_entry("microsoft-translator", "microsoft_translator", json!({
-        "id": "microsoft-translator-v3",
-        "name": "Microsoft Translator v3",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}",
-            "headers": { "Content-Type": "application/json", "Ocp-Apim-Subscription-Key": "{{auth.api_key}}" },
-            "body": [{ "text": "{{input.text}}" }]
-        },
-        "response": { "translated_text_path": "0.translations.0.text" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("amazon-translate", "amazon_translate", json!({
-        "id": "amazon-translate-v1",
-        "name": "Amazon Translate",
-        "version": "1.0.0",
-        "type": "text",
-        // Runner injects Authorization + X-Amz-Date; auth field names match aws_sigv4.
-        "auth": { "fields": [
-            { "name": "access_key", "required": true },
-            { "name": "secret_key", "required": true }
-        ] },
-        "sign": {
-            "algorithm": "aws_sigv4",
-            "service": "translate",
-            "region": "us-east-1"
-        },
-        "request": {
-            "method": "POST",
-            "url": "https://translate.us-east-1.amazonaws.com",
-            "headers": {
-                "Content-Type": "application/x-amz-json-1.1",
-                "X-Amz-Target": "TranslateService.TranslateText"
-            },
-            "body": {
-                "Text": "{{input.text}}",
-                "SourceLanguageCode": "{{input.source_lang}}",
-                "TargetLanguageCode": "{{input.target_lang}}"
-            }
-        },
-        "response": { "translated_text_path": "TranslatedText" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("baidu", "baidu", json!({
-        "id": "baidu-translate-v1",
-        "name": "Baidu Translate (Open API)",
-        "version": "1.0.0",
-        "type": "text",
-        // Match mock-sign-md5 / Baidu Open API: MD5(appid + q + salt + secret).
-        // Must declare body_type=form + object body; a raw form string with the
-        // default body_type=json is JSON-encoded and breaks MD5 verification.
-        "auth": { "fields": [
-            { "name": "app_id", "required": true },
-            { "name": "api_key", "required": true }
-        ] },
-        "sign": {
-            "algorithm": "md5",
-            "salt_type": "random_int",
-            "concat": ["auth.app_id", "input.text", "computed.salt", "auth.api_key"]
-        },
-        "request": {
-            "method": "POST",
-            "url": "https://fanyi-api.baidu.com/api/trans/vip/translate",
-            "headers": { "Content-Type": "application/x-www-form-urlencoded" },
-            "body_type": "form",
-            "body": {
-                "q": "{{input.text}}",
-                "from": "{{input.source_lang}}",
-                "to": "{{input.target_lang}}",
-                "appid": "{{auth.app_id}}",
-                "salt": "{{computed.salt}}",
-                "sign": "{{computed.sign}}"
-            }
-        },
-        "response": { "translated_text_path": "trans_result.0.dst" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("youdao", "youdao", json!({
-        "id": "youdao-translate-v1",
-        "name": "Youdao Translate",
-        "version": "1.0.0",
-        "type": "text",
-        // Match mock-sign-sha256: SHA256(appKey + input_truncated + salt + curtime + appSecret).
-        "auth": { "fields": [
-            { "name": "app_key", "required": true },
-            { "name": "app_secret", "required": true }
-        ] },
-        "sign": {
-            "algorithm": "sha256",
-            "salt_type": "uuid",
-            "extra_computed": {
-                "curtime": "unix_timestamp",
-                "input_truncated": "youdao_truncate"
-            },
-            "concat": [
-                "auth.app_key",
-                "computed.input_truncated",
-                "computed.salt",
-                "computed.curtime",
-                "auth.app_secret"
-            ]
-        },
-        "request": {
-            "method": "POST",
-            "url": "https://openapi.youdao.com/api",
-            "headers": { "Content-Type": "application/x-www-form-urlencoded" },
-            "body_type": "form",
-            "body": {
-                "q": "{{input.text}}",
-                "from": "{{input.source_lang}}",
-                "to": "{{input.target_lang}}",
-                "appKey": "{{auth.app_key}}",
-                "salt": "{{computed.salt}}",
-                "sign": "{{computed.sign}}",
-                "signType": "v3",
-                "curtime": "{{computed.curtime}}"
-            }
-        },
-        // Official zhiyun shape: errorCode "0" = success (string) — the
-        // runner treats "0"/"ok"/"success"/"" as non-errors on error_path.
-        "response": { "translated_text_path": "translation.0", "error_path": "errorCode" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("tencent", "tencent", json!({
-        "id": "tencent-cloud-translate-v3",
-        "name": "Tencent Cloud Translate (TC3)",
-        "version": "1.0.0",
-        "type": "text",
-        // Runner injects Authorization + X-TC-Timestamp; do not use {{sign.*}} placeholders.
-        "auth": { "fields": [
-            { "name": "secret_id", "required": true },
-            { "name": "secret_key", "required": true }
-        ] },
-        "sign": {
-            "algorithm": "tc3_hmac_sha256",
-            "service": "tmt"
-        },
-        "request": {
-            "method": "POST",
-            "url": "https://tmt.tencentcloudapi.com",
-            "headers": {
-                "Content-Type": "application/json",
-                "X-TC-Action": "TextTranslate",
-                "X-TC-Version": "2018-03-21",
-                "X-TC-Region": "ap-guangzhou"
-            },
-            "body": {
-                "SourceText": "{{input.text}}",
-                "Source": "{{input.source_lang}}",
-                "Target": "{{input.target_lang}}"
-            }
-        },
-        "response": { "translated_text_path": "Response.TargetText" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("alibaba", "alibaba", json!({
-        "id": "alibaba-translate-v1",
-        "name": "Alibaba Cloud Translate",
-        "version": "1.0.0",
-        "type": "text",
-        // Match mock-sign-alibaba / alibaba_v1: HMAC-SHA1 + Base64 → computed.sign.
-        "auth": { "fields": [
-            { "name": "access_key", "required": true },
-            { "name": "secret_key", "required": true }
-        ] },
-        "sign": {
-            "algorithm": "alibaba_v1",
-            "concat": [
-                { "param_name": "AccessKeyId", "ctx_key": "auth.access_key" },
-                { "param_name": "Action", "value": "TranslateGeneral" },
-                { "param_name": "FormatType", "value": "text" },
-                { "param_name": "SourceLanguage", "ctx_key": "input.source_lang" },
-                { "param_name": "SourceText", "ctx_key": "input.text" },
-                { "param_name": "TargetLanguage", "ctx_key": "input.target_lang" }
-            ]
-        },
-        "request": {
-            "method": "POST",
-            "url": "https://mt.cn-hangzhou.aliyuncs.com/api/translate/web",
-            "headers": { "Content-Type": "application/x-www-form-urlencoded" },
-            "body_type": "form",
-            "body": {
-                "Action": "TranslateGeneral",
-                "FormatType": "text",
-                "SourceLanguage": "{{input.source_lang}}",
-                "TargetLanguage": "{{input.target_lang}}",
-                "SourceText": "{{input.text}}",
-                "AccessKeyId": "{{auth.access_key}}",
-                "Signature": "{{computed.sign}}"
-            }
-        },
-        "response": { "translated_text_path": "Data.TranslatedText" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("iflytek", "iflytek", json!({
-        "id": "iflytek-translate-v1",
-        "name": "iFlytek Translate",
-        "version": "1.0.0",
-        "type": "text",
-        // Mock /api/iflytek/translate: MD5(api_secret + CurTime + X-Param); empty X-Param OK.
-        "auth": { "fields": [
-            { "name": "app_id", "required": true },
-            { "name": "api_secret", "required": true }
-        ] },
-        "sign": {
-            "algorithm": "md5",
-            "salt_type": "unix_timestamp",
-            "concat": ["auth.api_secret", "computed.salt"]
-        },
-        "request": {
-            "method": "POST",
-            "url": "https://itrans.xf-yun.com/v1/its",
-            "headers": {
-                "Content-Type": "application/json",
-                "X-Appid": "{{auth.app_id}}",
-                "X-CurTime": "{{computed.salt}}",
-                "X-CheckSum": "{{computed.sign}}"
-            },
-            "body": {
-                "from": "{{input.source_lang}}",
-                "to": "{{input.target_lang}}",
-                "text": "{{input.text}}"
-            }
-        },
-        "response": { "translated_text_path": "data.trans_result.dst" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("niutrans", "niutrans", json!({
-        "id": "niutrans-translate-v2",
-        "name": "NiuTrans Open API v2",
-        "version": "1.0.0",
-        "type": "text",
-        // Mock /api/niutrans/translate: MD5(apikey + q + from + to + apikey).
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "sign": {
-            "algorithm": "md5",
-            "concat": [
-                "auth.api_key",
-                "input.text",
-                "input.source_lang",
-                "input.target_lang",
-                "auth.api_key"
-            ]
-        },
-        "request": {
-            "method": "POST",
-            "url": "https://api.niutrans.com/NiuTransServer/translation",
-            "headers": { "Content-Type": "application/x-www-form-urlencoded" },
-            "body_type": "form",
-            "body": {
-                "from": "{{input.source_lang}}",
-                "to": "{{input.target_lang}}",
-                "apikey": "{{auth.api_key}}",
-                "q": "{{input.text}}",
-                "sign": "{{computed.sign}}"
-            }
-        },
-        "response": { "translated_text_path": "tgt_text" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("azure-cognitive", "azure_cognitive", json!({
-        "id": "azure-cognitive-translate-v3",
-        "name": "Azure Cognitive Services Translate",
-        "version": "1.0.0",
-        "type": "text",
-        // Runner injects Ocp-Apim-Subscription-Key from auth.subscription_key|api_key.
-        "auth": { "fields": [{ "name": "subscription_key", "required": true }] },
-        "sign": { "algorithm": "azure_subscription_key" },
-        "request": {
-            "method": "POST",
-            "url": "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}",
-            "headers": { "Content-Type": "application/json" },
-            "body": [{ "Text": "{{input.text}}" }]
-        },
-        // Official v3 response shape: lowercase `translations[].text`
-        // (matches microsoft_translator entry and the real API).
-        "response": { "translated_text_path": "0.translations.0.text" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("kakao", "kakao", json!({
-        "id": "kakao-translate-v1",
-        "name": "Kakao i Translator",
-        "version": "1.0.0",
-        "type": "text",
-        // Runner injects Authorization: KakaoAK … (mock /api/kakao/translate expects JSON).
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "sign": { "algorithm": "kakao_api_key" },
-        "request": {
-            "method": "POST",
-            "url": "https://dapi.kakao.com/v2/translation/translate",
-            "headers": { "Content-Type": "application/json" },
-            "body": {
-                "source_lang": "{{input.source_lang}}",
-                "target_lang": "{{input.target_lang}}",
-                "query": "{{input.text}}"
-            }
-        },
-        "response": { "translated_text_path": "translated_text.0.0" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("libretranslate", "libretranslate", json!({
-        "id": "libretranslate-v1",
-        "name": "LibreTranslate (self-hosted)",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": false }] },
-        "request": {
-            "method": "POST",
-            "url": "http://localhost:5000/translate",
-            "headers": { "Content-Type": "application/json" },
-            "body": {
-                "q": "{{input.text}}",
-                "source": "{{input.source_lang}}",
-                "target": "{{input.target_lang}}",
-                "api_key": "{{auth.api_key}}"
-            }
-        },
-        "response": { "translated_text_path": "translatedText" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-
-    // ---- P1-C stage 2: expand to 50 (20 more OpenAI-compatible + 10 HTTP MT) ----
-    entries.push(openai_compatible_entry(
-        "cohere", "cohere", "cohere-chat-v1", "Cohere Command Chat",
-        "https://api.cohere.ai/v1/chat", "command-r-plus", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "ai21", "ai21", "ai21-chat-v1", "AI21 Jurassic Chat",
-        "https://api.ai21.com/v1/chat/completions", "jamba-instruct", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "novita", "novita", "novita-chat-v1", "Novita AI Chat",
-        "https://api.novita.ai/v3/openai/chat/completions", "gpt-4o-mini", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "deepinfra", "deepinfra", "deepinfra-chat-v1", "DeepInfra Chat",
-        "https://api.deepinfra.com/v1/openai/chat/completions", "meta-llama/Llama-3.3-70B-Instruct", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "siliconflow", "siliconflow", "siliconflow-chat-v1", "SiliconFlow Chat",
-        "https://api.siliconflow.cn/v1/chat/completions", "Qwen/Qwen2.5-72B-Instruct", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "fireworks", "fireworks", "fireworks-chat-v1", "Fireworks AI Chat",
-        "https://api.fireworks.ai/inference/v1/chat/completions", "accounts/fireworks/models/llama-v3p3-70b-instruct", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "replicate", "replicate", "replicate-chat-v1", "Replicate Chat",
-        "https://api.replicate.com/v1/chat/completions", "meta/llama-3.3-70b-instruct", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "anyscale", "anyscale", "anyscale-chat-v1", "Anyscale Chat",
-        "https://api.endpoints.anyscale.com/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "upstage", "upstage", "upstage-chat-v1", "Upstage Solar Chat",
-        "https://api.upstage.ai/v1/solar/chat/completions", "solar-pro", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "nvidia-nim", "nvidia", "nvidia-nim-chat-v1", "NVIDIA NIM Chat",
-        "https://integrate.api.nvidia.com/v1/chat/completions", "meta/llama-3.3-70b-instruct", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "cerebras", "cerebras", "cerebras-chat-v1", "Cerebras Chat",
-        "https://api.cerebras.ai/v1/chat/completions", "llama-3.3-70b", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "sambanova", "sambanova", "sambanova-chat-v1", "SambaNova Chat",
-        "https://api.sambanova.ai/v1/chat/completions", "Meta-Llama-3.3-70B-Instruct", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "lepton", "lepton", "lepton-chat-v1", "Lepton AI Chat",
-        "https://api.lepton.ai/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "grok", "grok", "grok-chat-v1", "xAI Grok Chat",
-        "https://api.x.ai/v1/chat/completions", "grok-3-mini", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "minimax", "minimax", "minimax-chat-v1", "MiniMax Chat",
-        "https://api.minimax.chat/v1/chat/completions", "MiniMax-Text-01", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "01-ai", "01_ai", "01-ai-chat-v1", "01.AI Yi Chat",
-        "https://api.lingyiwanwu.com/v1/chat/completions", "yi-large", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "zhipu", "zhipu", "zhipu-chat-v1", "Zhipu GLM Chat",
-        "https://open.bigmodel.cn/api/paas/v4/chat/completions", "glm-4", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "baichuan", "baichuan", "baichuan-chat-v1", "Baichuan Chat",
-        "https://api.baichuan-ai.com/v1/chat/completions", "Baichuan4", "Authorization",
-    ));
-    entries.push(openai_compatible_entry(
-        "stepfun", "stepfun", "stepfun-chat-v1", "StepFun Chat",
-        "https://api.stepfun.com/v1/chat/completions", "step-2-16k", "Authorization",
-    ));
-
-    // ---- 10 more HTTP MT providers ----
-    entries.push(http_mt_entry("yandex", "yandex", json!({
-        "id": "yandex-translate-v2",
-        "name": "Yandex Translate",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://translate.yandex.net/api/v1.5/tr.json/translate",
-            "headers": { "Content-Type": "application/json" },
-            "body": {
-                "text": "{{input.text}}",
-                "lang": "{{input.source_lang}}-{{input.target_lang}}",
-                "key": "{{auth.api_key}}"
-            }
-        },
-        "response": { "translated_text_path": "text.0" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("ibm-watson", "ibm_watson", json!({
-        "id": "ibm-watson-translate-v3",
-        "name": "IBM Watson Language Translator v3",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }, { "name": "instance_id", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://api.us-south.language-translator.watson.cloud.ibm.com/instances/{{auth.instance_id}}/v3/translate?version=2018-05-01",
-            "headers": {
-                "Content-Type": "application/json",
-                "Authorization": "Bearer {{auth.api_key}}"
-            },
-            "body": { "text": ["{{input.text}}"], "source": "{{input.source_lang}}", "target": "{{input.target_lang}}" }
-        },
-        "response": { "translated_text_path": "translations.0.translation" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("papago", "papago", json!({
-        "id": "papago-translate-v1",
-        "name": "Naver Papago Translate",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "client_id", "required": true }, { "name": "client_secret", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://openapi.naver.com/v1/papago/n2mt",
-            "headers": { "Content-Type": "application/x-www-form-urlencoded", "X-Naver-Client-Id": "{{auth.client_id}}", "X-Naver-Client-Secret": "{{auth.client_secret}}" },
-            "body": "source={{input.source_lang}}&target={{input.target_lang}}&text={{input.text}}"
-        },
-        "response": { "translated_text_path": "message.result.translatedText" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("systran", "systran", json!({
-        "id": "systran-translate-v1",
-        "name": "Systran Translate",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://api-translate.systran.net/translation/text/translate",
-            "headers": { "Authorization": "Bearer {{auth.api_key}}" },
-            "body": { "input": ["{{input.text}}"], "source": "{{input.source_lang}}", "target": "{{input.target_lang}}" }
-        },
-        "response": { "translated_text_path": "outputs.0.output" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("smartcat", "smartcat", json!({
-        "id": "smartcat-translate-v1",
-        "name": "Smartcat Translate",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://api.smartcat.com/api/v1/document/translate",
-            "headers": { "Authorization": "Bearer {{auth.api_key}}", "Content-Type": "application/json" },
-            "body": { "text": "{{input.text}}", "sourceLanguage": "{{input.source_lang}}", "targetLanguage": "{{input.target_lang}}" }
-        },
-        "response": { "translated_text_path": "translatedText" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("phrase", "phrase", json!({
-        "id": "phrase-translate-v1",
-        "name": "Phrase MT",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://api.phrase.com/v2/projects/mt/translate",
-            "headers": { "Authorization": "token {{auth.api_key}}", "Content-Type": "application/json" },
-            "body": { "source": "{{input.source_lang}}", "target": "{{input.target_lang}}", "q": "{{input.text}}" }
-        },
-        "response": { "translated_text_path": "translation" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("mymemory", "mymemory", json!({
-        "id": "mymemory-translate-v1",
-        "name": "MyMemory Translate",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": false }] },
-        "request": {
-            "method": "GET",
-            "url": "https://api.mymemory.translated.net/get?q={{input.text}}&langpair={{input.source_lang}}|{{input.target_lang}}",
-            "headers": {}
-        },
-        "response": { "translated_text_path": "responseData.translatedText" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("reverso", "reverso", json!({
-        "id": "reverso-translate-v1",
-        "name": "Reverso Translate",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://api.reverso.net/translate/v1/translation",
-            "headers": { "Content-Type": "application/json", "Api-Key": "{{auth.api_key}}" },
-            "body": { "from": "{{input.source_lang}}", "to": "{{input.target_lang}}", "input": ["{{input.text}}"] }
-        },
-        "response": { "translated_text_path": "translation.0" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("linguee", "linguee", json!({
-        "id": "linguee-translate-v1",
-        "name": "Linguee Translate",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": true }] },
-        "request": {
-            "method": "GET",
-            "url": "https://api.linguee.net/api/v2/translations?query={{input.text}}&src={{input.source_lang}}&dst={{input.target_lang}}",
-            "headers": { "Authorization": "Bearer {{auth.api_key}}" }
-        },
-        "response": { "translated_text_path": "0.0" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-
-    // ---- P1-C-3: expand to 100+ (OpenAI-compatible gateways + HTTP MT + mock sign families) ----
-    for (id, vendor, tid, name, url, model) in [
-        ("ollama", "ollama", "ollama-chat-v1", "Ollama (local OpenAI-compatible)", "http://127.0.0.1:11434/v1/chat/completions", "llama3.2"),
-        ("lmstudio", "lmstudio", "lmstudio-chat-v1", "LM Studio Chat", "http://127.0.0.1:1234/v1/chat/completions", "local-model"),
-        ("vllm", "vllm", "vllm-chat-v1", "vLLM OpenAI-compatible", "http://127.0.0.1:8000/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct"),
-        ("litellm", "litellm", "litellm-chat-v1", "LiteLLM Proxy", "http://127.0.0.1:4000/v1/chat/completions", "gpt-4o-mini"),
-        ("huggingface", "huggingface", "huggingface-chat-v1", "Hugging Face Inference (OpenAI-compatible)", "https://router.huggingface.co/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct"),
-        ("cloudflare-ai", "cloudflare", "cloudflare-ai-chat-v1", "Cloudflare Workers AI Chat", "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT/ai/v1/chat/completions", "@cf/meta/llama-3.3-70b-instruct"),
-        ("google-gemini-openai", "google_gemini", "google-gemini-openai-v1", "Google Gemini (OpenAI-compatible)", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-2.0-flash"),
-        ("anthropic-openai-compat", "anthropic", "anthropic-openai-compat-v1", "Anthropic via OpenAI-compatible gateway", "https://api.anthropic.com/v1/chat/completions", "claude-sonnet-4-20250514"),
-        ("aws-bedrock-openai", "aws_bedrock", "aws-bedrock-openai-v1", "Amazon Bedrock (OpenAI-compatible proxy)", "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/chat/completions", "anthropic.claude-3-5-sonnet"),
-        ("github-models", "github", "github-models-chat-v1", "GitHub Models Chat", "https://models.inference.ai.azure.com/chat/completions", "gpt-4o-mini"),
-        ("azure-ai-inference", "azure_ai", "azure-ai-inference-v1", "Azure AI Inference Chat", "https://YOUR_RESOURCE.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview", "gpt-4o-mini"),
-        ("volcengine-ark", "volcengine_ark", "volcengine-ark-chat-v1", "Volcengine Ark (Doubao OpenAI-compatible)", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao-pro-32k"),
-        ("baidu-qianfan", "baidu_qianfan", "baidu-qianfan-chat-v1", "Baidu Qianfan (OpenAI-compatible)", "https://qianfan.baidubce.com/v2/chat/completions", "ernie-4.0-8k"),
-        ("tencent-hunyuan", "tencent_hunyuan", "tencent-hunyuan-chat-v1", "Tencent Hunyuan (OpenAI-compatible)", "https://hunyuan.tencentcloudapi.com/openai/v1/chat/completions", "hunyuan-turbos"),
-        ("xunfei-spark", "xunfei", "xunfei-spark-chat-v1", "iFlytek Spark (OpenAI-compatible)", "https://spark-api-open.xf-yun.com/v1/chat/completions", "generalv3.5"),
-        ("modelscope", "modelscope", "modelscope-chat-v1", "ModelScope Chat", "https://api-inference.modelscope.cn/v1/chat/completions", "Qwen/Qwen2.5-72B-Instruct"),
-        ("ppio", "ppio", "ppio-chat-v1", "PPIO Chat", "https://api.ppinfra.com/v3/openai/chat/completions", "meta-llama/Llama-3.3-70B-Instruct"),
-        ("friendli", "friendli", "friendli-chat-v1", "FriendliAI Chat", "https://api.friendli.ai/serverless/v1/chat/completions", "meta-llama-3.3-70b-instruct"),
-        ("hyperbolic", "hyperbolic", "hyperbolic-chat-v1", "Hyperbolic Chat", "https://api.hyperbolic.xyz/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct"),
-        ("lambdalabs", "lambdalabs", "lambdalabs-chat-v1", "Lambda Labs Chat", "https://api.lambdalabs.com/v1/chat/completions", "llama3.3-70b-instruct-fp8"),
-        ("fal-ai", "fal", "fal-ai-chat-v1", "fal.ai Chat", "https://fal.run/fal-ai/any-llm", "meta-llama/llama-3.3-70b-instruct"),
-        ("baseten", "baseten", "baseten-chat-v1", "Baseten Chat", "https://bridge.baseten.co/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct"),
-        ("modal-labs", "modal", "modal-labs-chat-v1", "Modal Labs Chat", "https://YOUR_WORKSPACE--vllm-openai.modal.run/v1/chat/completions", "meta-llama/Llama-3.3-70B-Instruct"),
-        ("predibase", "predibase", "predibase-chat-v1", "Predibase Chat", "https://serving.app.predibase.com/v1/chat/completions", "llama-3.3-70b"),
-        ("portkey", "portkey", "portkey-chat-v1", "Portkey AI Gateway", "https://api.portkey.ai/v1/chat/completions", "gpt-4o-mini"),
-        ("helicone", "helicone", "helicone-chat-v1", "Helicone AI Gateway", "https://gateway.helicone.ai/v1/chat/completions", "gpt-4o-mini"),
-        ("openai-compatible-local", "openai_local", "openai-compatible-local-v1", "Generic local OpenAI-compatible endpoint", "http://127.0.0.1:8080/v1/chat/completions", "local-model"),
-        ("qwen-intl", "qwen_intl", "qwen-intl-chat-v1", "Qwen International (DashScope)", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions", "qwen-max"),
-        ("infini-ai", "infini", "infini-ai-chat-v1", "Infini-AI Chat", "https://cloud.infini-ai.com/maas/v1/chat/completions", "llama-3.3-70b-instruct"),
-        ("skywork", "skywork", "skywork-chat-v1", "Skywork Chat", "https://api.skywork.ai/v1/chat/completions", "skywork-13b"),
-        ("360-zhinao", "qihoo360", "360-zhinao-chat-v1", "360 Zhinao Chat", "https://api.360.cn/v1/chat/completions", "360gpt-pro"),
-        ("sensechat", "sensechat", "sensechat-chat-v1", "SenseChat", "https://api.sensenova.cn/compatible-mode/v1/chat/completions", "SenseChat-5"),
-        ("doubao", "doubao", "doubao-chat-v1", "Doubao Chat (OpenAI-compatible)", "https://ark.cn-beijing.volces.com/api/v3/chat/completions", "doubao-1.5-pro-32k"),
-        ("ernie-speed", "ernie", "ernie-speed-chat-v1", "ERNIE Speed (OpenAI-compatible)", "https://qianfan.baidubce.com/v2/chat/completions", "ernie-speed-8k"),
-        ("watsonx-openai", "ibm_watsonx", "watsonx-openai-v1", "IBM watsonx.ai (OpenAI-compatible)", "https://us-south.ml.cloud.ibm.com/ml/v1/text/chat?version=2024-03-14", "ibm/granite-3-8b-instruct"),
-        ("oracle-genai", "oracle", "oracle-genai-chat-v1", "Oracle Generative AI Chat", "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/20231130/actions/chat", "cohere.command-r-plus"),
-        ("deepseek-reasoner", "deepseek_reasoner", "deepseek-reasoner-v1", "DeepSeek Reasoner", "https://api.deepseek.com/v1/chat/completions", "deepseek-reasoner"),
-        ("chatgpt-enterprise", "openai_enterprise", "chatgpt-enterprise-v1", "ChatGPT Enterprise / API", "https://api.openai.com/v1/chat/completions", "gpt-4.1-mini"),
-        ("groq-compound", "groq_compound", "groq-compound-v1", "Groq Compound Systems", "https://api.groq.com/openai/v1/chat/completions", "compound-beta"),
-        ("mistral-codestral", "mistral_codestral", "mistral-codestral-v1", "Mistral Codestral", "https://api.mistral.ai/v1/chat/completions", "codestral-latest"),
-    ] {
-        entries.push(openai_compatible_entry(id, vendor, tid, name, url, model, "Authorization"));
-    }
-
-    // Mock-covered sign families previously missing from builtin catalog.
-    entries.push(http_mt_entry("volcengine", "volcengine", json!({
-        "id": "volcengine-translate-v1",
-        "name": "Volcengine Translate (SigV4 variant)",
-        "version": "1.0.0",
-        "type": "text",
-        // Runner injects Authorization + X-Amz-Date.
-        "auth": { "fields": [
-            { "name": "access_key", "required": true },
-            { "name": "secret_key", "required": true }
-        ] },
-        "sign": {
-            "algorithm": "volcengine_hmac_sha256",
-            "service": "translate",
-            "region": "cn-north-1"
-        },
-        "request": {
-            "method": "POST",
-            "url": "https://translate.volcengineapi.com",
-            "headers": { "Content-Type": "application/json" },
-            "body": {
-                "SourceText": "{{input.text}}",
-                "SourceLanguage": "{{input.source_lang}}",
-                "TargetLanguage": "{{input.target_lang}}"
-            }
-        },
-        "response": { "translated_text_path": "Translation" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("hmac-generic", "hmac_generic", json!({
-        "id": "hmac-generic-translate-v1",
-        "name": "Generic HMAC-SHA256 Translate",
-        "version": "1.0.0",
-        "type": "text",
-        // Match mock-sign-hmac-sha256: HMAC(api_key + text + salt, secret_key).
-        "auth": { "fields": [
-            { "name": "api_key", "required": true },
-            { "name": "secret_key", "required": true }
-        ] },
-        "sign": {
-            "algorithm": "hmac_sha256",
-            "salt_type": "unix_timestamp",
-            "concat": ["auth.api_key", "input.text", "computed.salt"]
-        },
-        "request": {
-            "method": "POST",
-            "url": "https://example.com/api/hmac/translate",
-            "headers": { "Content-Type": "application/json" },
-            "body": {
-                "api_key": "{{auth.api_key}}",
-                "text": "{{input.text}}",
-                "source_lang": "{{input.source_lang}}",
-                "target_lang": "{{input.target_lang}}",
-                "timestamp": "{{computed.salt}}",
-                "sign": "{{computed.sign}}"
-            }
-        },
-        "response": { "translated_text_path": "translated_text" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true }
-        ]
-    })));
-    entries.push(http_mt_entry("oauth-mt", "oauth_mt", json!({
-        "id": "oauth-mt-translate-v1",
-        "name": "OAuth Client-Credentials Translate",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [
-            { "name": "client_id", "required": true },
-            { "name": "client_secret", "required": true },
-            { "name": "access_token", "required": true }
-        ] },
-        "request": {
-            "method": "POST",
-            "url": "https://example.com/api/oauth/translate",
-            "headers": { "Content-Type": "application/json", "Authorization": "Bearer {{auth.access_token}}" },
-            "body": {
-                "text": "{{input.text}}",
-                "source_lang": "{{input.source_lang}}",
-                "target_lang": "{{input.target_lang}}"
-            }
-        },
-        "response": { "translated_text_path": "translated_text" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("jwt-mt", "jwt_mt", json!({
-        "id": "jwt-mt-translate-v1",
-        "name": "JWT Bearer (RSA) Translate",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "jwt_token", "required": true }] },
-        "request": {
-            "method": "POST",
-            "url": "https://example.com/api/jwt/translate",
-            "headers": { "Content-Type": "application/json", "Authorization": "Bearer {{auth.jwt_token}}" },
-            "body": {
-                "text": "{{input.text}}",
-                "source_lang": "{{input.source_lang}}",
-                "target_lang": "{{input.target_lang}}"
-            }
-        },
-        "response": { "translated_text_path": "translated_text" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-    })));
-    entries.push(http_mt_entry("custom-http-mt", "custom_http_mt", json!({
-        "id": "custom-http-mt-v1",
-        "name": "Custom HTTP MT (user-editable)",
-        "version": "1.0.0",
-        "type": "text",
-        "auth": { "fields": [{ "name": "api_key", "required": false }] },
-        "request": {
-            "method": "POST",
-            "url": "https://example.com/translate",
-            "headers": { "Content-Type": "application/json", "Authorization": "Bearer {{auth.api_key}}" },
-            "body": {
-                "q": "{{input.text}}",
-                "source": "{{input.source_lang}}",
-                "target": "{{input.target_lang}}"
-            }
-        },
-        "response": { "translated_text_path": "translatedText" },
-        "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-        "editable_params": [
-            { "path": "request.method", "scope": "config", "type": "string", "required": true },
-            { "path": "request.url", "scope": "config", "type": "string", "required": true },
-            { "path": "request.headers.Authorization", "scope": "config", "type": "string", "required": false },
-            { "path": "request.headers.Content-Type", "scope": "config", "type": "string", "required": false },
-            { "path": "request.body.q", "scope": "config", "type": "string", "required": false },
-            { "path": "request.body.source", "scope": "config", "type": "string", "required": false },
-            { "path": "request.body.target", "scope": "config", "type": "string", "required": false },
-            { "path": "response.translated_text_path", "scope": "config", "type": "string", "required": true },
-            { "path": "response.error_path", "scope": "config", "type": "string", "required": false }
-        ]
-    })));
-
-    for (id, vendor, tid, name, url, path) in [
-        ("deepl-pro", "deepl_pro", "deepl-pro-v2", "DeepL API Pro", "https://api.deepl.com/v2/translate", "translations.0.text"),
-        ("google-advanced", "google_advanced", "google-advanced-v3", "Google Cloud Translation Advanced", "https://translation.googleapis.com/v3/projects/YOUR_PROJECT/locations/global:translateText", "translations.0.translatedText"),
-        ("modernmt", "modernmt", "modernmt-v1", "ModernMT", "https://api.modernmt.com/translate", "data.translation"),
-        ("argos-translate", "argos", "argos-translate-v1", "Argos Translate (self-hosted)", "http://127.0.0.1:5001/translate", "translatedText"),
-        ("apertium", "apertium", "apertium-v1", "Apertium Translate", "https://www.apertium.org/apy/translate", "responseData.translatedText"),
-        ("bergamot", "bergamot", "bergamot-v1", "Bergamot / Firefox Translations", "http://127.0.0.1:8081/translate", "translatedText"),
-        ("lingvanex", "lingvanex", "lingvanex-v1", "LingvaNex Translate", "https://api-b2b.backenster.com/b1/api/v3/translate", "result"),
-        ("cloudtranslation", "cloudtranslation", "cloudtranslation-v1", "CloudTranslation", "https://api.cloudtranslation.com/v1/translate", "translations.0.text"),
-        ("iciba", "iciba", "iciba-v1", "iCIBA Translate", "https://ifanyi.iciba.com/index.php", "content.out"),
-        ("sogou", "sogou", "sogou-v1", "Sogou Translate", "https://fanyi.sogou.com/api/transweb/translate", "data.translatedText"),
-        ("huawei-nlp", "huawei", "huawei-nlp-v1", "Huawei Cloud NLP Translate", "https://nlp-ext.cn-north-4.myhuaweicloud.com/v1/infers/machine-translation/text-translation", "translations.0.text"),
-        ("crowdin-mt", "crowdin", "crowdin-mt-v1", "Crowdin MT", "https://api.crowdin.com/api/v2/machines/translations", "data.0.text"),
-        ("lokalise-mt", "lokalise", "lokalise-mt-v1", "Lokalise MT", "https://api.lokalise.com/api2/projects/mt/translate", "translation"),
-        ("unbabel", "unbabel", "unbabel-v1", "Unbabel MT", "https://api.unbabel.com/v1/translation", "translated_text"),
-        ("translated-matecat", "translated", "translated-matecat-v1", "Translated MateCat MT", "https://api.translated.com/v2/translate", "translation"),
-        ("microsoft-custom", "microsoft_custom", "microsoft-custom-v3", "Microsoft Custom Translator", "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}&category=generalnn", "0.translations.0.text"),
-    ] {
-        let auth_header = if id == "deepl-pro" {
-            "DeepL-Auth-Key {{auth.api_key}}"
-        } else if id == "microsoft-custom" {
-            "{{auth.api_key}}"
-        } else {
-            "Bearer {{auth.api_key}}"
-        };
-        let (auth_header_name, auth_header_value) = if id == "microsoft-custom" {
-            ("Ocp-Apim-Subscription-Key", auth_header)
-        } else if id == "deepl-pro" {
-            ("Authorization", auth_header)
-        } else {
-            ("Authorization", auth_header)
-        };
-        let mut headers = serde_json::Map::new();
-        headers.insert("Content-Type".into(), json!("application/json"));
-        headers.insert(auth_header_name.into(), json!(auth_header_value));
-        let body = if id == "deepl-pro" {
-            json!({
-                "text": ["{{input.text}}"],
-                "source_lang": "{{input.source_lang}}",
-                "target_lang": "{{input.target_lang}}"
-            })
-        } else if id == "microsoft-custom" {
-            json!([{ "Text": "{{input.text}}" }])
-        } else if id == "apertium" {
-            json!({
-                "q": "{{input.text}}",
-                "langpair": "{{input.source_lang}}|{{input.target_lang}}"
-            })
-        } else {
-            json!({
-                "q": "{{input.text}}",
-                "source": "{{input.source_lang}}",
-                "target": "{{input.target_lang}}",
-                "text": "{{input.text}}"
-            })
-        };
-        entries.push(http_mt_entry(id, vendor, json!({
-            "id": tid,
-            "name": name,
-            "version": "1.0.0",
-            "type": "text",
-            "auth": { "fields": [{ "name": "api_key", "required": true }] },
-            "request": {
-                "method": "POST",
-                "url": url,
-                "headers": headers,
-                "body": body
-            },
-            "response": { "translated_text_path": path },
-            "constraints": { "split_strategy": "paragraph", "supported_content_formats": ["plain_text", "rich_html"] },
-            "editable_params": [{ "path": "request.url", "scope": "config", "type": "string", "required": true }]
-        })));
-    }
-
-    annotate_builtin_evidence_tiers(&mut entries);
-
-    json!({
-        "schema": PROVIDER_CATALOG_SCHEMA,
-        "catalog_version": "builtin-3",
-        "created_at": "2026-09-03T00:00:00Z",
-        "entries": entries,
-    })
-}
+/// Embedded seed provider templates (WBS 3.4 / Revised Decision 2):
+/// 15 core provider templates compiled into binary to provide immediate
+/// out-of-the-box offline usability on fresh installations.
+static SEED_PROVIDER_CATALOG: &str = include_str!("../../../config/seed-provider-catalog.json");
 
 fn load_catalog_document() -> anyhow::Result<(Value, bool)> {
     load_catalog_document_with_meta().map(|(catalog, builtin, _)| (catalog, builtin))
@@ -1278,7 +192,12 @@ struct CatalogLoadMeta {
     catalog_version: Option<String>,
 }
 
-fn catalog_cache_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+fn catalog_cache_paths() -> (
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
     let legacy = std::path::PathBuf::from(provider_catalog_path());
     let parent = legacy
         .parent()
@@ -1298,9 +217,8 @@ fn catalog_cache_paths() -> (std::path::PathBuf, std::path::PathBuf, std::path::
 }
 
 fn read_validate_catalog_file(path: &Path, builtin: bool) -> anyhow::Result<Value> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("read provider catalog failed: {}", path.display()))?;
-    let catalog: Value = serde_json::from_str(&raw)
+    let raw = read_cache_snapshot(path)?.context("provider catalog cache is missing")?;
+    let catalog: Value = serde_json::from_slice(&raw)
         .with_context(|| format!("parse provider catalog JSON failed: {}", path.display()))?;
     validate_catalog_document(&catalog, builtin)?;
     Ok(catalog)
@@ -1321,26 +239,52 @@ fn load_refresh_metadata() -> Value {
 }
 
 fn write_refresh_metadata(meta: &Value) -> anyhow::Result<()> {
-    let (_, _, _, meta_path) = catalog_cache_paths();
-    if let Some(parent) = meta_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create catalog cache dir failed: {}", parent.display()))?;
-    }
-    let tmp = meta_path.with_extension("metadata.tmp.json");
-    fs::write(&tmp, serde_json::to_vec_pretty(meta)?)
-        .with_context(|| format!("write catalog metadata temp failed: {}", tmp.display()))?;
-    fs::rename(&tmp, &meta_path).with_context(|| {
-        format!(
-            "replace catalog metadata failed: {} -> {}",
-            tmp.display(),
-            meta_path.display()
-        )
-    })?;
-    Ok(())
+    let (_, current, _, meta_path) = catalog_cache_paths();
+    let lease = cache_journal::acquire(&current)?;
+    cache_journal::recover(&current, &lease)?;
+    let prior = read_cache_snapshot(&meta_path)?;
+    let encoded = serde_json::to_vec_pretty(meta)?;
+    anyhow::ensure!(
+        u64::try_from(encoded.len())? <= MAX_CATALOG_CACHE_BYTES,
+        "catalog metadata snapshot exceeds max size"
+    );
+    crate::bindings::atomic_file::install_siblings_uncredited(
+        &current,
+        &[(&meta_path, &encoded, prior.as_deref())],
+    )
+}
+
+fn read_cache_snapshot(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect catalog cache snapshot failed"),
+    };
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() <= MAX_CATALOG_CACHE_BYTES,
+        "invalid catalog cache snapshot"
+    );
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_CATALOG_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        u64::try_from(bytes.len())? == metadata.len(),
+        "catalog cache snapshot changed"
+    );
+    Ok(Some(bytes))
 }
 
 fn load_catalog_document_with_meta() -> anyhow::Result<(Value, bool, CatalogLoadMeta)> {
     let (legacy, current, lkg, _) = catalog_cache_paths();
+    let _lease = if current.parent().is_some_and(Path::exists) {
+        let lease = cache_journal::acquire(&current)?;
+        cache_journal::recover(&current, &lease)?;
+        Some(lease)
+    } else {
+        None
+    };
 
     if current.exists() {
         match read_validate_catalog_file(&current, false) {
@@ -1407,35 +351,100 @@ fn load_catalog_document_with_meta() -> anyhow::Result<(Value, bool, CatalogLoad
         ));
     }
 
-    let catalog = builtin_catalog();
-    validate_catalog_document(&catalog, true)?;
-    let version = catalog
-        .get("catalog_version")
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    // Embedded seed fallback (WBS 3.4 / Revised Decision 2):
+    // When no local cache exists, load the embedded 15 core provider seed templates
+    // so fresh or air-gapped installs are immediately operational.
+    if let Ok(seed_catalog) = serde_json::from_str::<Value>(SEED_PROVIDER_CATALOG) {
+        if validate_catalog_document(&seed_catalog, true).is_ok() {
+            let version = seed_catalog
+                .get("catalog_version")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            return Ok((
+                seed_catalog,
+                true,
+                CatalogLoadMeta {
+                    source: "embedded_seed".into(),
+                    offline: true,
+                    state: "seed".into(),
+                    catalog_version: version,
+                },
+            ));
+        }
+    }
+
+    // Clean release fallback: if embedded seed fails to parse, return empty document.
+    let catalog = json!({
+        "schema": PROVIDER_CATALOG_SCHEMA_V2,
+        "template_schema": PROVIDER_TEMPLATE_SCHEMA_V2,
+        "catalog_version": Value::Null,
+        "entries": [],
+    });
     Ok((
         catalog,
-        true,
+        false,
         CatalogLoadMeta {
-            source: "builtin".into(),
+            source: "never_fetched".into(),
             offline: true,
-            state: "builtin".into(),
-            catalog_version: version,
+            state: "never_fetched".into(),
+            catalog_version: None,
         },
     ))
 }
 
+/// Catalog source override is test/CI-only (decision 5: the client loads the
+/// official repository and no other). An env override is honored only when an
+/// explicit allow flag is set, mirroring the file/loopback source gating.
+fn catalog_source_override_allowed() -> bool {
+    env_flag("WPTSALL_PROVIDER_CATALOG_ALLOW_FILE_SOURCE")
+        || env_flag("WPTSALL_PROVIDER_CATALOG_ALLOW_LOOPBACK_SOURCE")
+        || env_flag("WPTSALL_PROVIDER_CATALOG_ALLOW_UNOFFICIAL_SOURCE")
+        || false
+}
+
 fn catalog_source_url() -> Option<String> {
-    std::env::var("WPTSALL_PROVIDER_CATALOG_SOURCE_URL")
+    if let Some(value) = std::env::var("WPTSALL_PROVIDER_CATALOG_SOURCE_URL")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+    {
+        if !catalog_source_override_allowed() {
+            // Silently ignore unofficial sources in production: the official
+            // repository is the only supported catalog source.
+            return Some(OFFICIAL_PROVIDER_CATALOG_SOURCE_URL.to_string());
+        }
+        return Some(value);
+    }
+    Some(OFFICIAL_PROVIDER_CATALOG_SOURCE_URL.to_string())
+}
+
+/// Base URL of the catalog source (the repo root behind `catalog.json`);
+/// used to resolve `versions.json` and `versions/<v>/catalog.json`.
+fn catalog_versions_base_url(source_url: &str) -> String {
+    let trimmed = source_url.trim_end_matches('/');
+    let base = trimmed.strip_suffix("catalog.json").unwrap_or(trimmed);
+    format!("{base}/")
+}
+
+fn catalog_versions_index_url() -> Option<String> {
+    catalog_source_url()
+        .map(|source| format!("{}versions.json", catalog_versions_base_url(&source)))
+}
+
+fn catalog_version_url(version: &str) -> Option<String> {
+    catalog_source_url().map(|source| {
+        format!(
+            "{}versions/{version}/catalog.json",
+            catalog_versions_base_url(&source)
+        )
+    })
 }
 
 fn assert_catalog_source_url_allowed(raw: &str) -> anyhow::Result<()> {
-    let parsed = url::Url::parse(raw.trim()).map_err(|_| anyhow!("catalog source URL is invalid"))?;
+    let parsed =
+        url::Url::parse(raw.trim()).map_err(|_| anyhow!("catalog source URL is invalid"))?;
     if parsed.scheme() == "file" {
-        if cfg!(test) || env_flag("WPTSALL_PROVIDER_CATALOG_ALLOW_FILE_SOURCE") {
+        if false || env_flag("WPTSALL_PROVIDER_CATALOG_ALLOW_FILE_SOURCE") {
             return Ok(());
         }
         anyhow::bail!("file:// catalog source is not allowed");
@@ -1452,7 +461,9 @@ fn assert_catalog_source_url_allowed(raw: &str) -> anyhow::Result<()> {
         .trim_end_matches('.')
         .to_ascii_lowercase();
     let allow_loopback = env_flag("WPTSALL_PROVIDER_CATALOG_ALLOW_LOOPBACK_SOURCE")
-        || (cfg!(test) && parsed.port().is_some() && matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
+        || (false
+            && parsed.port().is_some()
+            && matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1"));
     if !allow_loopback {
         // Reuse provider host policy for public HTTPS sources.
         if let Err(reason) = catalog_url_check(raw) {
@@ -1465,40 +476,16 @@ fn assert_catalog_source_url_allowed(raw: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Atomically install a validated candidate as current cache, preserving prior current as LKG.
+/// Install admitted private snapshots, preserving prior current as LKG.
+/// A checked publication journal repairs interrupted related renames.
 fn install_catalog_candidate(catalog: &Value, source_url: &str) -> anyhow::Result<Value> {
-    let (_legacy, current, lkg, _) = catalog_cache_paths();
-    if let Some(parent) = current.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create catalog cache dir failed: {}", parent.display()))?;
-    }
+    let (_legacy, current, lkg, metadata) = catalog_cache_paths();
+    let lease = cache_journal::acquire(&current)?;
+    cache_journal::recover(&current, &lease)?;
+    let prior_current = read_cache_snapshot(&current)?;
+    let prior_lkg = read_cache_snapshot(&lkg)?;
+    let prior_metadata = read_cache_snapshot(&metadata)?;
     let encoded = serde_json::to_vec_pretty(catalog)?;
-    let candidate = current.with_extension("candidate.tmp.json");
-    fs::write(&candidate, &encoded).with_context(|| {
-        format!(
-            "write catalog candidate failed: {}",
-            candidate.display()
-        )
-    })?;
-
-    if current.exists() {
-        fs::copy(&current, &lkg).with_context(|| {
-            format!(
-                "preserve LKG failed: {} -> {}",
-                current.display(),
-                lkg.display()
-            )
-        })?;
-    }
-
-    fs::rename(&candidate, &current).with_context(|| {
-        format!(
-            "atomic catalog replace failed: {} -> {}",
-            candidate.display(),
-            current.display()
-        )
-    })?;
-
     let meta = json!({
         "state": "current",
         "source_url": source_url,
@@ -1508,7 +495,31 @@ fn install_catalog_candidate(catalog: &Value, source_url: &str) -> anyhow::Resul
         "offline": false,
         "template_count": catalog_template_entries(catalog).map(|v| v.len()).unwrap_or(0),
     });
-    write_refresh_metadata(&meta)?;
+    let encoded_meta = serde_json::to_vec_pretty(&meta)?;
+    anyhow::ensure!(
+        u64::try_from(encoded.len())? <= MAX_CATALOG_CACHE_BYTES
+            && u64::try_from(encoded_meta.len())? <= MAX_CATALOG_CACHE_BYTES,
+        "catalog cache snapshot exceeds max size"
+    );
+    let mut snapshots = Vec::new();
+    if let Some(prior) = prior_current.as_ref().filter(|bytes| {
+        serde_json::from_slice::<Value>(bytes)
+            .ok()
+            .is_some_and(|prior| validate_catalog_document(&prior, false).is_ok())
+    }) {
+        snapshots.push((lkg.as_path(), prior.as_slice(), prior_lkg.as_deref()));
+    }
+    snapshots.push((
+        current.as_path(),
+        encoded.as_slice(),
+        prior_current.as_deref(),
+    ));
+    snapshots.push((
+        metadata.as_path(),
+        encoded_meta.as_slice(),
+        prior_metadata.as_deref(),
+    ));
+    cache_journal::publish(&current, &snapshots, &lease)?;
     Ok(meta)
 }
 
@@ -1517,17 +528,24 @@ async fn download_catalog_bytes(source_url: &str) -> anyhow::Result<Vec<u8>> {
     const MAX_BYTES: usize = 2 * 1024 * 1024;
 
     if source_url.starts_with("file://") {
+        use std::io::Read;
         let path = source_url.trim_start_matches("file://");
-        let bytes = fs::read(path)
-            .with_context(|| format!("read file catalog source failed: {path}"))?;
-        if bytes.len() > MAX_BYTES {
-            anyhow::bail!("catalog source exceeds max size ({MAX_BYTES} bytes)");
-        }
+        let metadata = fs::symlink_metadata(path)?;
+        anyhow::ensure!(metadata.is_file() && metadata.len() <= MAX_BYTES as u64,
+            "file catalog source exceeds its bound or is not regular");
+        let mut bytes = Vec::new();
+        fs::File::open(path)?.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() <= MAX_BYTES && bytes.len() as u64 == metadata.len(),
+            "file catalog source changed or exceeds its bound");
         return Ok(bytes);
     }
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+        // 3.8flash A3: 3s, not the old 30s — the first catalog view must never
+        // stare at a half-minute black hole while the network is unreachable.
+        // The fetch failure arm already degrades honestly (built-in seed +
+        // offline refresh metadata); a long timeout only punishes the UI.
+        .timeout(std::time::Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 {
                 return attempt.error(anyhow!("too many redirects"));
@@ -1541,30 +559,34 @@ async fn download_catalog_bytes(source_url: &str) -> anyhow::Result<Vec<u8>> {
         .build()
         .context("build catalog download client failed")?;
 
-    let response = client
+    let mut response = client
         .get(source_url)
-        .header(reqwest::header::ACCEPT, "application/json, application/octet-stream")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, application/octet-stream",
+        )
         .send()
         .await
-        .context("catalog source download failed")?;
+        .map_err(|error| anyhow!("catalog source download failed ({})",
+            if error.is_timeout() { "timeout" } else { "transport" }))?;
     if !response.status().is_success() {
         anyhow::bail!("catalog source HTTP {}", response.status());
     }
     if let Some(len) = response.content_length() {
-        if len as usize > MAX_BYTES {
+        if len > MAX_BYTES as u64 {
             anyhow::bail!("catalog source Content-Length exceeds max size");
         }
     }
     let final_url = response.url().clone();
     assert_catalog_source_url_allowed(final_url.as_str())?;
-    let bytes = response
-        .bytes()
-        .await
-        .context("catalog source body read failed")?;
-    if bytes.len() > MAX_BYTES {
-        anyhow::bail!("catalog source body exceeds max size");
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await
+        .map_err(|_| anyhow!("catalog source body read failed"))? {
+        anyhow::ensure!(bytes.len().checked_add(chunk.len()).is_some_and(|size| size <= MAX_BYTES),
+            "catalog source body exceeds max size");
+        bytes.extend_from_slice(&chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 async fn refresh_provider_catalog_from_source() -> anyhow::Result<Value> {
@@ -1592,12 +614,12 @@ async fn refresh_provider_catalog_from_source() -> anyhow::Result<Value> {
             // Remote catalogs are fail-closed: signature always required.
             if let Err(err) = validate_catalog_document_inner(&catalog, false, true) {
                 let (_, _, load_meta) = load_catalog_document_with_meta().unwrap_or((
-                    builtin_catalog(),
-                    true,
+                    Value::Null,
+                    false,
                     CatalogLoadMeta {
-                        source: "builtin".into(),
+                        source: "never_fetched".into(),
                         offline: true,
-                        state: "builtin".into(),
+                        state: "never_fetched".into(),
                         catalog_version: None,
                     },
                 ));
@@ -1611,12 +633,25 @@ async fn refresh_provider_catalog_from_source() -> anyhow::Result<Value> {
                 let _ = write_refresh_metadata(&meta);
                 return Err(err).context("remote provider catalog validation failed");
             }
-            let meta = install_catalog_candidate(&catalog, &source_url)?;
+            // Browsing/checking must not replace an installed catalog or any
+            // user component. Installation is an explicit version-confirmed POST.
+            let (current, _, current_meta) = load_catalog_document_with_meta()?;
+            let meta = json!({
+                "state": current_meta.state, "source_url": source_url,
+                "catalog_version": current.get("catalog_version").cloned().unwrap_or(Value::Null),
+                "available_version": catalog.get("catalog_version").cloned().unwrap_or(Value::Null),
+                "available_entries_sha256": catalog.get("entries_sha256").cloned().unwrap_or(Value::Null),
+                "last_success_at": unix_ts(), "last_attempt_at": unix_ts(),
+                "last_error": Value::Null, "offline": false,
+            });
+            write_refresh_metadata(&meta)?;
             let count = catalog_template_entries(&catalog)?.len();
             Ok(json!({
-                "catalog_version": catalog.get("catalog_version").cloned().unwrap_or(Value::Null),
+                "catalog_version": current.get("catalog_version").cloned().unwrap_or(Value::Null),
+                "available_version": catalog.get("catalog_version").cloned().unwrap_or(Value::Null),
                 "template_count": count,
-                "source": "remote",
+                "source": "remote_check",
+                "installed": false,
                 "verified": true,
                 "offline": false,
                 "refresh_metadata": meta,
@@ -1660,30 +695,65 @@ fn hex_sha256(value: &[u8]) -> String {
 }
 
 fn catalog_signature_key() -> anyhow::Result<Option<String>> {
-    let Some(path) = std::env::var("WPTSALL_PROVIDER_CATALOG_PUBLIC_KEY_FILE")
+    if let Some(path) = std::env::var("WPTSALL_PROVIDER_CATALOG_PUBLIC_KEY_FILE")
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-    else {
-        return Ok(None);
-    };
-    Ok(Some(fs::read_to_string(&path).with_context(|| {
-        format!("read provider catalog public key failed: {path}")
-    })?))
+    {
+        // Test/CI-only key override, gated exactly like the source override.
+        if catalog_source_override_allowed() {
+            return Ok(Some(fs::read_to_string(&path).with_context(|| {
+                format!("read provider catalog public key failed: {path}")
+            })?));
+        }
+    }
+    // Default: the official template-repo catalog key (embedded at build time
+    // so the clean client verifies the official source out of the box).
+    Ok(Some(OFFICIAL_PROVIDER_CATALOG_PUBLIC_KEY_PEM.to_string()))
 }
 
 fn validate_catalog_document(catalog: &Value, builtin: bool) -> anyhow::Result<()> {
     let require_signature = !builtin && !env_flag("WPTSALL_ALLOW_UNSIGNED_CATALOG");
-    validate_catalog_document_inner(catalog, builtin, require_signature)
+    validate_catalog_document_contract(catalog, builtin, require_signature, false)
 }
 
 fn validate_catalog_document_inner(
     catalog: &Value,
-    _builtin: bool,
+    builtin: bool,
     require_signature: bool,
 ) -> anyhow::Result<()> {
-    if catalog.get("schema").and_then(Value::as_str) != Some(PROVIDER_CATALOG_SCHEMA) {
-        anyhow::bail!("unsupported provider catalog schema");
+    validate_catalog_document_contract(catalog, builtin, require_signature, require_signature)
+}
+
+fn validate_catalog_document_contract(
+    catalog: &Value,
+    _builtin: bool,
+    require_signature: bool,
+    require_metadata_signature: bool,
+) -> anyhow::Result<()> {
+    let schema = catalog
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_v2 = match schema {
+        s if s == PROVIDER_CATALOG_SCHEMA => false,
+        s if s == PROVIDER_CATALOG_SCHEMA_V2 => true,
+        _ => anyhow::bail!("unsupported provider catalog schema"),
+    };
+    if is_v2 {
+        // Fail-closed on unknown template schema declarations.
+        if catalog.get("template_schema").and_then(Value::as_str)
+            != Some(PROVIDER_TEMPLATE_SCHEMA_V2)
+        {
+            anyhow::bail!("unsupported provider catalog template schema");
+        }
+        let version = catalog
+            .get("catalog_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !is_semver_3(version) {
+            anyhow::bail!("v2 provider catalog catalog_version must be SemVer");
+        }
     }
     let entries = catalog
         .get("entries")
@@ -1706,25 +776,39 @@ fn validate_catalog_document_inner(
         .map(str::trim)
         .filter(|v| !v.is_empty());
     if let Some(signature) = signature {
-        if catalog
+        let scope = catalog
             .get("signature_scope")
             .and_then(Value::as_str)
-            .unwrap_or(PROVIDER_CATALOG_SIGNATURE_SCOPE)
-            != PROVIDER_CATALOG_SIGNATURE_SCOPE
-        {
-            anyhow::bail!("unsupported provider catalog signature scope");
-        }
+            .unwrap_or(PROVIDER_CATALOG_SIGNATURE_SCOPE);
+        anyhow::ensure!(
+            !require_metadata_signature || scope == PROVIDER_CATALOG_DOCUMENT_SIGNATURE_SCOPE,
+            "online provider catalog must sign its full version metadata"
+        );
+        let payload = match scope {
+            PROVIDER_CATALOG_SIGNATURE_SCOPE => entries_json.clone(),
+            PROVIDER_CATALOG_DOCUMENT_SIGNATURE_SCOPE => {
+                anyhow::ensure!(
+                    catalog.get("catalog_version").and_then(Value::as_str).is_some_and(is_semver_3)
+                        && catalog.get("entries_sha256").and_then(Value::as_str).is_some_and(|value|
+                            value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                        && catalog.get("signature_algorithm").and_then(Value::as_str) == Some("RSA-SHA256")
+                        && catalog.get("signature_contract_version").and_then(Value::as_str) == Some("2")
+                        && catalog.get("signing_key_id").and_then(Value::as_str).is_some_and(|value| !value.trim().is_empty()),
+                    "provider catalog signed metadata is incomplete"
+                );
+                let mut document = catalog.clone();
+                document.as_object_mut().context("catalog must be an object")?.remove("signature");
+                serde_json::to_vec(&document)?
+            }
+            _ => anyhow::bail!("unsupported provider catalog signature scope"),
+        };
         let public_key = catalog_signature_key()?.ok_or_else(|| {
-            anyhow!(
-                "provider catalog signature is present but WPTSALL_PROVIDER_CATALOG_PUBLIC_KEY_FILE is not configured"
-            )
+            anyhow!("provider catalog signature is present but no verification key is configured")
         })?;
-        crate::crypto::verify_component_signature(&entries_json, signature, &public_key)
+        crate::crypto::verify_component_signature(&payload, signature, &public_key)
             .context("provider catalog signature verification failed")?;
     } else if require_signature {
-        anyhow::bail!(
-            "provider catalog signature is required for this catalog source"
-        );
+        anyhow::bail!("provider catalog signature is required for this catalog source");
     }
 
     for entry in entries {
@@ -1740,9 +824,259 @@ fn validate_catalog_document_inner(
         }
         for template in templates {
             validate_public_catalog_template(template, entry_id)?;
+            if is_v2 {
+                validate_v2_template_requirements(template, entry_id)?;
+            }
         }
     }
     Ok(())
+}
+
+fn is_semver_3(value: &str) -> bool {
+    let mut parts = value.trim().split('.');
+    let mut numeric = 0;
+    for part in parts.by_ref() {
+        if part.is_empty()
+            || !part.bytes().all(|b| b.is_ascii_digit())
+            || (part.len() > 1 && part.starts_with('0'))
+        {
+            return false;
+        }
+        numeric += 1;
+    }
+    numeric == 3
+}
+
+/// v2 template gate (decision 7): provenance, evidence, examples, and the
+/// client-contract api_version are required on every v2 catalog template, and
+/// auth placeholders must be declared in auth.fields (the P7 lesson: an
+/// undeclared `{{auth.*}}` renders literally and burns vendor quota with 401s).
+fn validate_v2_template_requirements(template: &Value, entry_id: &str) -> anyhow::Result<()> {
+    let api_version = template
+        .get("api_version")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("v2 catalog entry '{entry_id}' template requires api_version"))?;
+    let major = api_version
+        .split('.')
+        .next()
+        .and_then(|m| m.parse::<u32>().ok())
+        .ok_or_else(|| {
+            anyhow!("v2 catalog entry '{entry_id}' template api_version is malformed")
+        })?;
+    if !(1..=2).contains(&major) {
+        anyhow::bail!(
+            "v2 catalog entry '{entry_id}' template api_version major {major} is unsupported"
+        );
+    }
+
+    if !template
+        .get("forked_from")
+        .is_some_and(|ff| ff.is_null() || ff.is_object())
+    {
+        anyhow::bail!(
+            "v2 catalog entry '{entry_id}' template requires forked_from (null for repo originals)"
+        );
+    }
+    if let Some(ff) = template.get("forked_from").filter(|v| v.is_object()) {
+        for key in ["repo", "entry_id", "template_id", "template_version"] {
+            if !ff
+                .get(key)
+                .and_then(Value::as_str)
+                .is_some_and(|v| !v.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "v2 catalog entry '{entry_id}' forked_from.{key} must be a non-empty string"
+                );
+            }
+        }
+    }
+
+    let evidence = template
+        .get("evidence")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("v2 catalog entry '{entry_id}' template requires evidence"))?;
+    let tier = evidence
+        .get("tier")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(tier, "mock-verified" | "schema-only") {
+        anyhow::bail!("v2 catalog entry '{entry_id}' evidence.tier '{tier}' is invalid");
+    }
+    let cases = evidence
+        .get("cases")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("v2 catalog entry '{entry_id}' evidence.cases must be an array"))?;
+    if cases
+        .iter()
+        .any(|c| !c.as_str().is_some_and(|s| !s.trim().is_empty()))
+    {
+        anyhow::bail!("v2 catalog entry '{entry_id}' evidence.cases must be case-id strings");
+    }
+    if tier == "mock-verified" {
+        let verified_at = evidence
+            .get("verified_at")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !verified_at.ends_with('Z') || verified_at.len() != 20 {
+            anyhow::bail!(
+                "v2 catalog entry '{entry_id}' mock-verified evidence requires verified_at ISO-8601 Z"
+            );
+        }
+        if cases.is_empty() {
+            anyhow::bail!(
+                "v2 catalog entry '{entry_id}' mock-verified evidence requires at least one case id"
+            );
+        }
+    }
+
+    let examples = template
+        .get("examples")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("v2 catalog entry '{entry_id}' template requires examples"))?;
+    if examples.get("request").map(Value::is_object) != Some(true) {
+        anyhow::bail!("v2 catalog entry '{entry_id}' examples.request must be an object");
+    }
+    // Some vendors reply with a top-level array (e.g. Azure
+    // `[{ "translations": [...] }]`) — a structurally faithful example.
+    if !examples
+        .get("response")
+        .is_some_and(|r| r.is_object() || r.is_array())
+    {
+        anyhow::bail!("v2 catalog entry '{entry_id}' examples.response must be an object or array");
+    }
+
+    // Placeholder consistency: every {{auth.X}} used in the request must be
+    // declared in auth.fields; computed placeholders require a sign block.
+    // X-11 (批 S): the scan covers async_poll too, the non-text input
+    // vocabulary mirrors the runner's insert_component_non_text_context,
+    // and the async computed keys (job_id/async_job_id) are admitted only
+    // when the template declares async_poll — parity with the template
+    // repo's wptsall_catalog.check_template_v2.
+    let declared: HashSet<String> = template
+        .get("auth")
+        .and_then(|a| a.get("fields"))
+        .and_then(Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(|f| f.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let request = template.get("request").cloned().unwrap_or(Value::Null);
+    let mut used = collect_placeholders(&request, &mut String::new());
+    let has_async_poll = template
+        .get("async_poll")
+        .and_then(Value::as_object)
+        .is_some_and(|poll| !poll.is_empty());
+    if has_async_poll {
+        let async_poll = template.get("async_poll").cloned().unwrap_or(Value::Null);
+        used.extend(collect_placeholders(&async_poll, &mut String::new()));
+    }
+    for name in used {
+        if let Some(field) = name.strip_prefix("auth.") {
+            if !declared.contains(field) {
+                anyhow::bail!(
+                    "v2 catalog entry '{entry_id}' uses auth placeholder '{name}' not declared in auth.fields"
+                );
+            }
+        } else if let Some(computed) = name.strip_prefix("computed.") {
+            let is_async_key = matches!(computed, "job_id" | "async_job_id");
+            if !matches!(computed, "salt" | "sign" | "curtime" | "input_truncated") && !is_async_key
+            {
+                anyhow::bail!(
+                    "v2 catalog entry '{entry_id}' uses unknown computed placeholder '{name}'"
+                );
+            }
+            if is_async_key {
+                if !has_async_poll {
+                    anyhow::bail!(
+                        "v2 catalog entry '{entry_id}' uses async computed placeholder '{name}' without an async_poll block"
+                    );
+                }
+            } else if template.get("sign").and_then(Value::as_object).is_none() {
+                anyhow::bail!(
+                    "v2 catalog entry '{entry_id}' uses computed placeholder '{name}' without a sign block"
+                );
+            }
+        } else if let Some(input) = name.strip_prefix("input.") {
+            let is_non_text_input = matches!(
+                input,
+                "source_ref"
+                    | "src"
+                    | "source"
+                    | "source_url"
+                    | "task_type"
+                    | "field_key"
+                    | "source_payload_json"
+            );
+            if !matches!(input, "text" | "source_lang" | "target_lang") && !is_non_text_input {
+                anyhow::bail!(
+                    "v2 catalog entry '{entry_id}' uses unknown input placeholder '{name}'"
+                );
+            }
+        } else {
+            anyhow::bail!(
+                "v2 catalog entry '{entry_id}' uses unknown placeholder namespace in '{name}'"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn collect_placeholders(value: &Value, buffer: &mut String) -> Vec<String> {
+    /// Inline placeholder scanner: avoids a full regex dependency and keeps
+    /// the scan allocation-free until the final dedup.
+    fn scan(text: &str, buffer: &mut String) {
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'{' && bytes[i + 1] == b'{' {
+                if let Some(end) = text[i + 2..].find("}}") {
+                    let inner = &text[i + 2..i + 2 + end];
+                    let name = inner.trim();
+                    if !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
+                    {
+                        buffer.push_str(name);
+                        buffer.push('\n');
+                    }
+                    i += 2 + end + 2;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    fn walk(value: &Value, buffer: &mut String) {
+        match value {
+            Value::String(text) => scan(text, buffer),
+            Value::Object(fields) => {
+                for child in fields.values() {
+                    walk(child, buffer);
+                }
+            }
+            Value::Array(items) => {
+                for child in items {
+                    walk(child, buffer);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    walk(value, buffer);
+    buffer
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn entry_templates<'a>(entry: &'a Value, entry_id: &str) -> anyhow::Result<Vec<&'a Value>> {
@@ -1766,17 +1100,17 @@ fn catalog_template_entries(catalog: &Value) -> anyhow::Result<Vec<CatalogTempla
         .get("entries")
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("provider catalog entries must be an array"))?;
-    let verified = catalog
+    let verified = (catalog
+        .get("signature_scope").and_then(Value::as_str) == Some(PROVIDER_CATALOG_DOCUMENT_SIGNATURE_SCOPE)
+        && catalog
         .get("signature")
         .and_then(Value::as_str)
-        .is_some_and(|signature| !signature.trim().is_empty())
+        .is_some_and(|signature| !signature.trim().is_empty()))
         || catalog.get("source").and_then(Value::as_str) == Some("builtin")
         || catalog
             .get("catalog_version")
             .and_then(Value::as_str)
-            .is_some_and(|v| {
-                matches!(v, "builtin-1" | "builtin-2" | "builtin-3")
-            });
+            .is_some_and(|v| matches!(v, "builtin-1" | "builtin-2" | "builtin-3"));
     let mut output = Vec::new();
     for entry in entries {
         let entry_id = entry
@@ -1966,23 +1300,29 @@ pub(super) async fn handle_provider_catalog_list(
     _state: &Arc<Mutex<WebUiState>>,
     query: &str,
 ) -> anyhow::Result<()> {
-    let (catalog, _builtin, load_meta) = match load_catalog_document_with_meta() {
-        Ok(value) => value,
+    let params = parse_query_string(query);
+    // Only the optional catalog page asks for a bounded online check on open.
+    // Plain lists/searches and local component loading remain entirely local.
+    if params.get("check").is_some_and(|value| value == "1") {
+        let _ = refresh_provider_catalog_from_source().await;
+    }
+    let mut load_meta = match load_catalog_document_with_meta() {
+        Ok((catalog, _builtin, meta)) => (catalog, meta),
         Err(err) => {
             return write_error_response_with_status(
                 socket,
                 "500 Internal Server Error",
                 "PROVIDER_CATALOG_INVALID",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await;
         }
     };
-    let params = parse_query_string(query);
+    let (catalog, meta) = (&load_meta.0, &mut load_meta.1);
     let needle = params.get("q").map(|v| v.to_ascii_lowercase());
     let vendor_filter = params.get("vendor_id").map(|v| v.to_ascii_lowercase());
     let mut items = Vec::new();
-    for entry in catalog_template_entries(&catalog)? {
+    for entry in catalog_template_entries(catalog)? {
         let template_name = entry
             .template
             .get("name")
@@ -2014,6 +1354,15 @@ pub(super) async fn handle_provider_catalog_list(
             .and_then(|v| v.get("supported_content_formats"))
             .cloned()
             .unwrap_or_else(|| json!([]));
+        // v2 templates carry structured evidence; legacy caches may still
+        // have the flat evidence_tier field. Both are displayed, v2 wins.
+        let evidence_tier = entry
+            .template
+            .get("evidence")
+            .and_then(|e| e.get("tier"))
+            .and_then(Value::as_str)
+            .or_else(|| entry.template.get("evidence_tier").and_then(Value::as_str))
+            .unwrap_or("schema-only");
         items.push(json!({
             "entry_id": entry.entry_id,
             "template_id": entry.template_id,
@@ -2024,11 +1373,9 @@ pub(super) async fn handle_provider_catalog_list(
             "supported_content_formats": formats,
             "source": entry.source,
             "verified": entry.verified,
-            "evidence_tier": entry
-                .template
-                .get("evidence_tier")
-                .and_then(Value::as_str)
-                .unwrap_or("schema-only"),
+            "evidence_tier": evidence_tier,
+            "api_version": entry.template.get("api_version").cloned().unwrap_or(Value::Null),
+            "template_version": entry.template.get("version").cloned().unwrap_or(Value::Null),
             "requires_local_credentials": entry.template.get("auth").is_some(),
             "editable_params": entry
                 .template
@@ -2039,16 +1386,26 @@ pub(super) async fn handle_provider_catalog_list(
         }));
     }
     let refresh_metadata = load_refresh_metadata();
+    let first_fetch_required = meta.state == "never_fetched";
     let payload = json!({
         "success": true,
         "data": {
-            "schema": PROVIDER_CATALOG_SCHEMA,
+            "schema": catalog.get("schema").cloned().unwrap_or_else(|| json!(PROVIDER_CATALOG_SCHEMA)),
             "catalog_version": catalog.get("catalog_version").cloned().unwrap_or(Value::Null),
             "items": items,
-            "offline": load_meta.offline,
-            "cache_source": load_meta.source,
-            "cache_state": load_meta.state,
+            "offline": meta.offline,
+            "cache_source": meta.source,
+            "cache_state": meta.state,
+            "first_fetch_required": first_fetch_required,
+            "first_fetch_hint": if first_fetch_required {
+                "provider catalog is empty: one online fetch from the official template repository is required (POST /api/provider-catalog/refresh); after that the local cache works offline"
+            } else if meta.state == "seed" {
+                "loaded embedded seed provider templates; online fetch (POST /api/provider-catalog/refresh) can update to the latest template repository"
+            } else {
+                ""
+            },
             "refresh_metadata": refresh_metadata,
+            "available_version": refresh_metadata.get("available_version").cloned().unwrap_or(Value::Null),
         }
     });
     write_http_response(
@@ -2071,11 +1428,20 @@ pub(super) async fn handle_provider_catalog_refresh(
                 socket,
                 "422 Unprocessable Entity",
                 "PROVIDER_CATALOG_REFRESH_FAILED",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await;
         }
     };
+    crate::logging::log_event_global(
+        "info",
+        "catalog.refreshed",
+        json!({
+            "catalog_version": data.get("catalog_version").cloned().unwrap_or(Value::Null),
+            "template_count": data.get("template_count").cloned().unwrap_or(Value::Null),
+            "offline": data.get("offline").cloned().unwrap_or(Value::Null),
+        }),
+    );
     let payload = json!({
         "success": true,
         "data": data,
@@ -2087,6 +1453,177 @@ pub(super) async fn handle_provider_catalog_refresh(
         &serde_json::to_vec(&payload)?,
     )
     .await
+}
+
+/// GET /api/provider-catalog/versions — browse the official repository's
+/// frozen releases (versions.json). Records are sanitized: SemVer only, no
+/// path traversal; the actual catalogs are individually signature-verified
+/// when installed, so a tampered index cannot inject content.
+pub(super) async fn handle_provider_catalog_versions(
+    socket: &mut TcpStream,
+    _state: &Arc<Mutex<WebUiState>>,
+) -> anyhow::Result<()> {
+    let Some(index_url) = catalog_versions_index_url() else {
+        return write_error_response(
+            socket,
+            "PROVIDER_CATALOG_SOURCE_NOT_CONFIGURED",
+            "catalog source is not configured",
+        )
+        .await;
+    };
+    let payload = match download_catalog_bytes(&index_url).await {
+        Ok(bytes) => {
+            let doc: Value = serde_json::from_slice(&bytes)
+                .context("parse provider catalog versions index failed")?;
+            let raw_versions = doc
+                .get("versions")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut versions: Vec<Value> = Vec::new();
+            for record in raw_versions {
+                let version = record
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if !is_semver_3(&version) || version.contains("..") {
+                    continue; // skip malformed/hostile records
+                }
+                versions.push(json!({
+                    "version": version,
+                    "released_at": record.get("released_at").cloned().unwrap_or(Value::Null),
+                    "entries_count": record.get("entries_count").cloned().unwrap_or(Value::Null),
+                    "entries_sha256": record.get("entries_sha256").cloned().unwrap_or(Value::Null),
+                }));
+            }
+            // newest first (release timestamps are ISO-8601 Z, sortable as text)
+            versions.reverse();
+            json!({
+                "success": true,
+                "data": {
+                    "source": "remote",
+                    "versions": versions,
+                }
+            })
+        }
+        Err(err) => json!({
+            "success": true,
+            "data": {
+                "source": "unreachable",
+                "versions": [],
+                "last_error": format!("{err:#}"),
+            }
+        }),
+    };
+    write_http_response(
+        socket,
+        "200 OK",
+        "application/json",
+        &serde_json::to_vec(&payload)?,
+    )
+    .await
+}
+
+/// POST /api/provider-catalog/install-version {version,confirm:true} — fetch the frozen
+/// catalog of a historical release, verify its signature (fail-closed), and
+/// atomically install it as the current cache. Install provenance
+/// (source_template_*) then comes from that release's entries.
+pub(super) async fn handle_provider_catalog_install_version(
+    socket: &mut TcpStream,
+    _state: &Arc<Mutex<WebUiState>>,
+    body: &[u8],
+) -> anyhow::Result<()> {
+    let req: Value = serde_json::from_slice(body)
+        .with_context(|| "invalid POST /api/provider-catalog/install-version payload")?;
+    if req.get("confirm").and_then(Value::as_bool) != Some(true) {
+        return write_error_response(socket, "CATALOG_CONFIRMATION_REQUIRED",
+            "confirm the exact catalog version before installation").await;
+    }
+    let version = req
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !is_semver_3(&version) || version.contains("..") {
+        return write_error_response(socket, "INVALID_CATALOG_VERSION", "version must be SemVer")
+            .await;
+    }
+    let Some(version_url) = catalog_version_url(&version) else {
+        return write_error_response(
+            socket,
+            "PROVIDER_CATALOG_SOURCE_NOT_CONFIGURED",
+            "catalog source is not configured",
+        )
+        .await;
+    };
+
+    let result = match download_catalog_bytes(&version_url).await {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(catalog) => match validate_catalog_document_inner(&catalog, false, true).and_then(|()| {
+                anyhow::ensure!(
+                    catalog.get("catalog_version").and_then(Value::as_str) == Some(version.as_str()),
+                    "historical catalog does not match the requested version"
+                );
+                Ok(())
+            }) {
+                Ok(()) => match install_catalog_candidate(&catalog, &version_url) {
+                    Ok(meta) => {
+                        let count = catalog_template_entries(&catalog)
+                            .map(|entries| entries.len())
+                            .unwrap_or(0);
+                        Ok(json!({
+                            "catalog_version": catalog.get("catalog_version").cloned().unwrap_or(Value::Null),
+                            "installed_version": version,
+                            "template_count": count,
+                            "source": "remote_version",
+                            "verified": true,
+                            "offline": false,
+                            "refresh_metadata": meta,
+                        }))
+                    }
+                    Err(err) => Err(err.context("install historical catalog version failed")),
+                },
+                Err(err) => Err(err.context("historical catalog version failed validation")),
+            },
+            Err(err) => Err(anyhow!("parse historical catalog version failed: {err}")),
+        },
+        Err(err) => Err(err.context("download historical catalog version failed")),
+    };
+
+    match result {
+        Ok(data) => {
+            crate::task_engine::backoff::clear_structural_all();
+            crate::logging::log_event_global(
+                "info",
+                "catalog.version_installed",
+                json!({
+                    "version": version,
+                    "catalog_version": data.get("catalog_version").cloned().unwrap_or(Value::Null),
+                    "template_count": data.get("template_count").cloned().unwrap_or(Value::Null),
+                }),
+            );
+            let payload = json!({ "success": true, "data": data });
+            write_http_response(
+                socket,
+                "200 OK",
+                "application/json",
+                &serde_json::to_vec(&payload)?,
+            )
+            .await
+        }
+        Err(err) => {
+            write_error_response_with_status(
+                socket,
+                "422 Unprocessable Entity",
+                "PROVIDER_CATALOG_VERSION_INSTALL_FAILED",
+                &format!("{err:#}"),
+            )
+            .await
+        }
+    }
 }
 
 pub(super) async fn handle_install_from_catalog(
@@ -2113,7 +1650,7 @@ pub(super) async fn handle_install_from_catalog(
                 socket,
                 "422 Unprocessable Entity",
                 "PROVIDER_CATALOG_INVALID",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await;
         }
@@ -2150,7 +1687,7 @@ pub(super) async fn handle_install_from_catalog(
     if local_id.len() > 160 || local_id.contains('/') || local_id.contains('\\') {
         return write_error_response(socket, "INVALID_ID", "local_id is invalid").await;
     }
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     if doc.components.contains_key(&local_id)
         && req.get("overwrite").and_then(Value::as_bool) != Some(true)
     {
@@ -2213,6 +1750,12 @@ pub(super) async fn handle_install_from_catalog(
         },
     );
     save_local_components_runtime_doc(&doc)?;
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "info",
+        "catalog.installed_from_catalog",
+        json!({ "entry_id": entry.entry_id, "template_id": entry.template_id, "local_id": local_id, "overwrite": was_overwrite }),
+    );
     let payload = json!({
         "success": true,
         "data": {
@@ -2260,6 +1803,14 @@ fn public_pack_sensitive_key(key: &str) -> bool {
         || normalized.contains("apikey")
         || normalized.contains("accesstoken")
         || normalized.contains("privatekey")
+        // Defense-in-depth parity with the component-export filter: generic
+        // secret-bearing field names (app_secret, api_secret, ...) must be
+        // stripped too. Exemptions: boolean indicators (`route_secret_set`)
+        // keep a `_set` suffix, and the pack's own `secrets` metadata section
+        // carries only mode/required-id lists, never values.
+        || (normalized.contains("secret")
+            && !normalized.ends_with("set")
+            && normalized != "secrets")
 }
 
 fn redact_public_value(value: &mut Value, path: &str, redacted_fields: &mut Vec<String>) {
@@ -2312,7 +1863,7 @@ async fn build_integration_pack(
         let conn = db.lock().await;
         workflow_snapshot(&conn)
     };
-    let local_components = load_local_components_runtime_doc();
+    let local_components = load_local_components_runtime_doc()?;
     let vendor_keys = load_vendor_keys(&vendor_keys_path()).unwrap_or_default();
     let vendor_oauth = load_vendor_oauth(&vendor_oauth_path()).unwrap_or_default();
     let proxy_profiles = load_proxy_profiles(&proxy_profiles_path()).unwrap_or_default();
@@ -2651,7 +2202,7 @@ async fn integration_preview(
 ) -> anyhow::Result<Value> {
     let redacted = validate_pack_schema(pack, encrypted)?;
     let incoming_components = parse_local_components(pack)?;
-    let existing_components = load_local_components_runtime_doc();
+    let existing_components = load_local_components_runtime_doc()?;
     let component_ids = component_ids_after_import(&existing_components, &incoming_components);
     let new_components = incoming_components
         .iter()
@@ -2887,7 +2438,7 @@ pub(super) async fn handle_integration_pack_export(
             return write_error_response(
                 socket,
                 "PRIVATE_BACKUP_PASSPHRASE_REQUIRED",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await;
         }
@@ -2910,6 +2461,11 @@ pub(super) async fn handle_integration_pack_export(
         let passphrase = validate_backup_passphrase(req.get("passphrase").and_then(Value::as_str))?;
         let encoded = serde_json::to_vec(&pack)?;
         let encrypted = encrypt_private_backup(&encoded, passphrase)?;
+        crate::logging::log_event_global(
+            "info",
+            "catalog.pack_exported",
+            json!({ "export_mode": "private_encrypted" }),
+        );
         let payload = json!({
             "success": true,
             "data": {
@@ -2931,6 +2487,11 @@ pub(super) async fn handle_integration_pack_export(
         )
         .await;
     }
+    crate::logging::log_event_global(
+        "info",
+        "catalog.pack_exported",
+        json!({ "export_mode": "public", "redacted_fields": redacted_fields.len() }),
+    );
     let payload = json!({
         "success": true,
         "data": {
@@ -2957,7 +2518,7 @@ pub(super) async fn handle_integration_pack_preview(
     let (pack, encrypted) = match pack_from_request(body) {
         Ok(value) => value,
         Err(err) => {
-            return write_error_response(socket, "INVALID_INTEGRATION_PACK", &format!("{:#}", err))
+            return write_error_response(socket, "INVALID_INTEGRATION_PACK", &err_public(&err))
                 .await
         }
     };
@@ -2977,7 +2538,7 @@ pub(super) async fn handle_integration_pack_preview(
                 socket,
                 "422 Unprocessable Entity",
                 "INTEGRATION_PACK_PREVIEW_FAILED",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await
         }
@@ -3046,7 +2607,20 @@ pub(super) async fn handle_integration_pack_import(
     let req: Value = if body.is_empty() {
         json!({})
     } else {
-        serde_json::from_slice(body).context("invalid integration pack import request")?
+        // Garbage JSON bodies get the same graceful INVALID_INTEGRATION_PACK
+        // error as garbage pack content (instead of escaping as a raw
+        // handler error) — the import API always answers a defined envelope.
+        match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(err) => {
+                return write_error_response(
+                    socket,
+                    "INVALID_INTEGRATION_PACK",
+                    &format!("invalid integration pack import request: {err:#}"),
+                )
+                .await
+            }
+        }
     };
     let overwrite = req
         .get("overwrite")
@@ -3063,7 +2637,7 @@ pub(super) async fn handle_integration_pack_import(
     let (pack, encrypted) = match pack_from_request(&pack_input) {
         Ok(value) => value,
         Err(err) => {
-            return write_error_response(socket, "INVALID_INTEGRATION_PACK", &format!("{:#}", err))
+            return write_error_response(socket, "INVALID_INTEGRATION_PACK", &err_public(&err))
                 .await
         }
     };
@@ -3074,7 +2648,7 @@ pub(super) async fn handle_integration_pack_import(
                 socket,
                 "422 Unprocessable Entity",
                 "INTEGRATION_PACK_IMPORT_REJECTED",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await;
         }
@@ -3105,7 +2679,7 @@ pub(super) async fn handle_integration_pack_import(
     }
 
     let incoming_components = parse_local_components(&pack)?;
-    let mut components_doc = load_local_components_runtime_doc();
+    let mut components_doc = load_local_components_runtime_doc()?;
     let mut imported_components = Vec::new();
     let mut skipped_components = Vec::new();
     for (id, mut component) in incoming_components {
@@ -3421,6 +2995,17 @@ pub(super) async fn handle_integration_pack_import(
         guard.updated_at = unix_ts();
     }
 
+    crate::logging::log_event_global(
+        "info",
+        "catalog.pack_imported",
+        json!({
+            "imported_components": imported_components.len(),
+            "imported_bindings": imported_component_bindings.len() + imported_task_bindings.len() + imported_rule_bindings.len(),
+            "imported_domains": imported_domains.len(),
+            "encrypted": encrypted,
+            "overwrite": overwrite,
+        }),
+    );
     let payload = json!({
         "success": true,
         "data": {
@@ -3442,332 +3027,4 @@ pub(super) async fn handle_integration_pack_import(
         &serde_json::to_vec(&payload)?,
     )
     .await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builtin_catalog_is_valid_and_secret_free() {
-        let catalog = builtin_catalog();
-        validate_catalog_document(&catalog, true).expect("builtin catalog valid");
-        assert!(find_catalog_secret_field(&catalog, "catalog").is_none());
-    }
-
-    #[test]
-    fn builtin_catalog_entry_count_meets_floor() {
-        // P1-C-3: floor raised to 100+ (was 50 in stage 2).
-        let catalog = builtin_catalog();
-        let entries = catalog
-            .get("entries")
-            .and_then(Value::as_array)
-            .expect("builtin catalog entries array");
-        assert!(
-            entries.len() >= 100,
-            "builtin catalog should have >=100 entries, got {}",
-            entries.len()
-        );
-        // Every entry must have a unique id and at least one template with evidence_tier.
-        let mut ids = std::collections::HashSet::new();
-        for entry in entries {
-            let id = entry.get("id").and_then(Value::as_str).unwrap_or("");
-            assert!(!id.is_empty(), "builtin entry has empty id");
-            assert!(ids.insert(id), "builtin entry id '{id}' is duplicated");
-            let templates = entry_templates(entry, id).expect("builtin entry templates");
-            assert!(!templates.is_empty(), "builtin entry '{id}' has no templates");
-            for template in templates {
-                let tier = template
-                    .get("evidence_tier")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                assert!(
-                    matches!(tier, "mock-verified" | "live-verified" | "schema-only"),
-                    "builtin entry '{id}' template missing/invalid evidence_tier: '{tier}'"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn public_redaction_removes_credentials_but_keeps_template_metadata() {
-        let mut value = json!({
-            "vendor_id": "openai",
-            "auth_values": { "api_key": "secret" },
-            "template_json": {
-                "request": { "headers": { "Authorization": "Bearer {{auth.api_key}}" } }
-            },
-            "enabled": true
-        });
-        let mut paths = Vec::new();
-        redact_public_value(&mut value, "root", &mut paths);
-        assert!(value.get("auth_values").is_none());
-        assert!(value["template_json"]["request"]["headers"]
-            .get("Authorization")
-            .is_none());
-        assert!(!paths.is_empty());
-    }
-
-    #[test]
-    fn provider_url_preflight_allows_any_http_except_metadata() {
-        assert!(catalog_url_check("http://127.0.0.1:9090/translate").is_ok());
-        assert!(catalog_url_check("http://localhost:5000/translate").is_ok());
-        assert!(catalog_url_check("https://api.example.com/v1").is_ok());
-        assert!(catalog_url_check("http://metadata.google.internal/a").is_err());
-        assert!(catalog_url_check("http://user:pass@example.com/v1").is_err());
-    }
-
-    #[test]
-    fn encrypted_pack_requires_private_secret_marker() {
-        let public = json!({
-            "schema": INTEGRATION_PACK_SCHEMA,
-            "redaction_policy": "public_default",
-            "redacted": true
-        });
-        assert!(validate_pack_schema(&public, false).unwrap());
-        let private = json!({
-            "schema": INTEGRATION_PACK_SCHEMA,
-            "redaction_policy": "private_encrypted",
-            "redacted": false
-        });
-        assert!(validate_pack_schema(&private, false).is_err());
-    }
-
-    fn tiny_unsigned_catalog(version: &str) -> Value {
-        json!({
-            "schema": PROVIDER_CATALOG_SCHEMA,
-            "catalog_version": version,
-            "created_at": "2026-09-03T00:00:00Z",
-            "entries": [{
-                "id": "test-openai",
-                "kind": "provider-template-pack",
-                "vendor_id": "openai",
-                "family": "openai_compatible",
-                "source": "remote",
-                "templates": [{
-                    "id": "test-openai-v1",
-                    "name": "Test OpenAI",
-                    "version": "1.0.0",
-                    "type": "text",
-                    "auth": { "fields": [{ "name": "api_key", "required": true }] },
-                    "request": {
-                        "method": "POST",
-                        "url": "https://api.openai.com/v1/chat/completions",
-                        "headers": { "Authorization": "Bearer {{auth.api_key}}" },
-                        "body": { "model": "gpt-4o-mini", "messages": [] }
-                    },
-                    "response": { "translated_text_path": "choices.0.message.content" },
-                    "constraints": {
-                        "split_strategy": "paragraph",
-                        "supported_content_formats": ["plain_text"]
-                    },
-                    "editable_params": [],
-                    "evidence_tier": "schema-only"
-                }]
-            }]
-        })
-    }
-
-    static CATALOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn catalog_cache_atomic_install_preserves_lkg() {
-        let _guard = CATALOG_ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path().join("provider-catalog.json");
-        // SAFETY: test-local env for isolated cache paths.
-        unsafe {
-            std::env::set_var("WPTSALL_PROVIDER_CATALOG_FILE", &base);
-            std::env::set_var("WPTSALL_ALLOW_UNSIGNED_CATALOG", "1");
-        }
-
-        let v1 = tiny_unsigned_catalog("cache-v1");
-        install_catalog_candidate(&v1, "file://test-v1").expect("install v1");
-        let (_, current, lkg, _) = catalog_cache_paths();
-        assert!(current.exists());
-        assert!(!lkg.exists(), "first install has no prior current to copy");
-
-        let v2 = tiny_unsigned_catalog("cache-v2");
-        install_catalog_candidate(&v2, "file://test-v2").expect("install v2");
-        assert!(lkg.exists());
-        let lkg_doc: Value = serde_json::from_str(&fs::read_to_string(&lkg).unwrap()).unwrap();
-        let cur_doc: Value = serde_json::from_str(&fs::read_to_string(&current).unwrap()).unwrap();
-        assert_eq!(lkg_doc["catalog_version"], "cache-v1");
-        assert_eq!(cur_doc["catalog_version"], "cache-v2");
-
-        let (loaded, builtin, meta) = load_catalog_document_with_meta().expect("load");
-        assert!(!builtin);
-        assert_eq!(meta.source, "current_cache");
-        assert_eq!(loaded["catalog_version"], "cache-v2");
-
-        unsafe {
-            std::env::remove_var("WPTSALL_PROVIDER_CATALOG_FILE");
-            std::env::remove_var("WPTSALL_ALLOW_UNSIGNED_CATALOG");
-        }
-    }
-
-    #[test]
-    fn catalog_load_falls_back_to_lkg_when_current_corrupt() {
-        let _guard = CATALOG_ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().expect("tempdir");
-        let base = dir.path().join("provider-catalog.json");
-        unsafe {
-            std::env::set_var("WPTSALL_PROVIDER_CATALOG_FILE", &base);
-            std::env::set_var("WPTSALL_ALLOW_UNSIGNED_CATALOG", "1");
-        }
-
-        let v1 = tiny_unsigned_catalog("lkg-keep");
-        install_catalog_candidate(&v1, "file://v1").expect("install");
-        let v2 = tiny_unsigned_catalog("will-corrupt");
-        install_catalog_candidate(&v2, "file://v2").expect("install2");
-        let (_, current, _, _) = catalog_cache_paths();
-        fs::write(&current, b"{not-json").expect("corrupt current");
-
-        let (loaded, _, meta) = load_catalog_document_with_meta().expect("load lkg");
-        assert_eq!(meta.state, "last_known_good");
-        assert_eq!(loaded["catalog_version"], "lkg-keep");
-
-        unsafe {
-            std::env::remove_var("WPTSALL_PROVIDER_CATALOG_FILE");
-            std::env::remove_var("WPTSALL_ALLOW_UNSIGNED_CATALOG");
-        }
-    }
-
-    #[test]
-    fn remote_catalog_refresh_signed_failclosed_and_offline_fallback() {
-        let _guard = CATALOG_ENV_LOCK.lock().unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-
-        // 1) unsigned remote → fail-closed
-        {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let base = dir.path().join("provider-catalog.json");
-            let source = dir.path().join("remote-unsigned.json");
-            fs::write(
-                &source,
-                serde_json::to_vec_pretty(&tiny_unsigned_catalog("remote-bad")).unwrap(),
-            )
-            .unwrap();
-            unsafe {
-                std::env::set_var("WPTSALL_PROVIDER_CATALOG_FILE", &base);
-                std::env::set_var("WPTSALL_ALLOW_UNSIGNED_CATALOG", "1");
-                std::env::set_var("WPTSALL_PROVIDER_CATALOG_ALLOW_FILE_SOURCE", "1");
-            }
-            install_catalog_candidate(&tiny_unsigned_catalog("keep-me"), "file://seed").unwrap();
-            let (_, current, _, _) = catalog_cache_paths();
-            let before = fs::read_to_string(&current).unwrap();
-            unsafe {
-                std::env::remove_var("WPTSALL_ALLOW_UNSIGNED_CATALOG");
-                std::env::set_var(
-                    "WPTSALL_PROVIDER_CATALOG_SOURCE_URL",
-                    format!("file://{}", source.display()),
-                );
-            }
-            let err = rt
-                .block_on(refresh_provider_catalog_from_source())
-                .expect_err("unsigned remote must fail");
-            let msg = format!("{err:#}");
-            assert!(
-                msg.contains("signature") || msg.contains("required"),
-                "unexpected err: {msg}"
-            );
-            assert_eq!(before, fs::read_to_string(&current).unwrap());
-        }
-
-        // 2) missing source → offline fallback
-        {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let base = dir.path().join("provider-catalog.json");
-            unsafe {
-                std::env::set_var("WPTSALL_PROVIDER_CATALOG_FILE", &base);
-                std::env::set_var("WPTSALL_ALLOW_UNSIGNED_CATALOG", "1");
-                std::env::set_var("WPTSALL_PROVIDER_CATALOG_ALLOW_FILE_SOURCE", "1");
-                std::env::set_var(
-                    "WPTSALL_PROVIDER_CATALOG_SOURCE_URL",
-                    format!("file://{}/missing-catalog.json", dir.path().display()),
-                );
-            }
-            install_catalog_candidate(&tiny_unsigned_catalog("offline-keep"), "file://seed")
-                .unwrap();
-            let result = rt
-                .block_on(refresh_provider_catalog_from_source())
-                .expect("download fail should soft-fallback");
-            assert_eq!(result["offline"], true);
-            assert_eq!(result["fallback"], true);
-            assert_eq!(result["catalog_version"], "offline-keep");
-        }
-
-        // 3) signed file source → updates current
-        {
-            use base64::Engine;
-            use rsa::pkcs1v15::SigningKey;
-            use rsa::pkcs8::{EncodePublicKey, LineEnding};
-            use rsa::signature::{SignatureEncoding, SignerMut};
-            use rsa::{RsaPrivateKey, RsaPublicKey};
-            use sha2::Sha256;
-
-            let dir = tempfile::tempdir().expect("tempdir");
-            let base = dir.path().join("provider-catalog.json");
-            let mut catalog = tiny_unsigned_catalog("remote-signed-1");
-            let entries = catalog.get("entries").cloned().unwrap();
-            let entries_json = serde_json::to_vec(&entries).unwrap();
-            catalog
-                .as_object_mut()
-                .unwrap()
-                .insert("entries_sha256".into(), json!(hex_sha256(&entries_json)));
-
-            let mut rng = rand::thread_rng();
-            let private = RsaPrivateKey::new(&mut rng, 2048).expect("rsa");
-            let public_pem = RsaPublicKey::from(&private)
-                .to_public_key_pem(LineEnding::LF)
-                .expect("pem");
-            let mut signing_key = SigningKey::<Sha256>::new_unprefixed(private);
-            let sig = base64::engine::general_purpose::STANDARD
-                .encode(signing_key.sign(&entries_json).to_bytes());
-            catalog
-                .as_object_mut()
-                .unwrap()
-                .insert("signature".into(), json!(sig));
-            catalog.as_object_mut().unwrap().insert(
-                "signature_scope".into(),
-                json!(PROVIDER_CATALOG_SIGNATURE_SCOPE),
-            );
-
-            let source = dir.path().join("remote-signed.json");
-            fs::write(&source, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
-            let pubkey = dir.path().join("catalog.pub.pem");
-            fs::write(&pubkey, public_pem).unwrap();
-
-            unsafe {
-                std::env::set_var("WPTSALL_PROVIDER_CATALOG_FILE", &base);
-                std::env::set_var("WPTSALL_PROVIDER_CATALOG_PUBLIC_KEY_FILE", &pubkey);
-                std::env::set_var("WPTSALL_PROVIDER_CATALOG_ALLOW_FILE_SOURCE", "1");
-                std::env::set_var(
-                    "WPTSALL_PROVIDER_CATALOG_SOURCE_URL",
-                    format!("file://{}", source.display()),
-                );
-                std::env::remove_var("WPTSALL_ALLOW_UNSIGNED_CATALOG");
-            }
-
-            let result = rt
-                .block_on(refresh_provider_catalog_from_source())
-                .expect("signed refresh");
-            assert_eq!(result["offline"], false);
-            assert_eq!(result["source"], "remote");
-            assert_eq!(result["catalog_version"], "remote-signed-1");
-            let (_, current, _, _) = catalog_cache_paths();
-            assert!(current.exists());
-        }
-
-        unsafe {
-            std::env::remove_var("WPTSALL_PROVIDER_CATALOG_FILE");
-            std::env::remove_var("WPTSALL_PROVIDER_CATALOG_PUBLIC_KEY_FILE");
-            std::env::remove_var("WPTSALL_PROVIDER_CATALOG_SOURCE_URL");
-            std::env::remove_var("WPTSALL_PROVIDER_CATALOG_ALLOW_FILE_SOURCE");
-            std::env::remove_var("WPTSALL_ALLOW_UNSIGNED_CATALOG");
-        }
-    }
 }

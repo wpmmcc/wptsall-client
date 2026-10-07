@@ -7,17 +7,91 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use crate::bindings::{
-    load_proxy_profiles, load_vendor_keys, load_vendor_oauth, save_proxy_profiles,
-    save_vendor_keys, save_vendor_oauth,
-};
 use crate::logging::unix_ts;
 use crate::types::*;
 
 use super::auth::{base64_url_encode_bytes, simple_urlencode};
-use super::errors::{write_conflict_response, write_error_response, write_not_found_response};
+use super::errors::{
+    err_public, write_conflict_response, write_error_response, write_not_found_response,
+};
 use super::http::{parse_query_string, write_http_response};
 use super::{proxy_profiles_path, vendor_keys_path, vendor_oauth_path};
+
+pub(super) mod config_store;
+pub(super) mod oauth_flow;
+use config_store::{load_config, save_config};
+
+fn valid_integration_fields(request: &Value, kind: &str) -> bool {
+    let Some(fields) = request.as_object() else {
+        return false;
+    };
+    for name in [
+        "id",
+        "vendor_id",
+        "label",
+        "grant_type",
+        "auth_url",
+        "token_url",
+        "client_id",
+        "client_secret",
+        "scopes",
+        "token_field",
+        "name",
+        "host",
+        "protocol",
+        "username",
+        "password",
+    ] {
+        if fields.get(name).is_some_and(|value| !value.is_string()) {
+            return false;
+        }
+    }
+    if fields
+        .get("enabled")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return false;
+    }
+    for (name, minimum, maximum) in [
+        ("max_concurrent", 1, u32::MAX as u64),
+        ("weight", 0, u32::MAX as u64),
+        ("max_input_chars", 0, u32::MAX as u64),
+    ] {
+        if fields.get(name).is_some_and(|value| {
+            !value
+                .as_u64()
+                .is_some_and(|value| value >= minimum && value <= maximum)
+        }) {
+            return false;
+        }
+    }
+    for name in ["requests_per_second", "max_file_size_mb"] {
+        if fields.get(name).is_some_and(|value| {
+            !value
+                .as_f64()
+                .is_some_and(|value| value.is_finite() && value >= 0.0)
+        }) {
+            return false;
+        }
+    }
+    let maps: &[&str] = match kind {
+        "keys" => &["auth_values"],
+        "oauth" => &["extra_params", "auth_extra_params"],
+        _ => &[],
+    };
+    if maps.iter().any(|name| {
+        fields.get(*name).is_some_and(|value| {
+            !value
+                .as_object()
+                .is_some_and(|values| values.values().all(Value::is_string))
+        })
+    }) {
+        return false;
+    }
+    !fields
+        .get("port")
+        .is_some_and(|value| value.as_u64().is_none())
+}
 
 // ---------------------------------------------------------------------------
 // Vendor Keys CRUD
@@ -25,11 +99,11 @@ use super::{proxy_profiles_path, vendor_keys_path, vendor_oauth_path};
 
 pub(super) async fn handle_vendor_keys_list(
     socket: &mut TcpStream,
-    _state: &Arc<Mutex<WebUiState>>,
+    state: &Arc<Mutex<WebUiState>>,
     query: &str,
 ) -> anyhow::Result<()> {
     let path = vendor_keys_path();
-    let doc = load_vendor_keys(&path).unwrap_or_default();
+    let doc: VendorKeysDoc = load_config(state, &path, "vendor_keys_doc").await?;
     let params = parse_query_string(query);
     let vendor_id_filter = params
         .get("vendor_id")
@@ -77,6 +151,14 @@ pub(super) async fn handle_vendor_key_create(
 ) -> anyhow::Result<()> {
     let req: Value = serde_json::from_slice(body)
         .with_context(|| "invalid POST /api/vendor-keys json payload")?;
+    if !valid_integration_fields(&req, "keys") {
+        return write_error_response(
+            socket,
+            "INVALID_INTEGRATION_CONFIG",
+            "invalid integration field shape or limit",
+        )
+        .await;
+    }
     let id = req
         .get("id")
         .and_then(|v| v.as_str())
@@ -125,7 +207,8 @@ pub(super) async fn handle_vendor_key_create(
         .unwrap_or(0.0);
 
     let path = vendor_keys_path();
-    let mut doc = load_vendor_keys(&path).unwrap_or_default();
+    let mut doc: VendorKeysDoc = load_config(state, &path, "vendor_keys_doc").await?;
+    let before = doc.clone();
     if doc.keys.contains_key(&id) {
         return write_conflict_response(socket, "DUPLICATE_ID", "key id already exists").await;
     }
@@ -143,15 +226,12 @@ pub(super) async fn handle_vendor_key_create(
             max_file_size_mb,
         },
     );
-    save_vendor_keys(&path, &doc)?;
-    let db_arc = {
-        let g = state.lock().await;
-        std::sync::Arc::clone(&g.db)
-    };
-    {
-        let db = db_arc.lock().await;
-        let _ = crate::db::vendor::save_vendor_keys_doc(&db, &doc);
-    }
+    save_config(state, &path, "vendor_keys_doc", &before, &doc).await?;
+    crate::logging::log_event_global(
+        "info",
+        "integration.vendor_key_created",
+        json!({ "id": id }),
+    );
     let payload = json!({ "success": true, "data": { "id": id } });
     write_http_response(
         socket,
@@ -170,8 +250,17 @@ pub(super) async fn handle_vendor_key_update(
 ) -> anyhow::Result<()> {
     let req: Value = serde_json::from_slice(body)
         .with_context(|| "invalid PUT /api/vendor-keys/:id json payload")?;
+    if !valid_integration_fields(&req, "keys") {
+        return write_error_response(
+            socket,
+            "INVALID_INTEGRATION_CONFIG",
+            "invalid integration field shape or limit",
+        )
+        .await;
+    }
     let path = vendor_keys_path();
-    let mut doc = load_vendor_keys(&path).unwrap_or_default();
+    let mut doc: VendorKeysDoc = load_config(state, &path, "vendor_keys_doc").await?;
+    let before = doc.clone();
     let Some(key) = doc.keys.get_mut(id) else {
         return write_not_found_response(socket, "NOT_FOUND", "vendor key not found").await;
     };
@@ -201,15 +290,12 @@ pub(super) async fn handle_vendor_key_update(
     if let Some(mfs) = req.get("max_file_size_mb").and_then(|v| v.as_f64()) {
         key.max_file_size_mb = mfs;
     }
-    save_vendor_keys(&path, &doc)?;
-    let db_arc = {
-        let g = state.lock().await;
-        std::sync::Arc::clone(&g.db)
-    };
-    {
-        let db = db_arc.lock().await;
-        let _ = crate::db::vendor::save_vendor_keys_doc(&db, &doc);
-    }
+    save_config(state, &path, "vendor_keys_doc", &before, &doc).await?;
+    crate::logging::log_event_global(
+        "info",
+        "integration.vendor_key_updated",
+        json!({ "id": id }),
+    );
     let payload = json!({ "success": true, "data": { "id": id } });
     write_http_response(
         socket,
@@ -226,17 +312,15 @@ pub(super) async fn handle_vendor_key_delete(
     id: &str,
 ) -> anyhow::Result<()> {
     let path = vendor_keys_path();
-    let mut doc = load_vendor_keys(&path).unwrap_or_default();
+    let mut doc: VendorKeysDoc = load_config(state, &path, "vendor_keys_doc").await?;
+    let before = doc.clone();
     let removed = doc.keys.remove(id).is_some();
-    save_vendor_keys(&path, &doc)?;
-    let db_arc = {
-        let g = state.lock().await;
-        std::sync::Arc::clone(&g.db)
-    };
-    {
-        let db = db_arc.lock().await;
-        let _ = crate::db::vendor::save_vendor_keys_doc(&db, &doc);
-    }
+    save_config(state, &path, "vendor_keys_doc", &before, &doc).await?;
+    crate::logging::log_event_global(
+        "warn",
+        "integration.vendor_key_deleted",
+        json!({ "id": id }),
+    );
     let payload = json!({ "success": true, "data": { "id": id, "deleted": removed } });
     write_http_response(
         socket,
@@ -253,11 +337,11 @@ pub(super) async fn handle_vendor_key_delete(
 
 pub(super) async fn handle_oauth_configs_list(
     socket: &mut TcpStream,
-    _state: &Arc<Mutex<WebUiState>>,
+    state: &Arc<Mutex<WebUiState>>,
     query: &str,
 ) -> anyhow::Result<()> {
     let path = vendor_oauth_path();
-    let doc = load_vendor_oauth(&path).unwrap_or_default();
+    let doc: VendorOAuthDoc = load_config(state, &path, "vendor_oauth_doc").await?;
     let params = parse_query_string(query);
     let vendor_id_filter = params
         .get("vendor_id")
@@ -312,6 +396,14 @@ pub(super) async fn handle_oauth_config_create(
 ) -> anyhow::Result<()> {
     let req: Value = serde_json::from_slice(body)
         .with_context(|| "invalid POST /api/vendor-oauth json payload")?;
+    if !valid_integration_fields(&req, "oauth") {
+        return write_error_response(
+            socket,
+            "INVALID_INTEGRATION_CONFIG",
+            "invalid integration field shape or limit",
+        )
+        .await;
+    }
     let id = req
         .get("id")
         .and_then(|v| v.as_str())
@@ -401,7 +493,11 @@ pub(super) async fn handle_oauth_config_create(
         .to_string();
 
     let path = vendor_oauth_path();
-    let mut doc = load_vendor_oauth(&path).unwrap_or_default();
+    let mut doc: VendorOAuthDoc = load_config(state, &path, "vendor_oauth_doc").await?;
+    let before = doc.clone();
+    if doc.configs.contains_key(&id) {
+        return write_conflict_response(socket, "DUPLICATE_ID", "OAuth id already exists").await;
+    }
     doc.configs.insert(
         id.clone(),
         crate::types::OAuthConfig {
@@ -425,15 +521,8 @@ pub(super) async fn handle_oauth_config_create(
             refresh_token: None,
         },
     );
-    save_vendor_oauth(&path, &doc)?;
-    let db_arc = {
-        let g = state.lock().await;
-        std::sync::Arc::clone(&g.db)
-    };
-    {
-        let db = db_arc.lock().await;
-        let _ = crate::db::vendor::save_vendor_oauth_doc(&db, &doc);
-    }
+    save_config(state, &path, "vendor_oauth_doc", &before, &doc).await?;
+    crate::logging::log_event_global("info", "integration.oauth_created", json!({ "id": id }));
     let payload = json!({ "success": true, "data": { "id": id } });
     write_http_response(
         socket,
@@ -450,17 +539,11 @@ pub(super) async fn handle_oauth_config_delete(
     id: &str,
 ) -> anyhow::Result<()> {
     let path = vendor_oauth_path();
-    let mut doc = load_vendor_oauth(&path).unwrap_or_default();
+    let mut doc: VendorOAuthDoc = load_config(state, &path, "vendor_oauth_doc").await?;
+    let before = doc.clone();
     let removed = doc.configs.remove(id).is_some();
-    save_vendor_oauth(&path, &doc)?;
-    let db_arc = {
-        let g = state.lock().await;
-        std::sync::Arc::clone(&g.db)
-    };
-    {
-        let db = db_arc.lock().await;
-        let _ = crate::db::vendor::save_vendor_oauth_doc(&db, &doc);
-    }
+    save_config(state, &path, "vendor_oauth_doc", &before, &doc).await?;
+    crate::logging::log_event_global("warn", "integration.oauth_deleted", json!({ "id": id }));
     let payload = json!({ "success": true, "data": { "id": id, "deleted": removed } });
     write_http_response(
         socket,
@@ -479,11 +562,21 @@ pub(super) async fn handle_oauth_config_update(
 ) -> anyhow::Result<()> {
     let req: Value = serde_json::from_slice(body)
         .with_context(|| "invalid PUT /api/vendor-oauth/:id json payload")?;
+    if !valid_integration_fields(&req, "oauth") {
+        return write_error_response(
+            socket,
+            "INVALID_INTEGRATION_CONFIG",
+            "invalid integration field shape or limit",
+        )
+        .await;
+    }
     let path = vendor_oauth_path();
-    let mut doc = load_vendor_oauth(&path).unwrap_or_default();
+    let mut doc: VendorOAuthDoc = load_config(state, &path, "vendor_oauth_doc").await?;
+    let before = doc.clone();
     let Some(cfg) = doc.configs.get_mut(id) else {
         return write_not_found_response(socket, "NOT_FOUND", "oauth config not found").await;
     };
+    let identity = crate::component_rt::oauth::OAuthTokenManager::credential_fingerprint(cfg)?;
     if let Some(label) = req.get("label").and_then(|v| v.as_str()) {
         cfg.label = label.trim().to_string();
     }
@@ -528,15 +621,13 @@ pub(super) async fn handle_oauth_config_update(
     if let Some(tf) = req.get("token_field").and_then(|v| v.as_str()) {
         cfg.token_field = tf.trim().to_string();
     }
-    save_vendor_oauth(&path, &doc)?;
-    let db_arc = {
-        let g = state.lock().await;
-        std::sync::Arc::clone(&g.db)
-    };
-    {
-        let db = db_arc.lock().await;
-        let _ = crate::db::vendor::save_vendor_oauth_doc(&db, &doc);
+    if crate::component_rt::oauth::OAuthTokenManager::credential_fingerprint(cfg)? != identity {
+        cfg.cached_token = None;
+        cfg.cached_token_expires_at = 0;
+        cfg.refresh_token = None;
     }
+    save_config(state, &path, "vendor_oauth_doc", &before, &doc).await?;
+    crate::logging::log_event_global("info", "integration.oauth_updated", json!({ "id": id }));
     let payload = json!({ "success": true, "data": { "id": id } });
     write_http_response(
         socket,
@@ -553,7 +644,7 @@ pub(super) async fn handle_oauth_authorize(
     id: &str,
 ) -> anyhow::Result<()> {
     let path = vendor_oauth_path();
-    let doc = load_vendor_oauth(&path).unwrap_or_default();
+    let doc = config_store::load_oauth_for_tokens(state, &path).await?;
     let Some(config) = doc.configs.get(id).cloned() else {
         return write_not_found_response(socket, "NOT_FOUND", "oauth config not found").await;
     };
@@ -599,6 +690,14 @@ async fn handle_vendor_oauth_start(
         )
         .await;
     }
+    if crate::component_rt::oauth::OAuthTokenManager::validate_token_request(config).is_err() {
+        return write_error_response(
+            socket,
+            "INVALID_TOKEN_REQUEST",
+            "token endpoint or parameters are invalid; no authorization was created",
+        )
+        .await;
+    }
 
     // PKCE: code_verifier (64 random alphanumeric chars) + code_challenge = BASE64URL(SHA256(verifier))
     let code_verifier: String = rand::thread_rng()
@@ -617,7 +716,28 @@ async fn handle_vendor_oauth_start(
         crate::web_ui::web_ui_loopback_origin()
     );
 
-    // Build authorization URL params
+    // Reserved identity/PKCE values cannot be shadowed by provider extras.
+    let reserved = [
+        "client_id",
+        "redirect_uri",
+        "response_type",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "scope",
+    ];
+    if config
+        .auth_extra_params
+        .keys()
+        .any(|key| reserved.contains(&key.to_ascii_lowercase().as_str()))
+    {
+        return write_error_response(
+            socket,
+            "OAUTH_IDENTITY_OVERRIDE",
+            "authorization parameters must not override OAuth identity or PKCE",
+        )
+        .await;
+    }
     let mut params: Vec<(&str, String)> = vec![
         ("client_id", config.client_id.clone()),
         ("redirect_uri", redirect_uri.clone()),
@@ -634,12 +754,52 @@ async fn handle_vendor_oauth_start(
         params.push((k.as_str(), v.clone()));
     }
 
-    let qs: String = params
+    let mut authorize_url = match url::Url::parse(&config.auth_url) {
+        Ok(url) => url,
+        Err(_) => {
+            return write_error_response(
+                socket,
+                "INVALID_AUTH_URL",
+                "authorization endpoint is invalid; no authorization was created",
+            )
+            .await
+        }
+    };
+    if !(matches!(authorize_url.scheme(), "http" | "https")
+        && authorize_url.host_str().is_some()
+        && authorize_url.username().is_empty()
+        && authorize_url.password().is_none()
+        && authorize_url.fragment().is_none()
+        && crate::component_rt::runner::assert_provider_url_allowed(authorize_url.as_str()).is_ok()
+        && !authorize_url
+            .query_pairs()
+            .any(|(key, _)| reserved.contains(&key.to_ascii_lowercase().as_str())))
+    {
+        return write_error_response(
+            socket,
+            "INVALID_AUTH_URL",
+            "authorization endpoint or parameters are invalid; no authorization was created",
+        )
+        .await;
+    }
+    let query = params
         .iter()
-        .map(|(k, v)| format!("{}={}", k, simple_urlencode(v)))
+        .map(|(key, value)| format!("{}={}", simple_urlencode(key), simple_urlencode(value)))
         .collect::<Vec<_>>()
         .join("&");
-    let authorize_url = format!("{}?{}", config.auth_url, qs);
+    let query = authorize_url
+        .query()
+        .filter(|query| !query.is_empty())
+        .map(|existing| format!("{existing}&{query}"))
+        .unwrap_or(query);
+    authorize_url.set_query(Some(&query));
+    let (authorize_url,redirect_uri) = match oauth_flow::start(
+        state,config_id,config,&oauth_state,&code_verifier,&redirect_uri,authorize_url.as_str(),
+    ).await {
+        Ok(saved) => saved,
+        Err(_) => return write_conflict_response(socket,"OAUTH_AUTHORIZATION_RETAINED",
+            "original OAuth authorization is unresolved or changed; no new authorization was created").await,
+    };
 
     // Store pending state (expires in 10 minutes)
     {
@@ -695,184 +855,62 @@ pub(super) async fn handle_vendor_oauth_callback(
         .await;
     }
 
-    // Look up the pending state (remove it atomically)
-    let pending = {
-        let mut guard = state.lock().await;
-        guard.vendor_oauth_pending.remove(&oauth_state)
-    };
-
-    let Some(pending) = pending else {
-        let html =
-            vendor_oauth_result_page("授权失败", "无效或过期的 state 参数，请重新发起授权", false);
-        return write_http_response(
-            socket,
+    let (status, message, success) = match oauth_flow::complete(state, &oauth_state, &code).await {
+        Ok(oauth_flow::Outcome::Applied(expires_in)) => (
+            "200 OK",
+            format!(
+                "已成功获取 Token，有效期 {} 秒。此窗口将自动关闭。",
+                expires_in
+            ),
+            true,
+        ),
+        Ok(oauth_flow::Outcome::Rejected(status)) => (
             "400 Bad Request",
-            "text/html; charset=utf-8",
-            html.as_bytes(),
-        )
-        .await;
-    };
-
-    if unix_ts() as i64 > pending.expires_at {
-        let html = vendor_oauth_result_page(
-            "授权失败",
-            "授权流程已超时（10 分钟），请重新发起授权",
+            format!(
+                "Token 交换失败 (HTTP {})，原始请求已保留，未重复交换 Token",
+                status
+            ),
             false,
-        );
-        return write_http_response(
-            socket,
+        ),
+        Ok(oauth_flow::Outcome::MissingToken) => (
             "400 Bad Request",
-            "text/html; charset=utf-8",
-            html.as_bytes(),
-        )
-        .await;
-    }
-
-    // Load config
-    let path = vendor_oauth_path();
-    let mut doc = load_vendor_oauth(&path).unwrap_or_default();
-    let Some(config) = doc.configs.get(&pending.config_id).cloned() else {
-        let html = vendor_oauth_result_page("授权失败", "OAuth 配置不存在或已被删除", false);
-        return write_http_response(
-            socket,
-            "400 Bad Request",
-            "text/html; charset=utf-8",
-            html.as_bytes(),
-        )
-        .await;
+            "响应中缺少 access_token，原始请求已保留，未重复交换 Token".into(),
+            false,
+        ),
+        Ok(oauth_flow::Outcome::NetworkUnknown) => (
+            "500 Internal Server Error",
+            "Token 交换网络请求失败，原始请求已保留，未重复交换 Token".into(),
+            false,
+        ),
+        Err(_) => (
+            "409 Conflict",
+            "OAuth 授权状态未确认、已更改或无法保存，原始证据已保留，未重复交换 Token".into(),
+            false,
+        ),
     };
-
-    let redirect_uri = format!(
-        "{}/oauth/vendor/callback",
-        crate::web_ui::web_ui_loopback_origin()
+    let html = vendor_oauth_result_page(
+        if success {
+            "授权成功"
+        } else {
+            "授权失败"
+        },
+        &message,
+        success,
     );
-
-    // Exchange authorization code for tokens
-    let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
-
-    let form: Vec<(&str, &str)> = vec![
-        ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", &redirect_uri),
-        ("client_id", &config.client_id),
-        ("client_secret", &config.client_secret),
-        ("code_verifier", &pending.code_verifier),
-    ];
-
-    let resp = client.post(&config.token_url).form(&form).send().await;
-
-    match resp {
-        Ok(r) => {
-            let status = r.status();
-            let body: Value = r.json().await.unwrap_or(json!({}));
-
-            if !status.is_success() {
-                let err_msg = body
-                    .get("error_description")
-                    .or_else(|| body.get("error"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown error");
-                eprintln!(
-                    "vendor_oauth token exchange failed: status={}, error={}",
-                    status.as_u16(),
-                    err_msg
-                );
-                let html = vendor_oauth_result_page(
-                    "授权失败",
-                    &format!(
-                        "Token 交换失败 (HTTP {})，请检查 OAuth 配置后重试",
-                        status.as_u16()
-                    ),
-                    false,
-                );
-                return write_http_response(
-                    socket,
-                    "400 Bad Request",
-                    "text/html; charset=utf-8",
-                    html.as_bytes(),
-                )
-                .await;
-            }
-
-            let access_token = body
-                .get("access_token")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if access_token.is_empty() {
-                let html = vendor_oauth_result_page("授权失败", "响应中缺少 access_token", false);
-                return write_http_response(
-                    socket,
-                    "400 Bad Request",
-                    "text/html; charset=utf-8",
-                    html.as_bytes(),
-                )
-                .await;
-            }
-
-            let expires_in = body
-                .get("expires_in")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(3600);
-            let refresh_token = body
-                .get("refresh_token")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Persist tokens into the config
-            if let Some(cfg) = doc.configs.get_mut(&pending.config_id) {
-                cfg.cached_token = Some(access_token);
-                cfg.cached_token_expires_at = unix_ts() as i64 + expires_in;
-                if refresh_token.is_some() {
-                    cfg.refresh_token = refresh_token;
-                }
-            }
-            save_vendor_oauth(&path, &doc)?;
-            let db_arc = {
-                let g = state.lock().await;
-                std::sync::Arc::clone(&g.db)
-            };
-            {
-                let db = db_arc.lock().await;
-                let _ = crate::db::vendor::save_vendor_oauth_doc(&db, &doc);
-            }
-
-            let html = vendor_oauth_result_page(
-                "授权成功",
-                &format!(
-                    "已成功获取 Token，有效期 {} 秒。此窗口将自动关闭。",
-                    expires_in
-                ),
-                true,
-            );
-            write_http_response(
-                socket,
-                "200 OK",
-                "text/html; charset=utf-8",
-                html.as_bytes(),
-            )
-            .await
-        }
-        Err(err) => {
-            eprintln!("vendor_oauth token exchange network error: {:#}", err);
-            let html = vendor_oauth_result_page(
-                "授权失败",
-                "Token 交换网络请求失败，请检查网络连接后重试",
-                false,
-            );
-            write_http_response(
-                socket,
-                "500 Internal Server Error",
-                "text/html; charset=utf-8",
-                html.as_bytes(),
-            )
-            .await
-        }
-    }
+    write_http_response(socket, status, "text/html; charset=utf-8", html.as_bytes()).await
 }
 
 /// Result page shown in the popup window after vendor OAuth callback.
 fn vendor_oauth_result_page(title: &str, message: &str, success: bool) -> String {
+    let escape = |text: &str| {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    };
+    let title = escape(title);
+    let message = escape(message);
     let color = if success { "#16a34a" } else { "#dc2626" };
     format!(
         r#"<!doctype html><html><head><meta charset="utf-8"><title>{title}</title>
@@ -899,85 +937,32 @@ async fn handle_oauth_authorize_client_credentials(
     id: &str,
     config: crate::types::OAuthConfig,
     path: String,
-    mut doc: crate::types::VendorOAuthDoc,
+    doc: crate::types::VendorOAuthDoc,
 ) -> anyhow::Result<()> {
     if config.token_url.is_empty() {
         return write_error_response(socket, "INVALID_TOKEN_URL", "token_url is required").await;
     }
 
-    let client = Client::builder().timeout(Duration::from_secs(15)).build()?;
-    let mut form_params = HashMap::new();
-    form_params.insert("grant_type", "client_credentials".to_string());
-    form_params.insert("client_id", config.client_id.clone());
-    form_params.insert("client_secret", config.client_secret.clone());
-    if !config.scopes.is_empty() {
-        form_params.insert("scope", config.scopes.clone());
-    }
-    for (k, v) in &config.extra_params {
-        form_params.insert(k.as_str(), v.clone());
-    }
-
-    let resp = client
-        .post(&config.token_url)
-        .form(&form_params)
-        .send()
-        .await;
-
-    match resp {
-        Ok(r) => {
-            let status = r.status();
-            let body_text = r.text().await.unwrap_or_default();
-            if !status.is_success() {
-                return write_error_response(
-                    socket,
-                    "TOKEN_REQUEST_FAILED",
-                    &format!("status {}: {}", status.as_u16(), body_text),
-                )
-                .await;
-            }
-            let token_json: Value = serde_json::from_str(&body_text).unwrap_or(json!({}));
-            let access_token = token_json
-                .get("access_token")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let expires_in = token_json
-                .get("expires_in")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(3600);
-            if access_token.is_empty() {
-                return write_error_response(
-                    socket,
-                    "NO_ACCESS_TOKEN",
-                    "no access_token in response",
-                )
-                .await;
-            }
-            let token_preview = if access_token.len() > 12 {
-                format!(
-                    "Bearer {}...{}",
-                    &access_token[..6],
-                    &access_token[access_token.len() - 4..]
-                )
-            } else {
-                format!("Bearer {}", access_token)
-            };
-            if let Some(cfg) = doc.configs.get_mut(id) {
-                cfg.cached_token = Some(access_token);
-                cfg.cached_token_expires_at = unix_ts() as i64 + expires_in;
-            }
-            save_vendor_oauth(&path, &doc)?;
-            let db_arc = {
-                let g = state.lock().await;
-                std::sync::Arc::clone(&g.db)
-            };
-            {
-                let db = db_arc.lock().await;
-                let _ = crate::db::vendor::save_vendor_oauth_doc(&db, &doc);
-            }
+    let db = state.lock().await.db.clone();
+    let client = crate::component_rt::oauth::OAuthHttpClient::direct()?;
+    let manager = crate::component_rt::oauth::OAuthTokenManager::new(doc.configs, client, path)
+        .with_recovery_db(db);
+    match manager.get_token(id).await {
+        Ok(_) => {
+            let saved = manager.snapshot().await;
+            let expires_at = saved
+                .get(id)
+                .map(|config| config.cached_token_expires_at)
+                .unwrap_or(0);
+            let expires_in = expires_at.saturating_sub(unix_ts() as i64).max(0);
+            crate::logging::log_event_global(
+                "info",
+                "integration.oauth_authorized",
+                json!({ "id": id, "grant_type": "client_credentials" }),
+            );
             let payload = json!({
                 "success": true,
-                "data": { "token_preview": token_preview, "expires_in": expires_in }
+                "data": { "token_preview": "Bearer [redacted]", "expires_in": expires_in }
             });
             write_http_response(
                 socket,
@@ -987,9 +972,7 @@ async fn handle_oauth_authorize_client_credentials(
             )
             .await
         }
-        Err(err) => {
-            write_error_response(socket, "TOKEN_REQUEST_ERROR", &format!("{:#}", err)).await
-        }
+        Err(err) => write_error_response(socket, "TOKEN_REQUEST_ERROR", &err_public(&err)).await,
     }
 }
 
@@ -999,10 +982,10 @@ async fn handle_oauth_authorize_client_credentials(
 
 pub(super) async fn handle_proxy_list(
     socket: &mut TcpStream,
-    _state: &Arc<Mutex<WebUiState>>,
+    state: &Arc<Mutex<WebUiState>>,
 ) -> anyhow::Result<()> {
     let path = proxy_profiles_path();
-    let doc = load_proxy_profiles(&path).unwrap_or_default();
+    let doc: ProxyProfilesDoc = load_config(state, &path, "proxy_profiles_doc").await?;
     let items: Vec<Value> = doc
         .profiles
         .iter()
@@ -1035,6 +1018,14 @@ pub(super) async fn handle_proxy_create(
 ) -> anyhow::Result<()> {
     let req: Value = serde_json::from_slice(body)
         .with_context(|| "invalid POST /api/proxy-profiles json payload")?;
+    if !valid_integration_fields(&req, "proxy") {
+        return write_error_response(
+            socket,
+            "INVALID_INTEGRATION_CONFIG",
+            "invalid integration field shape or limit",
+        )
+        .await;
+    }
     let id = req
         .get("id")
         .and_then(|v| v.as_str())
@@ -1102,17 +1093,15 @@ pub(super) async fn handle_proxy_create(
     }
 
     let path = proxy_profiles_path();
-    let mut doc = load_proxy_profiles(&path).unwrap_or_default();
-    doc.profiles.insert(id.clone(), profile);
-    save_proxy_profiles(&path, &doc)?;
-    let db_arc = {
-        let g = state.lock().await;
-        std::sync::Arc::clone(&g.db)
-    };
-    {
-        let db = db_arc.lock().await;
-        let _ = crate::db::proxy::save_proxy_profiles_doc(&db, &doc);
+    let mut doc: ProxyProfilesDoc = load_config(state, &path, "proxy_profiles_doc").await?;
+    let before = doc.clone();
+    if doc.profiles.contains_key(&id) {
+        return write_conflict_response(socket, "DUPLICATE_ID", "proxy profile id already exists")
+            .await;
     }
+    doc.profiles.insert(id.clone(), profile);
+    save_config(state, &path, "proxy_profiles_doc", &before, &doc).await?;
+    crate::logging::log_event_global("info", "integration.proxy_created", json!({ "id": id }));
     let payload = json!({ "success": true, "data": { "id": id } });
     write_http_response(
         socket,
@@ -1131,8 +1120,17 @@ pub(super) async fn handle_proxy_update(
 ) -> anyhow::Result<()> {
     let req: Value = serde_json::from_slice(body)
         .with_context(|| "invalid PUT /api/proxy-profiles/:id json payload")?;
+    if !valid_integration_fields(&req, "proxy") {
+        return write_error_response(
+            socket,
+            "INVALID_INTEGRATION_CONFIG",
+            "invalid integration field shape or limit",
+        )
+        .await;
+    }
     let path = proxy_profiles_path();
-    let mut doc = load_proxy_profiles(&path).unwrap_or_default();
+    let mut doc: ProxyProfilesDoc = load_config(state, &path, "proxy_profiles_doc").await?;
+    let before = doc.clone();
     let Some(profile) = doc.profiles.get_mut(id) else {
         return write_not_found_response(socket, "NOT_FOUND", "proxy profile not found").await;
     };
@@ -1176,15 +1174,8 @@ pub(super) async fn handle_proxy_update(
         };
         return write_error_response(socket, code, &format!("{}", err)).await;
     }
-    save_proxy_profiles(&path, &doc)?;
-    let db_arc = {
-        let g = state.lock().await;
-        std::sync::Arc::clone(&g.db)
-    };
-    {
-        let db = db_arc.lock().await;
-        let _ = crate::db::proxy::save_proxy_profiles_doc(&db, &doc);
-    }
+    save_config(state, &path, "proxy_profiles_doc", &before, &doc).await?;
+    crate::logging::log_event_global("info", "integration.proxy_updated", json!({ "id": id }));
     let payload = json!({ "success": true, "data": { "id": id } });
     write_http_response(
         socket,
@@ -1201,17 +1192,11 @@ pub(super) async fn handle_proxy_delete(
     id: &str,
 ) -> anyhow::Result<()> {
     let path = proxy_profiles_path();
-    let mut doc = load_proxy_profiles(&path).unwrap_or_default();
+    let mut doc: ProxyProfilesDoc = load_config(state, &path, "proxy_profiles_doc").await?;
+    let before = doc.clone();
     let removed = doc.profiles.remove(id).is_some();
-    save_proxy_profiles(&path, &doc)?;
-    let db_arc = {
-        let g = state.lock().await;
-        std::sync::Arc::clone(&g.db)
-    };
-    {
-        let db = db_arc.lock().await;
-        let _ = crate::db::proxy::save_proxy_profiles_doc(&db, &doc);
-    }
+    save_config(state, &path, "proxy_profiles_doc", &before, &doc).await?;
+    crate::logging::log_event_global("warn", "integration.proxy_deleted", json!({ "id": id }));
     let payload = json!({ "success": true, "data": { "id": id, "deleted": removed } });
     write_http_response(
         socket,
@@ -1224,11 +1209,11 @@ pub(super) async fn handle_proxy_delete(
 
 pub(super) async fn handle_proxy_test(
     socket: &mut TcpStream,
-    _state: &Arc<Mutex<WebUiState>>,
+    state: &Arc<Mutex<WebUiState>>,
     id: &str,
 ) -> anyhow::Result<()> {
     let path = proxy_profiles_path();
-    let doc = load_proxy_profiles(&path).unwrap_or_default();
+    let doc: ProxyProfilesDoc = load_config(state, &path, "proxy_profiles_doc").await?;
     let Some(profile) = doc.profiles.get(id) else {
         return write_not_found_response(socket, "NOT_FOUND", "proxy profile not found").await;
     };
@@ -1264,6 +1249,11 @@ pub(super) async fn handle_proxy_test(
 
     match result {
         Ok(ip) => {
+            crate::logging::log_event_global(
+                "info",
+                "integration.proxy_tested",
+                json!({ "id": id, "ok": true }),
+            );
             let payload = json!({
                 "success": true,
                 "data": { "reachable": true, "ip": ip, "proxy_url": proxy_url }
@@ -1277,6 +1267,11 @@ pub(super) async fn handle_proxy_test(
             .await
         }
         Err(err) => {
+            crate::logging::log_event_global(
+                "warn",
+                "integration.proxy_tested",
+                json!({ "id": id, "ok": false }),
+            );
             let payload = json!({
                 "success": false,
                 "error": { "code": "PROXY_TEST_FAILED", "message": format!("{:#}", err) },

@@ -64,14 +64,3 @@ pub async fn import_integration_pack(request: Value) -> Result<Value, String> {
     )
     .await
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_non_object_pack_requests() {
-        let error = require_object(Value::String("bad".into()), "pack").unwrap_err();
-        assert!(error.contains("JSON object"));
-    }
-}

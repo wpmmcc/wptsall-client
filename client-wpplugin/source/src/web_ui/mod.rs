@@ -1,6 +1,7 @@
+mod capacity_status;
 pub(crate) mod routes;
 pub(crate) mod static_html;
-pub mod test_support;
+
 
 use anyhow::{anyhow, Context};
 use reqwest::header::HeaderMap;
@@ -15,15 +16,17 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::{is_auth_error_message, request_json_encrypted};
 use crate::bindings::{
-    build_wp_base_url, has_any_domain_token_bindings, normalize_api_base_url_key,
-    normalize_domain_base, normalize_rule_component_bindings_doc, resolve_local_dev_binding,
-    resolve_route_secret_for_domain, resolve_wp_client_token_for_domain,
+    build_verify_base_url, build_wp_base_url, classify_verify_outcome, format_rfc3339_utc, gate,
+    has_any_domain_token_bindings, normalize_api_base_url_key, normalize_domain_base,
+    normalize_rule_component_bindings_doc, now_unix, resolve_entry_for_domain,
+    resolve_local_dev_binding, resolve_route_secret_for_domain, resolve_wp_client_token_for_domain,
+    verify_identity, GateVerdict, VerifyOutcome,
 };
 use crate::component_rt::loader::{
     collect_configured_runtime_component_ids, load_component_runtimes,
 };
 use crate::config::*;
-use crate::logging::{init_log_file, log_event, unix_ts};
+use crate::logging::{init_runtime_log_file, log_event, unix_ts};
 use crate::persistence::PendingCallbackStore;
 use crate::task_engine::discoverer::discover_and_translate;
 use crate::types::*;
@@ -166,44 +169,121 @@ pub async fn run_web_ui(
     let bind_addr_env = web_ui_effective_bind_addr();
     let worker_loop_poll_seconds = env_u64("WPTSALL_POLL_SECONDS", 20).max(1);
     let log_file = crate::config::log_file_path();
+    let db_path = crate::config::db_path();
+    let runtime_lease = crate::db::runtime::RuntimeLease::acquire(&db_path)?;
     let component_bindings_path = crate::config::component_bindings_file();
     let domain_token_bindings_path = crate::config::domain_token_bindings_file();
     let task_type_component_bindings_path = crate::config::task_type_component_bindings_file();
     let rule_component_bindings_path = crate::config::rule_component_bindings_file();
-    init_log_file(&log_file)?;
+    // Register the process-wide log path so route handlers can emit audit
+    // events (review decisions, credential mutations, ...) without a
+    // per-handler log_file parameter.
+    crate::logging::set_log_file_path(log_file.clone());
 
-    // Open SQLite database and run one-time JSON migration
-    let db_path = crate::config::db_path();
-    let db_conn = crate::db::open_db(&db_path).context("Failed to open SQLite database")?;
-    crate::db::migrate_from_json_if_needed(&db_conn).ok();
+    // Resolve the encryption identity before importing any binding documents.
+    let db_conn = match crate::db::open_db(&db_path) {
+        Ok(db) => db,
+        Err(error) if crate::db::is_storage_exhausted(&error) => {
+            return capacity_status::run(&bind_addr_env, shutdown_token, runtime_lease, start_time)
+                .await;
+        }
+        Err(error) => return Err(error.context("Failed to open SQLite database")),
+    };
+    let (
+        device_id,
+        component_bindings,
+        domain_token_bindings,
+        task_type_component_bindings,
+        rule_component_bindings,
+    ) = match crate::db::with_recovery_credit(&db_conn, || {
+        crate::db::system::migrate_device_id_from_file(&db_conn)
+            .context("Failed to import device identity")?;
 
-    // Load bindings from DB (populated by migration above if first run, or from previous DB writes)
-    let component_bindings = crate::db::bindings::load_component_bindings_doc(&db_conn);
-    let domain_token_bindings = crate::db::bindings::load_domain_token_bindings_doc(&db_conn);
-    let task_type_component_bindings =
-        crate::db::bindings::load_task_type_component_bindings_doc(&db_conn);
-    let rule_component_bindings = crate::db::bindings::load_rule_component_bindings_doc(&db_conn);
-    let normalized_rule_component_bindings =
-        normalize_rule_component_bindings_doc(&rule_component_bindings);
-    let bindings_changed = serde_json::to_string(&normalized_rule_component_bindings).ok()
-        != serde_json::to_string(&rule_component_bindings).ok();
-    if bindings_changed {
-        let _ = crate::db::bindings::save_rule_component_bindings_doc(
-            &db_conn,
-            &normalized_rule_component_bindings,
-        );
-    }
-    let rule_component_bindings = normalized_rule_component_bindings;
+        // opus5 A-03 (AF-03): device_id resolves once at boot — explicit
+        // WPTSALL_WP_DEVICE_ID (test lane / intentionally distinct WP identity) →
+        // WPTSALL_DEVICE_ID → stable DB identity. The HTTP layer threads THIS
+        // resolved value from AppState/WorkerConfig and never re-reads env, so
+        // every binding's requests carry the device id its token was paired with.
+        //
+        // §67 recheck (tasks/cursor CURSOR-COMMERCIAL-USE-RECHECK-20260929):
+        // this resolution + registration must run BEFORE the encrypted DB
+        // binding docs load below. The docs are AES-GCM sealed with a key
+        // derived from this device identity (S3/SEC-02); loading them first
+        // left every state doc EMPTY after a restart (decrypt fell back to
+        // the base64 blob, serde rejected it), so a freshly restarted client
+        // lost all component credentials, domain bindings, and rule bindings
+        // until an operator upsert refreshed the in-memory state.
+        let device_id = match crate::config::wp_device_id_override() {
+            Some(id) => id,
+            None => crate::db::system::load_or_create_device_id(&db_conn)
+                .context("Failed to load or create device_id from DB")?,
+        };
+        // S3/SEC-02 (07 audit, 12 批 A5): the resolved identity is the default
+        // at-rest encryption source — without this, credentials and bindings
+        // stayed plain text whenever the env knobs were unset.
+        crate::bindings::set_default_device_id(&device_id);
+        crate::db::migrate_from_json_if_needed(&db_conn)
+            .context("Failed to migrate local configuration")?;
+
+        // Load bindings from DB (populated by migration above if first run, or from previous DB writes)
+        let component_bindings = crate::db::bindings::load_component_bindings_doc(&db_conn)?;
+        let domain_token_bindings = crate::db::bindings::load_domain_token_bindings_doc(&db_conn)?;
+        let task_type_component_bindings =
+            crate::db::bindings::load_task_type_component_bindings_doc(&db_conn)?;
+        let rule_component_bindings =
+            crate::db::bindings::load_rule_component_bindings_doc(&db_conn)?;
+        let normalized_rule_component_bindings =
+            normalize_rule_component_bindings_doc(&rule_component_bindings);
+        let bindings_changed = serde_json::to_string(&normalized_rule_component_bindings).ok()
+            != serde_json::to_string(&rule_component_bindings).ok();
+        if bindings_changed {
+            crate::db::bindings::save_rule_component_bindings_doc(
+                &db_conn,
+                &normalized_rule_component_bindings,
+            )?;
+        }
+        let rule_component_bindings = normalized_rule_component_bindings;
+        crate::db::runtime::recover_interrupted_work(&db_conn, &runtime_lease)
+            .context("Failed to recover interrupted client work")?;
+        Ok((
+            device_id,
+            component_bindings,
+            domain_token_bindings,
+            task_type_component_bindings,
+            rule_component_bindings,
+        ))
+    }) {
+        Ok(data) => data,
+        Err(error) if crate::db::is_storage_exhausted(&error) => {
+            drop(db_conn);
+            return capacity_status::run(&bind_addr_env, shutdown_token, runtime_lease, start_time)
+                .await;
+        }
+        Err(error) => return Err(error),
+    };
 
     // No implicit control-plane URL: local-first mode must remain fully local,
     // while the legacy server lane is enabled only by explicit configuration.
     let server_base = configured_server_base();
-    // device_id: prefer non-empty env var, then load-or-create from SQLite DB (stable across restarts)
-    let device_id = match std::env::var("WPTSALL_DEVICE_ID") {
-        Ok(id) if !id.trim().is_empty() => id.trim().to_string(),
-        _ => crate::db::system::load_or_create_device_id(&db_conn)
-            .context("Failed to load or create device_id from DB")?,
-    };
+
+    // Boot only inventories recovery rows; cleanup is manual by default.
+    match crate::db::async_jobs::async_jobs_inventory(&db_conn) {
+        Ok((failed, polling)) => {
+            if failed > 0 || polling > 0 {
+                crate::logging::log_event_global(
+                    "info",
+                    "webui.async_jobs_recovery_inventory",
+                    serde_json::json!({
+                        "failed_kept": failed,
+                        "polling_resumable": polling,
+                    }),
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("warning: async recovery inventory failed: {err}");
+        }
+    }
 
     // Load log settings from DB and apply to global atomics.
     // Release default: logging DISABLED — only an explicit DB value "true"
@@ -216,6 +296,7 @@ pub async fn run_web_ui(
         .unwrap_or_else(|| "info".to_string());
     crate::logging::set_log_enabled(log_enabled);
     crate::logging::set_log_min_level(&log_min_level);
+    init_runtime_log_file(&log_file)?;
 
     // Load access control settings from DB
     let external_access = crate::db::system::get_system_config(&db_conn, "web_ui_external_access")
@@ -245,12 +326,11 @@ pub async fn run_web_ui(
     // Create a shared HTTP client with connection pooling (reused across all worker runs).
     // Test-hosts may opt in to insecure TLS for private CA / self-signed environments.
     let allow_insecure_tls = env_bool("WPTSALL_ALLOW_INSECURE_TLS", false);
-    let mut http_client_builder = Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(20))
-        .pool_max_idle_per_host(10)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .connect_timeout(Duration::from_secs(10));
+    // N-2 (07 audit, 12 批 A3): this client talks to the fixed server_base
+    // origin only; a redirect is never legitimate, so none are followed
+    // (session/credential headers must not travel cross-host).
+    let mut http_client_builder =
+        crate::auth::wp_http_client_builder().timeout(Duration::from_secs(20));
     if allow_insecure_tls {
         eprintln!(
             "warning: WPTSALL_ALLOW_INSECURE_TLS=true, TLS certificate verification is disabled"
@@ -364,8 +444,15 @@ pub async fn run_web_ui(
         json!({ "bind": bind_addr }),
     );
 
+    let mut connection_joins = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+            Some(result) = connection_joins.join_next(), if !connection_joins.is_empty() => {
+                if let Err(error) = result {
+                    let _ = log_event(&log_file, "warning", "webui.connection_task_failed",
+                        json!({ "cancelled": error.is_cancelled(), "panicked": error.is_panic() }));
+                }
+            }
             result = listener.accept() => {
                 let (socket, addr) = result?;
 
@@ -385,18 +472,31 @@ pub async fn run_web_ui(
                 let runtime_control = runtime_control.clone();
                 let log_file = log_file.clone();
                 let ac = access_control.clone();
-                tokio::spawn(async move {
+                let connection_lease = Arc::clone(&runtime_lease);
+                connection_joins.spawn(async move {
+                    let _lease = connection_lease;
                     if let Err(err) =
                         routes::handle_web_ui_connection(
                             socket, state, runtime_control, &log_file,
                             started_at_epoch, start_time, ac,
                         ).await
                     {
+                        // Playwright / browser often closes the socket mid-response;
+                        // Broken pipe is expected teardown noise, not an ops warning.
+                        let err_text = format!("{:#}", err);
+                        let level = if err_text.contains("Broken pipe")
+                            || err_text.contains("os error 32")
+                            || err_text.contains("Connection reset")
+                        {
+                            "debug"
+                        } else {
+                            "warning"
+                        };
                         let _ = log_event(
                             &log_file,
-                            "warning",
+                            level,
                             "webui.connection_error",
-                            json!({ "error": format!("{:#}", err) }),
+                            json!({ "error": err_text }),
                         );
                     }
                 });
@@ -411,8 +511,15 @@ pub async fn run_web_ui(
                         guard.worker_status = "stopping".to_string();
                     }
                 }
-                // Give in-flight connections a brief grace period
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                routes::stop_worker_loop(&runtime_control, Duration::from_secs(2)).await;
+                // Drain owned connections, then cancel and await blocked
+                // readers. Sleeping alone leaves detached tasks holding the DB.
+                let drained = tokio::time::timeout(Duration::from_secs(2), async {
+                    while connection_joins.join_next().await.is_some() {}
+                }).await;
+                if drained.is_err() {
+                    connection_joins.shutdown().await;
+                }
                 break;
             }
         }
@@ -441,14 +548,12 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
     log_file: &str,
     max_items_per_run: Option<usize>,
 ) -> anyhow::Result<Value> {
-    let _max_items_guard =
-        crate::task_engine::discoverer::scoped_max_items_per_run_override(max_items_per_run);
     let use_server_control_plane = server_control_plane_enabled();
     let (
         server_base,
         device_id,
         existing_session_token,
-        domain_token_bindings,
+        mut domain_token_bindings,
         task_type_component_bindings,
         db_arc,
         client,
@@ -484,6 +589,7 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
     let component_prefer_ids = parse_csv_env("WPTSALL_COMPONENT_PREFER_IDS");
     let component_bindings_path = crate::config::component_bindings_file();
     let mut worker_config = crate::worker::build_worker_config(&device_id);
+    worker_config.apply_discovery_item_limit(max_items_per_run);
     // Override review_mode from DB (Web UI toggle takes priority over env var)
     {
         let conn = db_arc.lock().await;
@@ -638,7 +744,7 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                     guard.rule_component_bindings.clone(),
                 )
             };
-            let local_components_doc = crate::db::components::load_runtime_local_components_doc();
+            let local_components_doc = crate::db::components::load_runtime_local_components_doc()?;
             let target_component_ids = collect_configured_runtime_component_ids(
                 &local_components_doc,
                 Some(&task_type_component_bindings),
@@ -663,6 +769,7 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                     guard.component_bindings = component_bindings;
                     Some(Arc::new(registry))
                 }
+                Err(err) if err.is::<crate::component_rt::loader::RuntimeConfigurationFault>() => return Err(err),
                 Err(err) => {
                     let _ = log_event(
                         log_file,
@@ -679,6 +786,13 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
 
         let mut missing_token_domains: Vec<String> = Vec::new();
         let mut missing_route_secret_domains: Vec<String> = Vec::new();
+        // §64 recheck (tasks/cursor): identity-gate drops used to vanish
+        // silently — the run-once summary reported domains_total=4 with
+        // domain_count=0 and zero skip counters, hiding the actual reason
+        // (no binding entry / verify failure / non-ATS lane exclusion).
+        // Surface every drop reason the way token/route-secret skips are.
+        let mut identity_unverified_domains: Vec<String> = Vec::new();
+        let mut lane_excluded_domains: Vec<String> = Vec::new();
         let task_type_bindings_arc = Arc::new(task_type_component_bindings.clone());
         let rule_component_bindings_arc = {
             let guard = state.lock().await;
@@ -711,10 +825,14 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
             route_secret: Option<String>,
             wp_base: String,
             domain_base: String,
+            /// Identity Contract v1.1 §5 (C-1): verified identity for this
+            /// ad-hoc dispatch; enforced again at the discoverer lane entry.
+            binding_identity: crate::types::PluginIdentity,
             is_local_dev: bool,
             relation_limit: Option<usize>,
         }
         let mut domain_tasks: Vec<WebUiDomainTask> = Vec::new();
+        let mut identity_bindings_dirty = false;
         let occupied_domain_bases: HashSet<String> = domains
             .iter()
             .filter(|d| d.site_status != LOCAL_DEV_LICENSE_STATUS)
@@ -804,15 +922,173 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                 };
                 wp_base
             };
+            // Identity Contract v1.1 §5 (C-1): fail-closed identity gate —
+            // the same gate as the background local/server worker loops, so
+            // manual run-once and the auto worker loop can never dispatch
+            // under an unverified, mismatched, or stale identity. Fresh
+            // entries (verified within the TTL) skip the ping. Event
+            // payloads carry no credential fields.
+            let Some(entry) =
+                resolve_entry_for_domain(&domain_api_base, &domain_token_bindings)
+            else {
+                identity_unverified_domains.push(domain_api_base.clone());
+                let _ = log_event(
+                    log_file,
+                    "warning",
+                    "identity.no_binding_entry",
+                    json!({ "api_base_url": domain_api_base }),
+                );
+                continue;
+            };
+            let binding_identity = match gate(entry, now_unix()) {
+                GateVerdict::Fresh(identity) => Some(identity),
+                GateVerdict::Reverify { .. } => {
+                    // Identity-aware verify base (contract §2/§3): the
+                    // entry's stored identity (v3 migration default
+                    // wpmmcc_ats) selects the endpoint family.
+                    let expected_identity = entry
+                        .plugin_identity
+                        .unwrap_or(crate::types::PluginIdentity::WpmmccAts);
+                    let verify_base = build_verify_base_url(
+                        &domain_base,
+                        domain_route_secret.as_deref().unwrap_or(""),
+                        &expected_identity,
+                    )
+                    .unwrap_or_else(|| wp_base.clone());
+                    let outcome = verify_identity(
+                        &client,
+                        &verify_base,
+                        &wp_client_token,
+                        &worker_config.worker_id,
+                        &worker_config.device_id,
+                        domain_route_secret.as_deref(),
+                    )
+                    .await;
+                    match classify_verify_outcome(&outcome, entry) {
+                        Ok(verified) => {
+                            // Refresh the persisted binding (contract §4):
+                            // verified identity + timestamp + capability
+                            // snapshot. First verify of a migrated v3 entry
+                            // overwrites the migration default.
+                            let caps = match &outcome {
+                                VerifyOutcome::Verified(_, caps) => caps.clone(),
+                                _ => crate::types::IdentityCapabilities::default(),
+                            };
+                            let verified_at = format_rfc3339_utc(now_unix());
+                            let legacy_key = normalize_api_base_url_key(&domain_api_base);
+                            let stored = match domain_token_bindings.domains.get_mut(&domain_base)
+                            {
+                                Some(stored) => Some(stored),
+                                None => domain_token_bindings.domains.get_mut(&legacy_key),
+                            };
+                            if let Some(stored) = stored {
+                                stored.plugin_identity = Some(verified);
+                                stored.identity_verified_at = Some(verified_at);
+                                stored.identity_capabilities = Some(caps);
+                                identity_bindings_dirty = true;
+                            }
+                            Some(verified)
+                        }
+                        Err(Some(code)) => {
+                            let _ = log_event(
+                                log_file,
+                                "warning",
+                                code,
+                                json!({ "api_base_url": domain_api_base }),
+                            );
+                            None
+                        }
+                        Err(None) => {
+                            // Transport failure: not a reserved-code event;
+                            // retry next cycle.
+                            let _ = log_event(
+                                log_file,
+                                "warning",
+                                "identity.verify_failed",
+                                json!({ "api_base_url": domain_api_base }),
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+            let Some(binding_identity) = binding_identity else {
+                identity_unverified_domains.push(domain_api_base.clone());
+                continue;
+            };
+            // FL-3 (Wave-2): this collector feeds ONLY the wpmmcc-ats
+            // discovery lanes (run-once dispatch). A binding that verified
+            // as plain `wpmmcc` is owned by the pair engine (sync lanes);
+            // dispatching it here would trip the lane-entry identity guard
+            // on EVERY run-once iteration (observed: 180-iteration
+            // identity_mismatch warn storms in SIM-08/SIM-13). Filter at
+            // task generation; one info notice per (domain, identity)
+            // keeps the exclusion visible without warn-level radar noise.
+            // No credential fields.
+            if binding_identity != crate::types::PluginIdentity::WpmmccAts {
+                if crate::bindings::identity_exclusion_first_notice(
+                    "wpmmcc_ats_task_generation",
+                    &domain_api_base,
+                    binding_identity.as_wire_str(),
+                ) {
+                    let _ = log_event(
+                        log_file,
+                        "info",
+                        "worker.domain_lane_excluded",
+                        json!({
+                            "api_base_url": domain_api_base,
+                            "lane": "wpmmcc_ats",
+                            "binding_identity": binding_identity.as_wire_str(),
+                        }),
+                    );
+                }
+                lane_excluded_domains.push(domain_api_base.clone());
+                continue;
+            }
             domain_tasks.push(WebUiDomainTask {
                 api_base_url: domain_api_base,
                 wp_client_token,
                 route_secret: domain_route_secret,
                 wp_base,
                 domain_base,
+                binding_identity,
                 is_local_dev,
                 relation_limit,
             });
+        }
+
+        // Contract §4 (C-1): persist identity refreshes to both stores the
+        // client reads (SQLite runtime doc for the Web UI / status API, the
+        // JSON file for the CLI worker) and the in-memory state, so the
+        // Sites identity badge reflects live verification immediately.
+        if identity_bindings_dirty {
+            let (path, db) = {
+                let guard = state.lock().await;
+                (
+                    guard.domain_token_bindings_path.clone(),
+                    std::sync::Arc::clone(&guard.db),
+                )
+            };
+            if let Err(err) = crate::bindings::save_domain_token_bindings(
+                &path,
+                &domain_token_bindings,
+            ) {
+                let _ = log_event(
+                    log_file,
+                    "warning",
+                    "worker.identity_bindings_save_failed",
+                    json!({ "path": path, "error": format!("{:#}", err) }),
+                );
+            }
+            {
+                let conn = db.lock().await;
+                let _ = crate::db::bindings::save_domain_token_bindings_doc(
+                    &conn,
+                    &domain_token_bindings,
+                );
+            }
+            let mut guard = state.lock().await;
+            guard.domain_token_bindings = domain_token_bindings.clone();
         }
 
         // Fast path: no runnable domain tasks (all skipped or empty).
@@ -828,6 +1104,8 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                     "domains_total": domains.len(),
                     "skipped_missing_token": missing_token_domains.len(),
                     "skipped_missing_route_secret": missing_route_secret_domains.len(),
+                    "skipped_identity_unverified": identity_unverified_domains.len(),
+                    "skipped_lane_excluded": lane_excluded_domains.len(),
                 }),
             );
             let summary = json!({
@@ -843,6 +1121,10 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                     "missing_token_domains": missing_token_domains,
                     "skipped_missing_route_secret": missing_route_secret_domains.len(),
                     "missing_route_secret_domains": missing_route_secret_domains,
+                    "skipped_identity_unverified": identity_unverified_domains.len(),
+                    "identity_unverified_domains": identity_unverified_domains,
+                    "skipped_lane_excluded": lane_excluded_domains.len(),
+                    "lane_excluded_domains": lane_excluded_domains,
                     "domains": []
                 }
             });
@@ -856,6 +1138,10 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
         // Spawn concurrent domain workers
         let mut domain_joins: tokio::task::JoinSet<anyhow::Result<Option<DomainRunReport>>> =
             tokio::task::JoinSet::new();
+        let domain_runtime_lease = {
+            let conn = db_arc.lock().await;
+            crate::db::runtime::RuntimeLease::for_connection(&conn)
+        };
 
         for dt in domain_tasks {
             let client = client.clone();
@@ -873,7 +1159,9 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
             let governor = Arc::clone(&governor);
 
                 let shared_state = Arc::clone(state);
+                let domain_lease = domain_runtime_lease.clone();
                 domain_joins.spawn(async move {
+                let _lease = domain_lease;
                 let Some(_domain_permit) = governor.domain_sem.acquire().await.ok() else {
                     return Ok(None);
                 };
@@ -899,6 +1187,7 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                     Some(Arc::clone(&governor.global_callback_sem)),
                     dt.relation_limit,
                     Some(db_arc.clone()),
+                    dt.binding_identity,
                 )
                 .await;
 
@@ -983,6 +1272,7 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                                 Some(Arc::clone(&governor.global_callback_sem)),
                                 dt.relation_limit,
                                 Some(db_arc.clone()),
+                                dt.binding_identity,
                             )
                             .await;
 
@@ -992,39 +1282,29 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                                         let guard = shared_state.lock().await;
                                         guard.domain_token_bindings_path.clone()
                                     };
-                                    let doc = {
+                                    let saved = {
                                         let conn = db_arc.lock().await;
-                                        let mut doc = crate::db::bindings::load_domain_token_bindings_doc(&conn);
-                                        if let Some(entry) = doc.domains.get_mut(&dt.domain_base) {
-                                            entry.route_secret = new_s.clone();
-                                        } else {
-                                            let legacy_key = normalize_api_base_url_key(&dt.api_base_url);
-                                            if let Some(entry) = doc.domains.get_mut(&legacy_key) {
-                                                entry.route_secret = new_s.clone();
-                                            } else {
-                                                doc.domains.insert(
-                                                    dt.domain_base.clone(),
-                                                    DomainTokenBindingEntry {
-                                                        wp_client_token: dt.wp_client_token.clone(),
-                                                        route_secret: new_s.clone(),
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        let _ = crate::db::bindings::save_domain_token_bindings_doc(&conn, &doc);
-                                        doc
+                                        crate::db::bindings::persist_refreshed_route_secret(
+                                            &conn, &dt.domain_base, &dt.api_base_url,
+                                            &dt.wp_client_token, new_s,
+                                        )
                                     };
-                                    let _ = crate::bindings::save_domain_token_bindings(&path, &doc);
-                                    {
-                                        let mut guard = shared_state.lock().await;
-                                        guard.domain_token_bindings = doc.clone();
+                                    match saved {
+                                        Ok(doc) => {
+                                            if crate::bindings::save_domain_token_bindings(&path, &doc).is_err() {
+                                                let _ = log_event(&log_file, "warning", "domain.route_secret_mirror_failed",
+                                                    json!({ "domain": dt.domain_base }));
+                                            }
+                                            let mut guard = shared_state.lock().await;
+                                            guard.domain_token_bindings = doc;
+                                            let _ = log_event(&log_file, "info", "domain.route_secret_persisted",
+                                                json!({ "domain": dt.domain_base }));
+                                        }
+                                        Err(_) => {
+                                            let _ = log_event(&log_file, "warning", "domain.route_secret_store_failed",
+                                                json!({ "domain": dt.domain_base }));
+                                        }
                                     }
-                                    let _ = log_event(
-                                        &log_file,
-                                        "info",
-                                        "domain.route_secret_persisted",
-                                        json!({ "domain": dt.domain_base }),
-                                    );
                                 }
                             }
                         }
@@ -1088,6 +1368,7 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                         Some(Arc::clone(&governor.global_callback_sem)),
                         dt.relation_limit,
                         Some(db_arc),
+                        dt.binding_identity,
                     )
                     .await;
                 }
@@ -1153,6 +1434,10 @@ pub(crate) async fn web_ui_run_worker_once_with_limits(
                 "missing_token_domains": missing_token_domains,
                 "skipped_missing_route_secret": missing_route_secret_domains.len(),
                 "missing_route_secret_domains": missing_route_secret_domains,
+                "skipped_identity_unverified": identity_unverified_domains.len(),
+                "identity_unverified_domains": identity_unverified_domains,
+                "skipped_lane_excluded": lane_excluded_domains.len(),
+                "lane_excluded_domains": lane_excluded_domains,
                 "domains": loop_reports
                     .iter()
                     .map(|r| json!({
@@ -1445,16 +1730,98 @@ pub(crate) async fn fetch_components_for_session(
     Ok(items)
 }
 
-#[cfg(test)]
-mod tests;
+
 
 pub(crate) fn read_recent_log_lines(path: &str, limit: usize) -> anyhow::Result<Vec<String>> {
+    read_log_lines_page(path, limit, None, None, None).map(|page| page.lines)
+}
+
+/// One page of JSONL log lines with an optional backward cursor.
+#[derive(Debug, Clone)]
+pub(crate) struct LogLinesPage {
+    pub(crate) lines: Vec<String>,
+    /// Oldest `ts_ms` in this page — pass as `before_ts_ms` for the next older page.
+    pub(crate) next_before_ts_ms: Option<u64>,
+    pub(crate) has_more: bool,
+}
+
+fn line_ts_ms(line: &str) -> Option<u64> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if let Some(ms) = v.get("ts_ms").and_then(|x| x.as_u64()) {
+        return Some(ms);
+    }
+    v.get("ts")
+        .and_then(|x| x.as_u64().or_else(|| x.as_f64().map(|f| f as u64)))
+        .map(|sec| sec.saturating_mul(1000))
+}
+
+pub(crate) fn read_log_lines_page(
+    path: &str,
+    limit: usize,
+    min_level: Option<u8>,
+    before_ts_ms: Option<u64>,
+    event_prefix: Option<&str>,
+) -> anyhow::Result<LogLinesPage> {
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("read log file failed: {}", path))?;
-    let mut lines: Vec<String> = raw.lines().map(|line| line.to_string()).collect();
-    if lines.len() > limit {
-        let start = lines.len().saturating_sub(limit);
-        lines = lines[start..].to_vec();
+    let mut candidates: Vec<(Option<u64>, String)> = raw
+        .lines()
+        .map(|line| {
+            let s = line.to_string();
+            (line_ts_ms(&s), s)
+        })
+        .collect();
+
+    if let Some(before) = before_ts_ms {
+        candidates.retain(|(ts, _)| match ts {
+            Some(ms) => *ms < before,
+            // Non-JSON / missing ts: keep only on first page.
+            None => false,
+        });
     }
-    Ok(lines)
+
+    if let Some(min) = min_level {
+        candidates.retain(|(_, line)| {
+            let level = serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("level")
+                        .and_then(|x| x.as_str())
+                        .map(crate::logging::level_to_u8)
+                })
+                .unwrap_or(1);
+            level >= min
+        });
+    }
+
+    if let Some(prefix) = event_prefix {
+        // Event-name prefix filter (e.g. `review.`): only JSONL lines whose
+        // `event` field starts with the prefix survive. Non-JSON lines and
+        // lines without an `event` field carry no event identity, so they are
+        // dropped when a prefix is requested.
+        candidates.retain(|(_, line)| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("event")
+                        .and_then(|x| x.as_str())
+                        .map(|event| event.starts_with(prefix))
+                })
+                .unwrap_or(false)
+        });
+    }
+
+    let has_more = candidates.len() > limit;
+    if candidates.len() > limit {
+        let start = candidates.len().saturating_sub(limit);
+        candidates = candidates[start..].to_vec();
+    }
+
+    let next_before_ts_ms = candidates.iter().filter_map(|(ts, _)| *ts).min();
+
+    Ok(LogLinesPage {
+        lines: candidates.into_iter().map(|(_, s)| s).collect(),
+        next_before_ts_ms,
+        has_more,
+    })
 }

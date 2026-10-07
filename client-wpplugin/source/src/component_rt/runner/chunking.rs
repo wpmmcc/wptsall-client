@@ -265,7 +265,11 @@ fn split_gutenberg_top_level_blocks(html: &str) -> Vec<TextChunk> {
                         if depth == 0 {
                             if i > last_end {
                                 let between = &html[last_end..i];
-                                if !between.trim().is_empty() {
+                                if between.trim().is_empty() {
+                                    if let Some(previous) = chunks.last_mut() {
+                                        previous.text.push_str(between);
+                                    }
+                                } else {
                                     chunks.push(TextChunk {
                                         text: between.to_string(),
                                         separator_after: String::new(),
@@ -273,7 +277,9 @@ fn split_gutenberg_top_level_blocks(html: &str) -> Vec<TextChunk> {
                                 }
                             }
                             chunks.push(TextChunk {
-                                text: html[i..comment_end].to_string(),
+                                text: html
+                                    [if chunks.is_empty() { last_end } else { i }..comment_end]
+                                    .to_string(),
                                 separator_after: String::new(),
                             });
                             last_end = comment_end;
@@ -282,14 +288,18 @@ fn split_gutenberg_top_level_blocks(html: &str) -> Vec<TextChunk> {
                         if depth == 0 {
                             if i > last_end {
                                 let between = &html[last_end..i];
-                                if !between.trim().is_empty() {
+                                if between.trim().is_empty() {
+                                    if let Some(previous) = chunks.last_mut() {
+                                        previous.text.push_str(between);
+                                    }
+                                } else {
                                     chunks.push(TextChunk {
                                         text: between.to_string(),
                                         separator_after: String::new(),
                                     });
                                 }
                             }
-                            block_start = Some(i);
+                            block_start = Some(if chunks.is_empty() { last_end } else { i });
                         }
                         depth += 1;
                     }
@@ -317,7 +327,11 @@ fn split_gutenberg_top_level_blocks(html: &str) -> Vec<TextChunk> {
 
     if last_end < len {
         let trailing = &html[last_end..];
-        if !trailing.trim().is_empty() {
+        if trailing.trim().is_empty() {
+            if let Some(previous) = chunks.last_mut() {
+                previous.text.push_str(trailing);
+            }
+        } else {
             chunks.push(TextChunk {
                 text: trailing.to_string(),
                 separator_after: String::new(),
@@ -386,7 +400,11 @@ fn split_classic_html_blocks(html: &str) -> Vec<TextChunk> {
                         if depth == 0 {
                             if i > last_end {
                                 let between = &html[last_end..i];
-                                if !between.trim().is_empty() {
+                                if between.trim().is_empty() {
+                                    if let Some(previous) = chunks.last_mut() {
+                                        previous.text.push_str(between);
+                                    }
+                                } else {
                                     chunks.push(TextChunk {
                                         text: between.to_string(),
                                         separator_after: String::new(),
@@ -394,7 +412,9 @@ fn split_classic_html_blocks(html: &str) -> Vec<TextChunk> {
                                 }
                             }
                             chunks.push(TextChunk {
-                                text: html[i..tag_info.end].to_string(),
+                                text: html
+                                    [if chunks.is_empty() { last_end } else { i }..tag_info.end]
+                                    .to_string(),
                                 separator_after: String::new(),
                             });
                             last_end = tag_info.end;
@@ -417,14 +437,18 @@ fn split_classic_html_blocks(html: &str) -> Vec<TextChunk> {
                         if depth == 0 {
                             if i > last_end {
                                 let between = &html[last_end..i];
-                                if !between.trim().is_empty() {
+                                if between.trim().is_empty() {
+                                    if let Some(previous) = chunks.last_mut() {
+                                        previous.text.push_str(between);
+                                    }
+                                } else {
                                     chunks.push(TextChunk {
                                         text: between.to_string(),
                                         separator_after: String::new(),
                                     });
                                 }
                             }
-                            block_start = Some(i);
+                            block_start = Some(if chunks.is_empty() { last_end } else { i });
                             current_block_tag = Some(tag_lower.clone());
                         }
                         depth += 1;
@@ -439,7 +463,11 @@ fn split_classic_html_blocks(html: &str) -> Vec<TextChunk> {
 
     if last_end < len {
         let trailing = &html[last_end..];
-        if !trailing.trim().is_empty() {
+        if trailing.trim().is_empty() {
+            if let Some(previous) = chunks.last_mut() {
+                previous.text.push_str(trailing);
+            }
+        } else {
             chunks.push(TextChunk {
                 text: trailing.to_string(),
                 separator_after: String::new(),
@@ -557,21 +585,64 @@ pub(crate) async fn translate_rich_html_blocks(
     target_lang: &str,
     constraints: &crate::types::EffectiveConstraints,
 ) -> anyhow::Result<String> {
+    translate_rich_html_blocks_with_env(
+        client,
+        runtime,
+        html,
+        source_lang,
+        target_lang,
+        constraints,
+        None,
+    )
+    .await
+}
+
+/// GAP-04 (批 I): rich-HTML chunking with a durable async-job env — each
+/// chunk translates under its own env (chunk_index), so an async provider
+/// job is persisted/resumed per chunk, not per field.
+pub(crate) async fn translate_rich_html_blocks_with_env(
+    client: &Client,
+    runtime: &ComponentRuntime,
+    html: &str,
+    source_lang: &str,
+    target_lang: &str,
+    constraints: &crate::types::EffectiveConstraints,
+    async_env: Option<crate::db::async_jobs::AsyncJobEnv>,
+) -> anyhow::Result<String> {
+    super::super::content_safety::validate_rich_html_source(html)?;
     let chunks = split_rich_html_by_blocks(html, constraints.max_input_chars);
 
     if chunks.len() <= 1 {
-        return translate_text_via_component(client, runtime, html, source_lang, target_lang).await;
+        let translated = translate_text_via_component_with_env(
+            client,
+            runtime,
+            html,
+            source_lang,
+            target_lang,
+            async_env,
+        )
+        .await?;
+        super::super::content_safety::validate_rich_html_translation(html, &translated)?;
+        return Ok(translated);
     }
 
     let mut results: Vec<(TextChunk, String)> = Vec::new();
-    for chunk in chunks {
-        let translated =
-            translate_text_via_component(client, runtime, &chunk.text, source_lang, target_lang)
-                .await?;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let translated = translate_text_via_component_with_env(
+            client,
+            runtime,
+            &chunk.text,
+            source_lang,
+            target_lang,
+            async_env.as_ref().map(|env| env.with_chunk(index as i64)),
+        )
+        .await?;
         results.push((chunk, translated));
     }
 
-    Ok(merge_translated_chunks(&results))
+    let translated = merge_translated_chunks(&results);
+    super::super::content_safety::validate_rich_html_translation(html, &translated)?;
+    Ok(translated)
 }
 
 pub(crate) async fn translate_text_with_constraints(
@@ -582,6 +653,29 @@ pub(crate) async fn translate_text_with_constraints(
     target_lang: &str,
     constraints: &crate::types::EffectiveConstraints,
 ) -> anyhow::Result<String> {
+    translate_text_with_constraints_with_env(
+        client,
+        runtime,
+        input_text,
+        source_lang,
+        target_lang,
+        constraints,
+        None,
+    )
+    .await
+}
+
+/// GAP-04 (批 I): plain-text/slug chunking with a durable async-job env —
+/// chunk_index keeps every chunk's provider job independently resumable.
+pub(crate) async fn translate_text_with_constraints_with_env(
+    client: &Client,
+    runtime: &ComponentRuntime,
+    input_text: &str,
+    source_lang: &str,
+    target_lang: &str,
+    constraints: &crate::types::EffectiveConstraints,
+    async_env: Option<crate::db::async_jobs::AsyncJobEnv>,
+) -> anyhow::Result<String> {
     let chunks = split_text_by_strategy(
         input_text,
         constraints.max_input_chars,
@@ -590,17 +684,32 @@ pub(crate) async fn translate_text_with_constraints(
     );
 
     if chunks.len() <= 1 {
-        return translate_text_via_component(client, runtime, input_text, source_lang, target_lang)
-            .await;
+        return translate_text_via_component_with_env(
+            client,
+            runtime,
+            input_text,
+            source_lang,
+            target_lang,
+            async_env,
+        )
+        .await;
     }
 
     let mut results: Vec<(TextChunk, String)> = Vec::new();
-    for chunk in chunks {
-        let translated =
-            translate_text_via_component(client, runtime, &chunk.text, source_lang, target_lang)
-                .await?;
+    for (index, chunk) in chunks.into_iter().enumerate() {
+        let translated = translate_text_via_component_with_env(
+            client,
+            runtime,
+            &chunk.text,
+            source_lang,
+            target_lang,
+            async_env.as_ref().map(|env| env.with_chunk(index as i64)),
+        )
+        .await?;
         results.push((chunk, translated));
     }
 
-    Ok(merge_translated_chunks(&results))
+    let translated = merge_translated_chunks(&results);
+    super::super::content_safety::validate_interpolation_tokens(input_text, &translated)?;
+    Ok(translated)
 }

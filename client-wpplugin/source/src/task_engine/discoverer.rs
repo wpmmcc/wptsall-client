@@ -21,10 +21,10 @@ use crate::component_rt::runner::translate_text_with_constraints;
 use crate::component_rt::selector::select_component_runtime_for_task_type;
 use crate::config::{env_bool, env_u64, env_usize, DEFAULT_DATA_DIR};
 use crate::db::discovery_tasks::{
-    cleanup_expired_in_progress, ensure_discovery_tasks, get_discovery_task_params,
-    release_in_progress, touch_last_run_at, try_claim_in_progress, DiscoveryTaskParams,
+    ensure_discovery_tasks, get_discovery_task_params, release_in_progress, touch_last_run_at,
+    try_claim_in_progress, DiscoveryTaskParams,
 };
-use crate::db::jobs::list_resumable_items;
+use crate::db::jobs::list_resumable_items_for_client_base;
 use crate::db::pending_callbacks::{
     add_pending_callback, find_pending_callback, increment_retry_pending_callback,
     remove_pending_callback, PendingCallbackEntry,
@@ -32,9 +32,8 @@ use crate::db::pending_callbacks::{
 use crate::logging::{log_event, snippet, unix_ts};
 use crate::persistence::{PendingCallback, PendingCallbackStore};
 use crate::task_engine::pipeline::{
-    build_translated_path, persist_raw_content, persist_translated,
-    sanitize_domain_key as pipeline_sanitize_domain_key, sync_i18n_item_to_wp, sync_item_to_wp,
-    translate_item_fields_with_trace_using_proxy,
+    build_translated_path, sanitize_domain_key as pipeline_sanitize_domain_key,
+    sync_i18n_item_to_wp, sync_item_to_wp, translate_item_fields_with_trace_using_proxy,
 };
 use crate::task_engine::submitter::{
     retry_with_backoff, send_i18n_translation_callback, send_translation_callback,
@@ -45,6 +44,7 @@ mod adaptive;
 mod execute;
 mod fetch;
 mod language_pack;
+mod receipts;
 mod task_scope;
 use self::adaptive::*;
 use self::execute::*;
@@ -52,24 +52,16 @@ use self::fetch::*;
 use self::language_pack::*;
 use self::task_scope::*;
 
-static MAX_ITEMS_PER_RUN_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
-
-pub struct MaxItemsPerRunOverrideGuard {
-    previous: usize,
-}
-
-impl Drop for MaxItemsPerRunOverrideGuard {
-    fn drop(&mut self) {
-        MAX_ITEMS_PER_RUN_OVERRIDE.store(self.previous, Ordering::SeqCst);
-    }
-}
-
-pub fn scoped_max_items_per_run_override(
-    value: Option<usize>,
-) -> Option<MaxItemsPerRunOverrideGuard> {
-    value.map(|max_items| MaxItemsPerRunOverrideGuard {
-        previous: MAX_ITEMS_PER_RUN_OVERRIDE.swap(max_items, Ordering::SeqCst),
-    })
+pub(crate) fn try_reserve_discovery_item(counter: &AtomicUsize, limit: usize) -> bool {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            if limit == 0 || used < limit {
+                used.checked_add(1)
+            } else {
+                None
+            }
+        })
+        .is_ok()
 }
 
 fn language_pack_source_text(complete_data: &LanguagePackCompleteData) -> &str {
@@ -101,6 +93,7 @@ async fn drain_outbox_changes(
         &changes_url,
         token,
         &worker_config.worker_id,
+        &worker_config.device_id,
         route_secret,
     )
     .await
@@ -164,13 +157,73 @@ pub(crate) async fn discover_and_translate(
     global_translation_sem: Option<Arc<Semaphore>>,
     global_callback_sem: Option<Arc<Semaphore>>,
     relation_limit: Option<usize>,
-    // SQLite DB for discovery task params and in-progress dedup (None = CLI mode, use defaults).
+    // Runtime DB for discovery params and resume (None = isolated legacy callers).
     db: Option<Arc<tokio::sync::Mutex<rusqlite::Connection>>>,
+    // Identity Contract v1.1 §5 (C-1): the binding's verified identity. This
+    // discoverer serves the wpmmcc-ats task lanes; any other identity must
+    // never dispatch through it (defense in depth behind the worker gate).
+    binding_identity: crate::types::PluginIdentity,
 ) -> anyhow::Result<DomainRunReport> {
+    // Lane entry fail-closed check (contract §5 row 1): refuse to run ats
+    // lanes for a binding that is not wpmmcc_ats. The worker-level gate
+    // normally filters earlier; this guard keeps the lane entry safe even
+    // if a future caller bypasses it. No credential fields in the event.
+    // FL-3 (Wave-2): the warn is emitted ONCE per (lane, domain, identity)
+    // per process — a standing mismatch used to re-warn on every run-once
+    // iteration (180-iteration identity_mismatch storms); repeats now skip
+    // silently, still fail-closed.
+    if binding_identity != crate::types::PluginIdentity::WpmmccAts {
+        if crate::bindings::identity_exclusion_first_notice(
+            "wpmmcc_ats_lane_entry",
+            wp_base,
+            binding_identity.as_wire_str(),
+        ) {
+            let _ = log_event(
+                log_file,
+                "warning",
+                crate::bindings::CODE_IDENTITY_MISMATCH,
+                serde_json::json!({
+                    "lane": "wpmmcc_ats",
+                    "binding_identity": binding_identity.as_wire_str(),
+                }),
+            );
+        }
+        return Ok(DomainRunReport {
+            api_base_url: wp_base.to_string(),
+            ..DomainRunReport::default()
+        });
+    }
+    // FL-7 dead-domain circuit: a site whose lane entry point failed at the
+    // transport level three times in a row is skipped for the cooldown —
+    // run-once budget then flows to live domains instead of burning one
+    // full failed scan per iteration on a dead one (observed: dead-domain
+    // relations starved fresh relations of the 180-iteration budget).
+    let domain_circuit = crate::task_engine::backoff::check_domain(wp_base);
+    if domain_circuit.blocked {
+        let _ = log_event(
+            log_file,
+            "info",
+            "discovery.domain_circuit_open",
+            json!({
+                "api_base_url": wp_base,
+                "remaining_secs": domain_circuit.remaining_secs,
+                "consecutive_failures": domain_circuit.consecutive_failures,
+            }),
+        );
+        return Ok(DomainRunReport {
+            api_base_url: wp_base.to_string(),
+            ..DomainRunReport::default()
+        });
+    }
     let domain_started_at = std::time::Instant::now();
-    // CLI mode has no local discovery_tasks table, so keep the legacy domain-level
-    // outbox drain for backward-compatible one-off workers. WebUI/Desktop (db Some)
-    // drain after /site-relations and only for enabled relation-scoped tasks.
+    // GAP-06 收尾: run 级 trace。run 开始即生成（disc- 前缀，与 sync 泳道的
+    // sync- 前缀同族），在本 run 的全部出站请求上以 X-WPTSALL-Trace-Id 头携带，
+    // 并随 run 报告/日志回传。上方早退分支未发出站请求，不生成 trace。
+    let trace_id = format!("disc-{}", crate::auth::build_request_id("run"));
+    let _run_trace_guard = crate::auth::scoped_run_trace_id(trace_id.clone());
+    // Isolated legacy callers without a DB retain the domain-level outbox
+    // drain. Runtime callers with a DB drain after /site-relations and only
+    // for enabled relation-scoped tasks.
     let mut leased_outbox_changes: Vec<OutboxContentChange> = if db.is_none() {
         drain_outbox_changes(
             client,
@@ -243,12 +296,15 @@ pub(crate) async fn discover_and_translate(
         adaptive_max_delay_ms,
     ));
     let items_processed_total = Arc::new(AtomicUsize::new(0));
-    let max_items_per_run_override = MAX_ITEMS_PER_RUN_OVERRIDE.load(Ordering::SeqCst);
-    let max_items_per_run = if max_items_per_run_override > 0 {
-        max_items_per_run_override
-    } else {
-        env_usize("WPTSALL_DISCOVERY_MAX_ITEMS_PER_RUN", 0)
-    };
+    // Default per-run budget guards real-time starvation (L3 capacity finding):
+    // with an unbounded run, one discover_and_translate call can chew a large
+    // historical backlog for many minutes, and fresh outbox lifecycle events
+    // (e.g. post updates) are only drained at the START of a cycle — they wait
+    // unclaimed until the whole backlog is done. A bounded default keeps cycles
+    // short so the outbox is re-drained every cycle within minutes; the worker
+    // tick loop starts the next cycle after poll_seconds, so overall backlog
+    // throughput is unchanged. Set the env to 0 to restore unbounded runs.
+    let max_items_per_run = worker_config.discovery_max_items_per_run;
 
     // Extract domain name for DB keying (use wp_base as the key)
     let domain_key = wp_base.to_string();
@@ -256,15 +312,48 @@ pub(crate) async fn discover_and_translate(
     // 1. Fetch site relations
     let relations_url = format!("{}/site-relations", wp_base);
     adaptive.wait_turn().await;
-    let relations_resp = wp_get_json_with_transport_and_secret::<RelationsResponse>(
+    let relations_resp = match wp_get_json_with_transport_and_secret::<RelationsResponse>(
         client,
         &relations_url,
         token,
         &worker_config.worker_id,
+        &worker_config.device_id,
         route_secret,
     )
     .await
-    .context("Failed to fetch site relations")?;
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            // FL-7: count transport-level entry failures so a dead domain
+            // trips the whole-domain circuit (skipped for the cooldown); a
+            // PERMANENT status on the entry route opens the scan circuit
+            // instead (the outbox lane keeps flowing). The error itself
+            // still propagates — this iteration's domain run fails loudly
+            // exactly as before.
+            let err_text = format!("{:#}", err);
+            let permanent =
+                crate::task_engine::backoff::is_permanent_http_failure_message(&err_text);
+            let decision = if permanent {
+                crate::task_engine::backoff::record_domain_scan_permanent_failure(wp_base)
+            } else {
+                crate::task_engine::backoff::record_domain_transport_failure(wp_base)
+            };
+            let _ = log_event(
+                log_file,
+                "info",
+                "discovery.site_relations_circuit_recorded",
+                json!({
+                    "api_base_url": wp_base,
+                    "consecutive_failures": decision.consecutive_failures,
+                    "circuit_open": decision.circuit_open,
+                    "permanent": permanent,
+                }),
+            );
+            return Err(err.context("Failed to fetch site relations"));
+        }
+    };
+    // FL-7: a live lane entry resets the dead-domain streak.
+    crate::task_engine::backoff::record_domain_success(wp_base);
     adaptive.on_success();
 
     let mut relations = relations_resp.relations;
@@ -273,8 +362,8 @@ pub(crate) async fn discover_and_translate(
         for relation in &relations {
             let params = {
                 let conn = db_arc.lock().await;
-                let _ = ensure_discovery_tasks(&conn, &domain_key, &[relation.id]);
-                get_discovery_task_params(&conn, &domain_key, relation.id)
+                ensure_discovery_tasks(&conn, &domain_key, &[relation.id])?;
+                get_discovery_task_params(&conn, &domain_key, relation.id)?
             };
             if !params.enabled {
                 let _ = log_event(
@@ -336,6 +425,7 @@ pub(crate) async fn discover_and_translate(
 
     let mut report = DomainRunReport {
         api_base_url: wp_base.to_string(),
+        trace_id: trace_id.clone(),
         ..DomainRunReport::default()
     };
 
@@ -347,6 +437,17 @@ pub(crate) async fn discover_and_translate(
     }
 
     if db.is_some() {
+        // 批 D ② 复审裁定（批 M，2026-09-23）：本块是**关系级定向 drain**
+        // （逐启用关系、带 relation_id 租约），相比批 D 时点的域级单次全局
+        // drain 已是形态升级；20s 迭代节奏（WPTSALL_POLL_SECONDS）是产品
+        // 设计的变更拉取节奏。原挂账的两种剩余形态裁定如下：
+        //   - 「处理中穿插」（relation 7 翻译期间的新 change 等 relation 8
+        //     下一轮）：需把本前置环 + outbox 执行管线整体搬进主关系环
+        //     （:1123 巨型环）——真重构，且 WP 侧 outbox 行本有
+        //     available_at 退避、无紧急性，收益/风险比不成立，不做；
+        //   - 「事件驱动/独立协程」：需 WP 侧推送通知端点（新产品面），
+        //     冻结待该端点立项后一并设计。
+        // 本批（批 M）据此把批 D ② 从活跃挂账转冻结。
         for relation in &relations {
             let mut relation_changes = drain_outbox_changes(
                 client,
@@ -365,7 +466,38 @@ pub(crate) async fn discover_and_translate(
     // Execute leased lifecycle events through the same component + callback
     // pipeline as normal discovery. This makes the outbox the authoritative
     // fast path instead of merely creating an unused compatibility task.
+    //
+    // One job per relation is created lazily so every outbox-executed item
+    // gets a job-item row: the jobs dashboard and the pending-review pool
+    // are both driven by those rows, and without them review-held outbox
+    // items were invisible and could never be approved.
+    let mut outbox_job_ids: std::collections::HashMap<i64, Option<i64>> =
+        std::collections::HashMap::new();
+    let mut outbox_failed_relations = std::collections::HashSet::new();
     for change in leased_outbox_changes {
+        // FL-2b re-offer hold: a row this process already executed and acked
+        // (retry-with-backoff or completed) must not execute again while its
+        // hold lasts. A site that immediately re-offers an acked row (or
+        // ignores `available_at`) would otherwise burn the whole run-once
+        // iteration budget on the same row (observed: 180/180 iterations,
+        // zero terminal state). Keyed by (domain, outbox_id) — ids are
+        // per-site and collide across sites.
+        let hold_remaining =
+            crate::task_engine::backoff::outbox_hold_remaining(wp_base, change.outbox_id);
+        if hold_remaining > 0 {
+            report.pulled += 1;
+            let _ = log_event(
+                log_file,
+                "info",
+                "discovery.outbox_reoffer_held",
+                json!({
+                    "api_base_url": wp_base,
+                    "outbox_id": change.outbox_id,
+                    "hold_remaining_secs": hold_remaining,
+                }),
+            );
+            continue;
+        }
         let Some(relation) = relations
             .iter()
             .find(|relation| relation.id == change.relation_id)
@@ -381,12 +513,50 @@ pub(crate) async fn discover_and_translate(
             );
             continue;
         };
+        let outbox_job_id = match outbox_job_ids.entry(relation.id) {
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let jid = if let Some(ref db_arc) = db {
+                    let conn = db_arc.lock().await;
+                    crate::db::jobs::create_job(
+                        &conn,
+                        &crate::db::jobs::CreateJobRequest {
+                            domain: domain_key.clone(),
+                            relation_id: relation.id,
+                            business_line: "discovery".to_string(),
+                            triggered_by: "outbox".to_string(),
+                        },
+                    )
+                    .ok()
+                    .map(|id| {
+                        let _ = crate::db::jobs::update_job_status(&conn, id, "running");
+                        id
+                    })
+                } else {
+                    None
+                };
+                if let Some(id) = jid {
+                    let _ = log_event(
+                        log_file,
+                        "info",
+                        "job.created",
+                        json!({
+                            "job_id": id,
+                            "relation_id": relation.id,
+                            "triggered_by": "outbox",
+                        }),
+                    );
+                }
+                *vacant.insert(jid)
+            }
+            std::collections::hash_map::Entry::Occupied(occupied) => *occupied.get(),
+        };
         let rules_url = format!("{}/rules?relation_id={}", wp_base, relation.id);
         let rules = match wp_get_json_with_transport_and_secret::<RulesResponse>(
             client,
             &rules_url,
             token,
             &worker_config.worker_id,
+            &worker_config.device_id,
             route_secret,
         )
         .await
@@ -408,7 +578,7 @@ pub(crate) async fn discover_and_translate(
         };
         let task_params = if let Some(ref db_arc) = db {
             let conn = db_arc.lock().await;
-            get_discovery_task_params(&conn, &domain_key, relation.id)
+            get_discovery_task_params(&conn, &domain_key, relation.id)?
         } else {
             DiscoveryTaskParams::default()
         };
@@ -418,6 +588,91 @@ pub(crate) async fn discover_and_translate(
                 "_wptsall_outbox_id".to_string(),
                 Value::from(change.outbox_id),
             );
+        }
+        // Relation poison (structural): the relation's post/term lane tripped
+        // the structural poison. Skip WITHOUT acking — the event stays
+        // pending, is re-listed cheaply each cycle, and gets picked up as
+        // soon as a configuration change clears the poison.
+        if crate::task_engine::backoff::check_relation(wp_base, relation.id).blocked {
+            report.pulled += 1;
+            let _ = log_event(
+                log_file,
+                "info",
+                "discovery.outbox_relation_structural_skip",
+                json!({
+                    "outbox_id": change.outbox_id,
+                    "relation_id": relation.id,
+                }),
+            );
+            continue;
+        }
+        // P8 client-side backoff: never re-execute an identity whose recent
+        // attempts failed until the cooldown expires. The identity key
+        // covers BOTH hot loops (outbox fast path + server retry queue).
+        // The provider is not contacted for a blocked row; it is acked back
+        // to pending with a backoff hint (the WP side honors it via
+        // available_at).
+        let backoff = crate::task_engine::backoff::check(
+            wp_base,
+            relation.id,
+            outbox_item.object_type.as_str(),
+            outbox_item.object_id,
+        );
+        if backoff.blocked {
+            report.pulled += 1;
+            report.retried += 1;
+            let _ = log_event(
+                log_file,
+                "warning",
+                "discovery.outbox_backoff_skip",
+                json!({
+                    "outbox_id": change.outbox_id,
+                    "remaining_secs": backoff.remaining_secs,
+                    "consecutive_failures": backoff.consecutive_failures,
+                    "circuit_open": backoff.circuit_open,
+                }),
+            );
+            let ack_url = format!("{}/content-changes/{}/ack", wp_base, change.outbox_id);
+            let ack_body = json!({
+                "outcome": "retry",
+                "error": format!(
+                    "client backoff: execution suppressed for {}s after {} consecutive failures{}",
+                    backoff.remaining_secs,
+                    backoff.consecutive_failures,
+                    if backoff.circuit_open { " (circuit open)" } else { "" }
+                ),
+                "backoff_seconds": backoff.remaining_secs,
+            });
+            if let Err(ack_err) = wp_request_with_transport(
+                client,
+                reqwest::Method::POST,
+                &ack_url,
+                token,
+                &worker_config.worker_id,
+                &worker_config.device_id,
+                &ack_body,
+                route_secret,
+            )
+            .await
+            {
+                let _ = log_event(
+                    log_file,
+                    "warning",
+                    "discovery.outbox_backoff_ack_failed",
+                    json!({
+                        "outbox_id": change.outbox_id,
+                        "error": snippet(&format!("{:#}", ack_err)),
+                    }),
+                );
+            }
+            // FL-2b: hold the row for the hinted backoff so a site that
+            // re-offers it immediately cannot re-burn iterations on it.
+            crate::task_engine::backoff::note_outbox_hold(
+                wp_base,
+                change.outbox_id,
+                backoff.remaining_secs.max(30),
+            );
+            continue;
         }
         let result = translate_content_item(
             client,
@@ -441,15 +696,32 @@ pub(crate) async fn discover_and_translate(
             global_translation_sem.clone(),
             global_callback_sem.clone(),
             adaptive.clone(),
+            outbox_job_id,
             &task_params,
+            None,
         )
         .await;
         report.pulled += 1;
         report.processed += 1;
         match result {
-            Ok((TranslateContentOutcome::Completed, _, _))
-            | Ok((TranslateContentOutcome::PendingCallback, _, _)) => {
+            Ok((
+                ref outcome @ TranslateContentOutcome::Completed,
+                fields_count,
+                ref execution_summary,
+            ))
+            | Ok((
+                ref outcome @ TranslateContentOutcome::PendingCallback,
+                fields_count,
+                ref execution_summary,
+            )) => {
                 report.completed += 1;
+                crate::task_engine::backoff::record_success(
+                    wp_base,
+                    relation.id,
+                    outbox_item.object_type.as_str(),
+                    outbox_item.object_id,
+                );
+                crate::task_engine::backoff::record_relation_success(wp_base, relation.id);
                 let _ = log_event(
                     log_file,
                     "info",
@@ -459,12 +731,80 @@ pub(crate) async fn discover_and_translate(
                         "client_task_id": change.client_task_id,
                     }),
                 );
+                // FL-12 (SIM-15): the outbox lane never wrote the
+                // materialized success record, so the scan lane's
+                // has_materialized_success_record dedup missed
+                // outbox-completed objects — the run-once loop's later
+                // scan pass re-translated and re-callbacked every one of
+                // them (double provider cost, duplicate site writes under
+                // lane-divergent idempotency keys). Record the success here
+                // so the scan pass skips instead of re-billing.
+                if *outcome == TranslateContentOutcome::Completed {
+                    if let Some(ref db_arc) = db {
+                        let object_type_key =
+                            normalize_object_type_key(outbox_item.object_type.as_str()).to_string();
+                        let matched_rule = rules
+                            .iter()
+                            .find(|r| r.object_name == outbox_item.subtype)
+                            .or_else(|| {
+                                rules
+                                    .iter()
+                                    .find(|r| r.object_name == outbox_item.object_type)
+                            });
+                        let derived_business_line =
+                            crate::task_engine::pipeline::derive_business_line_from_rule(
+                                matched_rule,
+                                outbox_item.object_type.as_str(),
+                            )
+                            .to_string();
+                        let conn = db_arc.lock().await;
+                        let _ = crate::db::translations::insert_translation_record(
+                            &conn,
+                            &crate::db::translations::InsertTranslationRecord {
+                                domain: wp_base.to_string(),
+                                relation_id: Some(relation.id),
+                                object_id: Some(outbox_item.object_id),
+                                object_type: Some(object_type_key),
+                                business_line: Some(derived_business_line),
+                                source_lang: relation.source_lang.clone(),
+                                target_lang: relation.target_lang.clone(),
+                                status: "success".to_string(),
+                                execution_ms: None,
+                                worker_id: Some(worker_config.worker_id.clone()),
+                                idempotency_key: None,
+                                fields_count: fields_count as i32,
+                                error_message: None,
+                                component_ids: execution_summary.component_ids.clone(),
+                                media_mappings_count: execution_summary.media_mappings_count,
+                                failed_fields_count: execution_summary.failed_fields_count,
+                                primary_failure_reason: execution_summary
+                                    .primary_failure_reason
+                                    .clone(),
+                            },
+                        );
+                    }
+                }
+                // FL-2b: the callback is the terminal signal for this row; a
+                // site that re-offers it within the settle window is skipped
+                // instead of re-translating (duplicate callback spam).
+                crate::task_engine::backoff::note_outbox_hold(
+                    wp_base,
+                    change.outbox_id,
+                    crate::task_engine::backoff::OUTBOX_COMPLETED_HOLD_SECS,
+                );
             }
             Ok((TranslateContentOutcome::NoChanges, _, _))
             | Ok((TranslateContentOutcome::PendingReview, _, _)) => {
                 // A no-op is terminal for this exact snapshot. Explicitly ack
                 // it so an empty/untranslatable attachment or field does not
                 // hold a lease until timeout.
+                crate::task_engine::backoff::record_success(
+                    wp_base,
+                    relation.id,
+                    outbox_item.object_type.as_str(),
+                    outbox_item.object_id,
+                );
+                crate::task_engine::backoff::record_relation_success(wp_base, relation.id);
                 let ack_url = format!("{}/content-changes/{}/ack", wp_base, change.outbox_id);
                 match wp_request_with_transport(
                     client,
@@ -472,85 +812,201 @@ pub(crate) async fn discover_and_translate(
                     &ack_url,
                     token,
                     &worker_config.worker_id,
+                    &worker_config.device_id,
                     &json!({ "outcome": "completed" }),
                     route_secret,
                 )
                 .await
                 {
-                    Ok(_) => report.completed += 1,
-                    Err(_) => report.retried += 1,
+                    Ok(_) => {
+                        report.completed += 1;
+                        // FL-2b: completed-ack settle window — a site that
+                        // re-offers the row immediately is skipped.
+                        crate::task_engine::backoff::note_outbox_hold(
+                            wp_base,
+                            change.outbox_id,
+                            crate::task_engine::backoff::OUTBOX_COMPLETED_HOLD_SECS,
+                        );
+                    }
+                    Err(_) => {
+                        report.retried += 1;
+                        crate::task_engine::backoff::note_outbox_hold(
+                            wp_base,
+                            change.outbox_id,
+                            30,
+                        );
+                    }
                 }
             }
             Err(err) => {
                 report.failed += 1;
+                outbox_failed_relations.insert(relation.id);
+                let error_snippet = snippet(&format!("{:#}", err));
+                // P8: record the failure and arm the cooldown before acking,
+                // so the ack can carry the backoff hint for observability.
+                // Structural failures (no component runtime for the content's
+                // formats) arm the permanent tier instead: the outbox row
+                // returns to pending, but the client-side claim filter stops
+                // re-offering it until the binding changes.
+                let backoff = if crate::task_engine::backoff::is_structural_failure_message(
+                    &format!("{:#}", err),
+                ) {
+                    let decision = crate::task_engine::backoff::record_structural_failure(
+                        wp_base,
+                        relation.id,
+                        outbox_item.object_type.as_str(),
+                        outbox_item.object_id,
+                    );
+                    crate::task_engine::backoff::record_structural_relation_failure(
+                        wp_base,
+                        relation.id,
+                    );
+                    decision
+                } else {
+                    crate::task_engine::backoff::record_failure(
+                        wp_base,
+                        relation.id,
+                        outbox_item.object_type.as_str(),
+                        outbox_item.object_id,
+                    )
+                };
+                if backoff.circuit_open {
+                    let _ = log_event(
+                        log_file,
+                        "warning",
+                        "discovery.outbox_circuit_open",
+                        json!({
+                            "outbox_id": change.outbox_id,
+                            "consecutive_failures": backoff.consecutive_failures,
+                            "cooldown_secs": backoff.remaining_secs,
+                        }),
+                    );
+                }
                 let _ = log_event(
                     log_file,
                     "warning",
                     "discovery.outbox_execution_failed",
                     json!({
                         "outbox_id": change.outbox_id, "task_id": change.task_id,
-                        "error": snippet(&format!("{:#}", err)),
+                        "error": error_snippet,
+                        "backoff_secs": backoff.remaining_secs,
                     }),
+                );
+                // Write the failure back to WP so the outbox row returns to
+                // pending with last_error recorded (retry outcome) instead of
+                // holding a dead lease until timeout. Best-effort: an ack
+                // failure only means the lease-timeout path stays as fallback.
+                let ack_url = format!("{}/content-changes/{}/ack", wp_base, change.outbox_id);
+                let ack_body = json!({
+                    "outcome": "retry",
+                    "error": error_snippet,
+                    "backoff_seconds": backoff.remaining_secs,
+                });
+                if let Err(ack_err) = wp_request_with_transport(
+                    client,
+                    reqwest::Method::POST,
+                    &ack_url,
+                    token,
+                    &worker_config.worker_id,
+                    &worker_config.device_id,
+                    &ack_body,
+                    route_secret,
+                )
+                .await
+                {
+                    let _ = log_event(
+                        log_file,
+                        "warning",
+                        "discovery.outbox_fail_ack_failed",
+                        json!({
+                            "outbox_id": change.outbox_id,
+                            "error": snippet(&format!("{:#}", ack_err)),
+                        }),
+                    );
+                }
+                // FL-2b: hold the row for the hinted backoff so a site that
+                // re-offers it immediately cannot re-burn iterations on it.
+                crate::task_engine::backoff::note_outbox_hold(
+                    wp_base,
+                    change.outbox_id,
+                    backoff.remaining_secs.max(30),
                 );
             }
         }
     }
 
-    // Clean up stale in-progress entries from previous runs.
-    // Timeout is configurable via system_config key "in_progress_timeout_secs" (default 600).
+    // Finalize the outbox jobs from their item rows (the same signal the
+    // dashboard reads): pending items hold the job open, all-failed marks
+    // it failed, otherwise it completed.
     if let Some(ref db_arc) = db {
-        {
-            let conn = db_arc.lock().await;
-            let timeout_secs =
-                crate::db::system::get_system_config(&conn, "in_progress_timeout_secs")
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(1800);
-            cleanup_expired_in_progress(&conn, timeout_secs);
+        let conn = db_arc.lock().await;
+        for (relation_id, jid) in outbox_job_ids.iter() {
+            let Some(jid) = *jid else { continue };
+            let empty_status = if outbox_failed_relations.contains(relation_id) {
+                "failed"
+            } else {
+                "completed"
+            };
+            let final_status =
+                match crate::db::jobs::project_job_from_items(&conn, jid, true, empty_status) {
+                    Ok(status) => status,
+                    Err(err) => {
+                        let _ = log_event(
+                            log_file,
+                            "warning",
+                            "job.finalize_failed",
+                            json!({
+                                "job_id": jid, "error": snippet(&format!("{err:#}")),
+                            }),
+                        );
+                        return Err(err.context("finalize outbox job projection"));
+                    }
+                };
+            let progress = crate::db::jobs::get_job_progress(&conn, jid)?;
+            let _ = log_event(
+                log_file,
+                "info",
+                "discovery.outbox_job_finalized",
+                json!({
+                    "relation_id": relation_id,
+                    "job_id": jid,
+                    "status": final_status,
+                    "items": progress.total,
+                }),
+            );
         }
     }
 
-    // One-time data lifecycle cleanup (orphaned files > 24h, old DB records > 7 days)
-    {
-        use std::sync::atomic::AtomicBool;
-        static CLEANUP_DONE: AtomicBool = AtomicBool::new(false);
-        if !CLEANUP_DONE.swap(true, Ordering::Relaxed) {
-            let data_dir =
-                std::env::var("WPTSALL_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string());
-            crate::task_engine::pipeline::cleanup_orphaned_data_files(&data_dir, 24, log_file);
-            if let Some(ref db_arc) = db {
-                {
-                    let conn = db_arc.lock().await;
-                    let deleted = crate::db::translations::prune_old_records(&conn, 7).unwrap_or(0);
-                    if deleted > 0 {
-                        let _ = log_event(
-                            log_file,
-                            "info",
-                            "lifecycle.records_pruned",
-                            json!({ "deleted": deleted }),
-                        );
-                    }
-                    let retries_deleted =
-                        crate::db::translations::prune_old_retries(&conn, 7).unwrap_or(0);
-                    if retries_deleted > 0 {
-                        let _ = log_event(
-                            log_file,
-                            "info",
-                            "lifecycle.retries_pruned",
-                            json!({ "deleted": retries_deleted }),
-                        );
-                    }
-                }
-            }
-        }
+    // The runtime lease owner recovered abandoned claims at boot. A normal
+    // scan must not age-delete claims that can still belong to live work.
+    if let Some(ref db_arc) = db {
+        let conn = db_arc.lock().await;
+        crate::db::discovery_tasks::in_progress_inventory(&conn)?;
     }
+
+    // Starting a scan is not authorization to delete saved results or history.
+    // Retention defaults to manual cleanup, including completed work.
 
     // Resume previously interrupted items (crash recovery).
-    // Items stuck at "fetched" need re-translation; items at "translated" just need sync.
+    // Boot has already reset unfinished translation; saved results only need
+    // sync. A filename slug is not a database origin (it omits the WP path).
     if let Some(ref db_arc) = db {
         let pipeline_domain_key = pipeline_sanitize_domain_key(wp_base);
         let resumable = {
             let conn = db_arc.lock().await;
-            list_resumable_items(&conn, &pipeline_domain_key, &["translated"])
+            list_resumable_items_for_client_base(
+                &conn,
+                wp_base,
+                &pipeline_domain_key,
+                &["translated"],
+            )?
+            .into_iter()
+            .filter(|item| {
+                relations
+                    .iter()
+                    .any(|relation| relation.id == item.relation_id)
+            })
+            .collect::<Vec<_>>()
         };
         if !resumable.is_empty() {
             let _ = log_event(
@@ -567,6 +1023,10 @@ pub(crate) async fn discover_and_translate(
                     // Re-sync: read payload from disk and submit callback
                     let sync_result =
                         if normalize_object_type_key(&item.object_type) == "language_pack" {
+                            let has_entries =
+                                crate::task_engine::pipeline::translated_payload_has_i18n_entries(
+                                    &item.translated_path,
+                                );
                             sync_i18n_item_to_wp(
                                 db_arc,
                                 client,
@@ -575,12 +1035,17 @@ pub(crate) async fn discover_and_translate(
                                 wp_base,
                                 token,
                                 worker_config,
-                                route_secret,
                                 log_file,
                                 &callback_sem,
                             )
                             .await
-                            .map(|count| count.max(1))
+                            .map(|count| {
+                                if has_entries {
+                                    count
+                                } else {
+                                    count.max(1)
+                                }
+                            })
                         } else {
                             sync_item_to_wp(
                                 db_arc,
@@ -628,9 +1093,39 @@ pub(crate) async fn discover_and_translate(
     .max(1);
 
     let relation_sem = Arc::new(Semaphore::new(relation_concurrency));
-    let mut relation_joins: JoinSet<(usize, usize, usize)> = JoinSet::new(); // (processed, completed, failed)
+    let discovery_runtime_lease = if let Some(ref db_arc) = db {
+        let conn = db_arc.lock().await;
+        crate::db::runtime::RuntimeLease::for_connection(&conn)
+    } else {
+        None
+    };
+    let mut relation_joins: JoinSet<anyhow::Result<(usize, usize, usize)>> = JoinSet::new();
 
     let relations_count = relations.len();
+
+    // FL-2b scan circuit: a domain whose claim/content endpoints answered
+    // with a permanent HTTP status (404/410 — route missing, e.g. an ATS
+    // plugin older than the claim contract) stops burning scan pages on it
+    // for the cooldown. The outbox fast path above is a DIFFERENT endpoint
+    // family and stays active — a claim-route gap must not stop lifecycle
+    // events from flowing. (Shadowing the relation list keeps the loop a
+    // zero-iteration pass instead of re-indenting the whole scan body.)
+    let scan_circuit = crate::task_engine::backoff::check_domain_scan(wp_base);
+    let relations = if scan_circuit.blocked {
+        let _ = log_event(
+            log_file,
+            "info",
+            "discovery.scan_circuit_open",
+            json!({
+                "api_base_url": wp_base,
+                "remaining_secs": scan_circuit.remaining_secs,
+                "consecutive_failures": scan_circuit.consecutive_failures,
+            }),
+        );
+        Vec::new()
+    } else {
+        relations
+    };
 
     // 2. For each relation, get rules and content (concurrent, limited by relation_sem)
     for relation in relations {
@@ -657,8 +1152,10 @@ pub(crate) async fn discover_and_translate(
         let global_callback_sem = global_callback_sem.clone();
         let adaptive = Arc::clone(&adaptive);
         let relation = relation.clone();
+        let relation_lease = discovery_runtime_lease.clone();
 
         relation_joins.spawn(async move {
+        let runtime_lease = relation_lease;
         let relation = &relation;
         let relation_started_at = std::time::Instant::now();
         let route_secret = route_secret.as_deref();
@@ -685,8 +1182,8 @@ pub(crate) async fn discover_and_translate(
         // content, or relation-scoped outbox rows.
         let params = if let Some(ref db_arc) = db {
             let conn = db_arc.lock().await;
-            let _ = ensure_discovery_tasks(&conn, &domain_key, &[relation.id]);
-            get_discovery_task_params(&conn, &domain_key, relation.id)
+            ensure_discovery_tasks(&conn, &domain_key, &[relation.id])?;
+            get_discovery_task_params(&conn, &domain_key, relation.id)?
         } else {
             DiscoveryTaskParams::default()
         };
@@ -698,7 +1195,7 @@ pub(crate) async fn discover_and_translate(
                 "discovery.relation_disabled",
                 json!({ "relation_id": relation.id, "domain": domain_key }),
             );
-            return (rel_processed, rel_completed, rel_failed);
+            return Ok((rel_processed, rel_completed, rel_failed));
         }
 
         let rules_url = format!("{}/rules?relation_id={}", wp_base, relation.id);
@@ -707,7 +1204,7 @@ pub(crate) async fn discover_and_translate(
             client,
             &rules_url,
             token,
-            &worker_config.worker_id,
+            &worker_config.worker_id, &worker_config.device_id,
             route_secret,
         )
         .await
@@ -727,7 +1224,7 @@ pub(crate) async fn discover_and_translate(
                         "error": snippet(&format!("{:#}", err))
                     }),
                 );
-                return (rel_processed, rel_completed, rel_failed);
+                return Ok((rel_processed, rel_completed, rel_failed));
             }
         };
 
@@ -747,8 +1244,17 @@ pub(crate) async fn discover_and_translate(
         let pending_count = {
             let conn = db_arc.lock().await;
             let pipeline_domain_key = pipeline_sanitize_domain_key(wp_base);
-            crate::db::pending_callbacks::count_pending_for_relation(&conn, &domain_key, relation.id)
-                + crate::db::jobs::count_items_by_status_for_relation(&conn, &pipeline_domain_key, relation.id, "translated")
+            let callbacks = match crate::db::pending_callbacks::count_pending_for_relation(&conn, &domain_key, relation.id) {
+                Ok(count) => count,
+                Err(error) => {
+                    let _ = log_event(log_file, "error", "discovery.pending_callback_read_failed",
+                        json!({ "relation_id": relation.id, "error": error.to_string() }));
+                    return Ok((rel_processed, rel_completed, rel_failed + 1));
+                }
+            };
+            callbacks
+                + crate::db::jobs::count_items_by_status_for_relation(&conn, wp_base, relation.id, "translated")?
+                + crate::db::jobs::count_legacy_items_by_status_for_relation(&conn, wp_base, &pipeline_domain_key, relation.id, "translated")?
         };
             if pending_count >= max_pending {
                 let _ = log_event(
@@ -761,7 +1267,7 @@ pub(crate) async fn discover_and_translate(
                         "max_pending": max_pending,
                     }),
                 );
-                return (rel_processed, rel_completed, rel_failed);
+                return Ok((rel_processed, rel_completed, rel_failed));
             }
         }
 
@@ -793,6 +1299,18 @@ pub(crate) async fn discover_and_translate(
         } else {
             None
         };
+        if let Some(id) = job_id {
+            let _ = log_event(
+                log_file,
+                "info",
+                "job.created",
+                json!({
+                    "job_id": id,
+                    "relation_id": relation.id,
+                    "triggered_by": "auto",
+                }),
+            );
+        }
         let job_id = Arc::new(job_id);
 
         // 2b. Process retry queue entries before normal discovery.
@@ -803,7 +1321,7 @@ pub(crate) async fn discover_and_translate(
         if let Some(ref db_arc) = db {
             let retries = {
                 let conn = db_arc.lock().await;
-                crate::db::translations::get_pending_retries(&conn, &domain_key, relation.id)
+                crate::db::translations::get_pending_retries(&conn, &domain_key, relation.id)?
             };
             if !retries.is_empty() {
                 let mut retry_ids_by_type: std::collections::BTreeMap<&'static str, Vec<i64>> =
@@ -851,7 +1369,7 @@ pub(crate) async fn discover_and_translate(
                         client,
                         &retry_url,
                         token,
-                        &worker_config.worker_id,
+                        &worker_config.worker_id, &worker_config.device_id,
                         route_secret,
                     )
                     .await
@@ -884,6 +1402,33 @@ pub(crate) async fn discover_and_translate(
                                         "data_type": retry_data_type,
                                     }),
                                 );
+                                // P8: the retry queue re-offers content every
+                                // cycle; gate it on the same identity-keyed
+                                // backoff as the outbox fast path so a bad
+                                // credential cannot keep hammering the
+                                // provider through this second loop.
+                                let backoff = crate::task_engine::backoff::check(
+                                    wp_base,
+                                    relation.id,
+                                    object_type.as_str(),
+                                    oid,
+                                );
+                                if backoff.blocked {
+                                    let _ = log_event(
+                                        log_file,
+                                        "warning",
+                                        "discovery.retry_item_backoff_skip",
+                                        json!({
+                                            "relation_id": relation.id,
+                                            "object_id": oid,
+                                            "object_type": object_type.as_str(),
+                                            "remaining_secs": backoff.remaining_secs,
+                                            "consecutive_failures": backoff.consecutive_failures,
+                                            "circuit_open": backoff.circuit_open,
+                                        }),
+                                    );
+                                    continue;
+                                }
                                 let result = translate_content_item(
                                     client,
                                     wp_base,
@@ -906,12 +1451,26 @@ pub(crate) async fn discover_and_translate(
                                     global_translation_sem.clone(),
                                     global_callback_sem.clone(),
                                     Arc::clone(&adaptive),
+                                    // Retry items join the relation's job so
+                                    // they appear in the dashboard/review pool.
+                                    *job_id,
                                     &params,
+                                    None,
                                 )
                                 .await;
                                 rel_processed += 1;
                                 match result {
                                     Ok((outcome, fields_count, summary)) => {
+                                        crate::task_engine::backoff::record_success(
+                                            wp_base,
+                                            relation.id,
+                                            object_type.as_str(),
+                                            oid,
+                                        );
+                                        crate::task_engine::backoff::record_relation_success(
+                                            wp_base,
+                                            relation.id,
+                                        );
                                         let outcome_name = match outcome {
                                             TranslateContentOutcome::Completed => "completed",
                                             TranslateContentOutcome::NoChanges => "no_changes",
@@ -939,21 +1498,59 @@ pub(crate) async fn discover_and_translate(
                                             }),
                                         );
                                         if outcome == TranslateContentOutcome::Completed {
-                                            rel_completed += 1;
                                             {
                                                 let conn = db_arc.lock().await;
-                                                let _ = crate::db::translations::mark_retry_done(
+                                                crate::db::translations::mark_retry_done(
                                                     &conn,
                                                     &domain_key,
                                                     relation.id,
                                                     item.object_type.as_str(),
                                                     oid,
-                                                );
+                                                ).context("retain original retry after unconfirmed completion")?;
                                             }
+                                            rel_completed += 1;
                                         }
                                     }
                                     Err(err) => {
                                         rel_failed += 1;
+                                        let err_str = format!("{:#}", err);
+                                        // Structural failures (no component
+                                        // runtime can ever serve this content
+                                        // until the binding changes) go to the
+                                        // permanent tier.
+                                        let backoff = if crate::task_engine::backoff::is_structural_failure_message(&err_str) {
+                                            let decision = crate::task_engine::backoff::record_structural_failure(
+                                                wp_base,
+                                                relation.id,
+                                                object_type.as_str(),
+                                                oid,
+                                            );
+                                            crate::task_engine::backoff::record_structural_relation_failure(
+                                                wp_base, relation.id,
+                                            );
+                                            decision
+                                        } else {
+                                            crate::task_engine::backoff::record_failure(
+                                                wp_base,
+                                                relation.id,
+                                                object_type.as_str(),
+                                                oid,
+                                            )
+                                        };
+                                        if backoff.circuit_open {
+                                            let _ = log_event(
+                                                log_file,
+                                                "warning",
+                                                "discovery.retry_item_circuit_open",
+                                                json!({
+                                                    "relation_id": relation.id,
+                                                    "object_id": oid,
+                                                    "object_type": object_type.as_str(),
+                                                    "consecutive_failures": backoff.consecutive_failures,
+                                                    "cooldown_secs": backoff.remaining_secs,
+                                                }),
+                                            );
+                                        }
                                         let _ = log_event(
                                             log_file,
                                             "warning",
@@ -1004,13 +1601,32 @@ pub(crate) async fn discover_and_translate(
         );
 
         for content_data_type in content_data_types {
+            // Relation poison (structural): a fully-doomed relation — every
+            // attempted post/term item failed structurally with no success in
+            // between — skips its whole post/term discovery+claim lane (no
+            // page fetches, no claim leases, no translate attempts) until a
+            // configuration change clears the poison. Mixed relations never
+            // trip it: any success resets the streak. Other lanes (language
+            // packs, outbox re-sync) are unaffected.
+            if crate::task_engine::backoff::check_relation(wp_base, relation.id).blocked {
+                let _ = log_event(
+                    log_file,
+                    "info",
+                    "discovery.relation_structural_skip",
+                    json!({
+                        "relation_id": relation.id,
+                        "data_type": content_data_type,
+                    }),
+                );
+                continue;
+            }
             // batch_parallel pipelines share an AtomicI64 page counter so they each
             // fetch different pages for the current data_type.
             let page_counter = Arc::new(AtomicI64::new(1));
             let total_pages = Arc::new(AtomicI64::new(i64::MAX));
 
             let rules_arc = Arc::new(rules.clone());
-            let mut batch_joins: JoinSet<(usize, usize, usize)> = JoinSet::new();
+            let mut batch_joins: JoinSet<anyhow::Result<(usize, usize, usize)>> = JoinSet::new();
 
             for _ in 0..params.batch_parallel.max(1) {
                 let client = client.clone();
@@ -1040,8 +1656,10 @@ pub(crate) async fn discover_and_translate(
                 let params = params.clone();
                 let content_data_type = content_data_type.to_string();
                 let proxy_pool = proxy_pool.clone();
+                let batch_lease = runtime_lease.clone();
 
                 batch_joins.spawn(async move {
+                    let runtime_lease = batch_lease;
                     let mut batch_completed = 0usize;
                     let mut batch_processed = 0usize;
                     let mut batch_failed = 0usize;
@@ -1090,7 +1708,7 @@ pub(crate) async fn discover_and_translate(
                             &client,
                             &content_url,
                             &token,
-                            &worker_config.worker_id,
+                            &worker_config.worker_id, &worker_config.device_id,
                             route_secret_owned.as_deref(),
                         )
                         .await
@@ -1137,11 +1755,51 @@ pub(crate) async fn discover_and_translate(
                         );
 
                         // Claim content items before translating (30-minute lock).
-                        // Current claim storage exists only for post/taxonomy lanes.
+                        // Claim storage exists for post/taxonomy/option lanes
+                        // (option lease: relation-scoped Option_Sync_State_Service,
+                        // STA-02 2026-09-22 — the WP callback for options rejects
+                        // unclaimed items with claim_required, and dual clients
+                        // previously raced with no lease at all).
                         let mut content_items = content.items;
-                        if matches!(content_data_type.as_str(), "post" | "term") {
-                            let is_term_claim = content_data_type == "term";
-                            let claim_items = build_content_claim_items(&content_items, is_term_claim);
+                        if let Some(claim_shape) = content_claim_shape(&content_data_type) {
+                            let is_term_claim = matches!(claim_shape, ContentClaimShape::Term);
+                            // Claim-filter: backoff-blocked items (transient
+                            // cooldown or structural skip) must not even be
+                            // LEASED. The claim POST itself is WP-side write
+                            // load, and pre-fix every cycle re-leased the whole
+                            // page — including every item the translate gate
+                            // would have skipped — so structurally-doomed
+                            // relations kept hammering the WP claim endpoint
+                            // with zero useful work.
+                            let before_claim_filter = content_items.len();
+                            content_items.retain(|candidate| {
+                                !crate::task_engine::backoff::check(
+                                    &wp_base,
+                                    relation.id,
+                                    candidate.object_type.as_str(),
+                                    candidate.object_id,
+                                )
+                                .blocked
+                            });
+                            if content_items.len() < before_claim_filter {
+                                let _ = log_event(
+                                    &log_file,
+                                    "info",
+                                    "discovery.content_claim_backoff_filtered",
+                                    json!({
+                                        "relation_id": relation.id,
+                                        "data_type": content_data_type,
+                                        "before": before_claim_filter,
+                                        "after": content_items.len(),
+                                    }),
+                                );
+                            }
+                            if content_items.is_empty() {
+                                // Whole page is blocked: no claim POST, no
+                                // translate. Later pages may hold fresh items.
+                                continue;
+                            }
+                            let claim_items = build_content_claim_items(&content_items, claim_shape);
                             let claim_url = format!("{}/content/claim", wp_base);
                             let claim_body = json!({
                                 "relation_id": relation.id,
@@ -1154,7 +1812,7 @@ pub(crate) async fn discover_and_translate(
                                 reqwest::Method::POST,
                                 &claim_url,
                                 &token,
-                                &worker_config.worker_id,
+                                &worker_config.worker_id, &worker_config.device_id,
                                 &claim_body,
                                 route_secret_owned.as_deref(),
                             )
@@ -1259,6 +1917,25 @@ pub(crate) async fn discover_and_translate(
                                             "error": snippet(&err_str)
                                         }),
                                     );
+                                    // FL-2b: a PERMANENT claim-route status (404/410 —
+                                    // route never deployed, or a plugin older than
+                                    // the claim contract) opens the domain scan
+                                    // circuit so the run stops re-attempting it
+                                    // every iteration; the outbox lane keeps
+                                    // flowing (different endpoint family).
+                                    if crate::task_engine::backoff::is_permanent_http_failure_message(&err_str) {
+                                        let decision = crate::task_engine::backoff::record_domain_scan_permanent_failure(wp_base.as_str());
+                                        let _ = log_event(
+                                            &log_file,
+                                            "info",
+                                            "discovery.scan_circuit_open",
+                                            json!({
+                                                "api_base_url": wp_base,
+                                                "reason": "claim_route_permanent_status",
+                                                "remaining_secs": decision.remaining_secs,
+                                            }),
+                                        );
+                                    }
                                     // Do not submit items when the durable claim request failed.
                                     content_items.clear();
                                     break;
@@ -1282,9 +1959,7 @@ pub(crate) async fn discover_and_translate(
                         let mut item_joins: JoinSet<(bool, bool)> = JoinSet::new(); // (completed, failed)
 
                         for item in content_items {
-                            if max_items_per_run > 0
-                                && items_processed_total.load(Ordering::Relaxed) >= max_items_per_run
-                            {
+                            if !try_reserve_discovery_item(&items_processed_total, max_items_per_run) {
                                 let _ = log_event(
                                     &log_file,
                                     "info",
@@ -1298,10 +1973,37 @@ pub(crate) async fn discover_and_translate(
                                 break;
                             }
 
-                            items_processed_total.fetch_add(1, Ordering::Relaxed);
+                            // P8: gate regular content discovery on the same
+                            // identity-keyed backoff as the outbox/retry loops.
+                            // An all-fields-failed object would otherwise be
+                            // re-discovered and re-translated every cycle.
+                            let backoff = crate::task_engine::backoff::check(
+                                &wp_base,
+                                relation.id,
+                                item.object_type.as_str(),
+                                item.object_id,
+                            );
+                            if backoff.blocked {
+                                let _ = log_event(
+                                    &log_file,
+                                    "warning",
+                                    "discovery.content_item_backoff_skip",
+                                    json!({
+                                        "relation_id": relation.id,
+                                        "data_type": content_data_type,
+                                        "object_id": item.object_id,
+                                        "object_type": item.object_type.as_str(),
+                                        "remaining_secs": backoff.remaining_secs,
+                                        "consecutive_failures": backoff.consecutive_failures,
+                                        "circuit_open": backoff.circuit_open,
+                                    }),
+                                );
+                                items_processed_total.fetch_sub(1, Ordering::Relaxed);
+                                continue;
+                            }
 
                             // In-progress dedup: skip if another pipeline is already translating this item.
-                            // On DB lock failure, log and skip (false) rather than double-translate.
+                            // An authority failure is not evidence of another owner.
                             let claimed_local = if let Some(ref db_arc) = db {
                                 let conn = db_arc.lock().await;
                                 try_claim_in_progress(
@@ -1310,7 +2012,7 @@ pub(crate) async fn discover_and_translate(
                                     relation.id,
                                     item.object_type.as_str(),
                                     item.object_id,
-                                )
+                                ).context("read and confirm retained discovery claim")?
                             } else {
                                 true
                             };
@@ -1330,7 +2032,7 @@ pub(crate) async fn discover_and_translate(
                                             relation.id,
                                             item.object_type.as_str(),
                                             item.object_id,
-                                        );
+                                        ).context("confirm discovery claim release after cancelled admission")?;
                                     }
                                     break;
                                 }
@@ -1363,9 +2065,15 @@ pub(crate) async fn discover_and_translate(
                             let task_params = params.clone();
 
                             let relation_id_for_release = relation.id;
+                            let item_lease = runtime_lease.clone();
                             item_joins.spawn(async move {
+                                let _lease = item_lease;
                                 let _permit = permit;
-                                let result = translate_content_item_owned(
+                                // P8: keep the identity for backoff accounting
+                                // (translate_content_item_owned consumes wp_base/log_file).
+                                let wp_base_for_backoff = wp_base.clone();
+                                let log_file_for_backoff = log_file.clone();
+                                let mut result = translate_content_item_owned(
                                     client,
                                     wp_base,
                                     token,
@@ -1395,19 +2103,114 @@ pub(crate) async fn discover_and_translate(
                                 // Always release in-progress lock
                                 if let Some(ref db_arc) = db {
                                     let conn = db_arc.lock().await;
-                                    release_in_progress(
+                                    if let Err(error) = release_in_progress(
                                         &conn,
                                         &domain_key,
                                         relation_id_for_release,
                                         object_type.as_str(),
                                         object_id,
-                                    );
+                                    ) {
+                                        if result.is_ok() {
+                                            result = Err(error.context("retain unconfirmed discovery claim release"));
+                                        } else {
+                                            let _ = log_event(&log_file_for_backoff, "error",
+                                                "discovery.claim_release_unconfirmed",
+                                                json!({"relation_id":relation_id_for_release,"object_id":object_id,
+                                                    "object_type":object_type.as_str()}));
+                                        }
+                                    }
                                 }
 
                                 match result {
-                                    Ok(true) => (true, false),
-                                    Ok(false) => (false, false),
-                                    Err(_) => (false, true),
+                                    Ok(true) => {
+                                        crate::task_engine::backoff::record_success(
+                                            &wp_base_for_backoff,
+                                            relation_id_for_release,
+                                            object_type.as_str(),
+                                            object_id,
+                                        );
+                                        // Success proves the relation is not
+                                        // fully doomed: reset its poison streak.
+                                        crate::task_engine::backoff::record_relation_success(
+                                            &wp_base_for_backoff,
+                                            relation_id_for_release,
+                                        );
+                                        (true, false)
+                                    }
+                                    Ok(false) => {
+                                        // No-op is terminal for this snapshot;
+                                        // it clears any stale cooldown.
+                                        crate::task_engine::backoff::record_success(
+                                            &wp_base_for_backoff,
+                                            relation_id_for_release,
+                                            object_type.as_str(),
+                                            object_id,
+                                        );
+                                        crate::task_engine::backoff::record_relation_success(
+                                            &wp_base_for_backoff,
+                                            relation_id_for_release,
+                                        );
+                                        (false, false)
+                                    }
+                                    Err(err) => {
+                                        let err_str = format!("{:#}", err);
+                                        // Structural failures (no component
+                                        // runtime can ever serve this content
+                                        // until the binding changes) go to the
+                                        // permanent tier: one attempt per
+                                        // process lifetime instead of a
+                                        // cooldown-bounded re-churn.
+                                        let backoff = if crate::task_engine::backoff::is_structural_failure_message(&err_str) {
+                                            let decision = crate::task_engine::backoff::record_structural_failure(
+                                                &wp_base_for_backoff,
+                                                relation_id_for_release,
+                                                object_type.as_str(),
+                                                object_id,
+                                            );
+                                            // Feed the relation poison counter: a
+                                            // fully-doomed relation stops its whole
+                                            // post/term lane after the threshold.
+                                            crate::task_engine::backoff::record_structural_relation_failure(
+                                                &wp_base_for_backoff,
+                                                relation_id_for_release,
+                                            );
+                                            let _ = log_event(
+                                                &log_file_for_backoff,
+                                                "warning",
+                                                "discovery.content_item_structural_skip",
+                                                json!({
+                                                    "relation_id": relation_id_for_release,
+                                                    "object_id": object_id,
+                                                    "object_type": object_type.as_str(),
+                                                    "consecutive_failures": decision.consecutive_failures,
+                                                    "error": snippet(&err_str),
+                                                }),
+                                            );
+                                            decision
+                                        } else {
+                                            crate::task_engine::backoff::record_failure(
+                                                &wp_base_for_backoff,
+                                                relation_id_for_release,
+                                                object_type.as_str(),
+                                                object_id,
+                                            )
+                                        };
+                                        if backoff.circuit_open {
+                                            let _ = log_event(
+                                                &log_file_for_backoff,
+                                                "warning",
+                                                "discovery.content_item_circuit_open",
+                                                json!({
+                                                    "relation_id": relation_id_for_release,
+                                                    "object_id": object_id,
+                                                    "object_type": object_type.as_str(),
+                                                    "consecutive_failures": backoff.consecutive_failures,
+                                                    "cooldown_secs": backoff.remaining_secs,
+                                                }),
+                                            );
+                                        }
+                                        (false, true)
+                                    }
                                 }
                             });
                         }
@@ -1432,18 +2235,19 @@ pub(crate) async fn discover_and_translate(
                         }
                     }
 
-                    (batch_completed, batch_processed, batch_failed)
+                    Ok((batch_completed, batch_processed, batch_failed))
                 });
             }
 
             // Collect batch pipeline results for this data_type
             while let Some(join_result) = batch_joins.join_next().await {
                 match join_result {
-                    Ok((c, p, f)) => {
+                    Ok(Ok((c, p, f))) => {
                         rel_completed += c;
                         rel_processed += p;
                         rel_failed += f;
                     }
+                    Ok(Err(error)) => return Err(error).context("discovery retained-state authority failed"),
                     Err(_) => {
                         rel_failed += 1;
                         rel_processed += 1;
@@ -1541,7 +2345,7 @@ pub(crate) async fn discover_and_translate(
                     client,
                     &lp_url,
                     token,
-                    &worker_config.worker_id,
+                    &worker_config.worker_id, &worker_config.device_id,
                     route_secret,
                 )
                 .await
@@ -1602,7 +2406,7 @@ pub(crate) async fn discover_and_translate(
                     reqwest::Method::POST,
                     &claim_url,
                     token,
-                    &worker_config.worker_id,
+                    &worker_config.worker_id, &worker_config.device_id,
                     &claim_body,
                     route_secret,
                 )
@@ -1712,6 +2516,22 @@ pub(crate) async fn discover_and_translate(
                                 "error": snippet(&err_str)
                             }),
                         );
+                        // FL-2b: permanent claim-route status opens the
+                        // domain scan circuit (outbox lane unaffected).
+                        if crate::task_engine::backoff::is_permanent_http_failure_message(&err_str) {
+                            let decision =
+                                crate::task_engine::backoff::record_domain_scan_permanent_failure(wp_base);
+                            let _ = log_event(
+                                log_file,
+                                "info",
+                                "discovery.scan_circuit_open",
+                                json!({
+                                    "api_base_url": wp_base,
+                                    "reason": "claim_route_permanent_status",
+                                    "remaining_secs": decision.remaining_secs,
+                                }),
+                            );
+                        }
                         // Do not submit unclaimed entries.
                         lp_items.clear();
                         break;
@@ -1748,6 +2568,25 @@ pub(crate) async fn discover_and_translate(
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .unwrap_or(component_id_override);
+                // FL-9 leak guard (see execute.rs): an unbound language-pack
+                // task must not fall back onto another relation's component.
+                let unbound_lp_fallback =
+                    scoped_registry.is_none() && effective_component_id_override.trim().is_empty();
+                let mut lp_claimed: Option<std::collections::HashSet<String>> = None;
+                if unbound_lp_fallback {
+                    if let Some(ref db_arc) = db {
+                        let conn = db_arc.lock().await;
+                        let claimed =
+                            crate::db::discovery_tasks::selected_components_claimed_by_other_relations(
+                                &conn,
+                                &domain_key,
+                                relation.id,
+                            )?;
+                        if !claimed.is_empty() {
+                            lp_claimed = Some(claimed);
+                        }
+                    }
+                }
                 let effective_relation = apply_discovery_task_relation_overrides(relation, &params);
 
                 // Select component for this business_line
@@ -1763,6 +2602,7 @@ pub(crate) async fn discover_and_translate(
                     effective_component_id_override,
                     component_prefer_ids,
                     task_type_component_bindings.as_deref(),
+                    lp_claimed.as_ref(),
                 );
                 let comp = match component {
                     Some(c) => c,
@@ -1788,17 +2628,23 @@ pub(crate) async fn discover_and_translate(
                     worker_config.default_max_input_chars,
                     &worker_config.default_split_strategy,
                 );
-                let component_client = proxy_pool
-                    .as_ref()
-                    .map(|pool| pool.get_client(comp.proxy_profile_id.as_deref()))
-                    .unwrap_or(client);
+                let component_client = match proxy_pool.as_ref() {
+                    Some(pool) => pool.get_client(comp.proxy_profile_id.as_deref())?,
+                    None => {
+                        anyhow::ensure!(comp.proxy_profile_id.is_none(),
+                            "configured proxy pool is unavailable; direct fallback refused");
+                        client
+                    }
+                };
+                anyhow::ensure!(
+                    db.is_some() && job_id.is_some(),
+                    "LANGUAGE_PACK_AUTHORITY_REQUIRED: database/job unavailable; no provider request sent"
+                );
 
                 // Translate each entry's msgid
                 let mut translated_entries: Vec<I18nCallbackEntry> = Vec::new();
                 for item in &lp_items {
-                    if max_items_per_run > 0
-                        && items_processed_total.load(Ordering::Relaxed) >= max_items_per_run
-                    {
+                    if !try_reserve_discovery_item(&items_processed_total, max_items_per_run) {
                         let _ = log_event(
                             log_file,
                             "info",
@@ -1814,7 +2660,6 @@ pub(crate) async fn discover_and_translate(
                         break;
                     }
 
-                    items_processed_total.fetch_add(1, Ordering::Relaxed);
 
                     let cd = &item.complete_data;
                     let source_text = language_pack_source_text(cd);
@@ -1828,12 +2673,16 @@ pub(crate) async fn discover_and_translate(
                         None
                     };
                     adaptive.wait_turn().await;
-                    match translate_text_with_constraints(
+                    match translate_language_pack_entry(
                         component_client,
                         comp,
-                        source_text,
-                        &effective_relation.source_lang,
-                        &effective_relation.target_lang,
+                        db.as_ref(),
+                        wp_base,
+                        &effective_relation,
+                        business_line,
+                        subtype,
+                        item,
+                        &params,
                         &constraints,
                     )
                     .await
@@ -1874,13 +2723,15 @@ pub(crate) async fn discover_and_translate(
                         let data_dir = crate::config::env_or("WPTSALL_DATA_DIR", DEFAULT_DATA_DIR);
                         let mut queued_for_review = 0usize;
                         for translated in &translated_entries {
-                            let idempotency_key = format!(
-                                "lang-pack-{}-{}-{}-{}-{}",
-                                crate::bindings::normalize_domain_base(wp_base),
+                            let idempotency_key = language_pack_batch_idempotency_key(
+                                wp_base,
                                 relation.id,
                                 business_line,
-                                translated.entry_id,
-                                worker_config.worker_id
+                                subtype,
+                                &effective_relation.source_lang,
+                                &effective_relation.target_lang,
+                                &worker_config.worker_id,
+                                std::slice::from_ref(translated),
                             );
                             let i18n_payload = I18nCallbackPayload {
                                 business_line: business_line.to_string(),
@@ -1891,136 +2742,12 @@ pub(crate) async fn discover_and_translate(
                                 target_lang: effective_relation.target_lang.clone(),
                                 entries: vec![translated.clone()],
                             };
-                            let raw_path = format!(
-                                "{}/raw/{}/rel_{}/language_pack_{}_{}_{}.json",
-                                data_dir, domain_key, relation.id, business_line, subtype, translated.entry_id
-                            );
-                            let translated_path = format!(
-                                "{}/translated/{}/rel_{}/language_pack_{}_{}_{}.json",
-                                data_dir, domain_key, relation.id, business_line, subtype, translated.entry_id
-                            );
-                            let source_item = lp_items
-                                .iter()
-                                .find(|it| it.complete_data.entry_id == translated.entry_id);
-                            let raw_json = json!({
-                                "relation_id": relation.id,
-                                "business_line": business_line,
-                                "subtype": subtype,
-                                "entry_id": translated.entry_id,
-                                "source_lang": effective_relation.source_lang.clone(),
-                                "target_lang": effective_relation.target_lang.clone(),
-                                "source": {
-                                    "object_id": source_item.map(|it| it.object_id).unwrap_or(0),
-                                    "text_domain": source_item.map(|it| it.complete_data.text_domain.clone()).unwrap_or_default(),
-                                    "msgctxt": source_item.map(|it| it.complete_data.msgctxt.clone()).unwrap_or_default(),
-                                    "msgid": source_item.map(|it| it.complete_data.msgid.clone()).unwrap_or_default(),
-                                }
-                            });
-                            let envelope = I18nTranslatedEnvelope {
-                                payload_type: "i18n_language_pack".to_string(),
-                                idempotency_key: idempotency_key.clone(),
-                                route_secret: route_secret.map(|s| s.to_string()),
-                                payload: i18n_payload,
-                                persisted_at: unix_ts() as i64,
-                            };
-                            let write_result: anyhow::Result<()> = (|| {
-                                if let Some(parent) = std::path::Path::new(&raw_path).parent() {
-                                    std::fs::create_dir_all(parent).with_context(|| {
-                                        format!("create raw dir failed: {}", parent.display())
-                                    })?;
-                                }
-                                if let Some(parent) = std::path::Path::new(&translated_path).parent()
-                                {
-                                    std::fs::create_dir_all(parent).with_context(|| {
-                                        format!("create translated dir failed: {}", parent.display())
-                                    })?;
-                                }
-                                let raw_str = serde_json::to_string_pretty(&raw_json)
-                                    .context("serialize language_pack raw json failed")?;
-                                std::fs::write(&raw_path, raw_str).with_context(|| {
-                                    format!("write language_pack raw file failed: {}", raw_path)
-                                })?;
-                                let envelope_str = serde_json::to_string_pretty(&envelope)
-                                    .context("serialize language_pack translated envelope failed")?;
-                                std::fs::write(&translated_path, envelope_str).with_context(|| {
-                                    format!(
-                                        "write language_pack translated file failed: {}",
-                                        translated_path
-                                    )
-                                })?;
-                                Ok(())
-                            })();
-                            if let Err(err) = write_result {
-                                let _ = log_event(
-                                    log_file,
-                                    "warning",
-                                    "discovery.language_pack_review_persist_failed",
-                                    json!({
-                                        "relation_id": relation.id,
-                                        "business_line": business_line,
-                                        "subtype": subtype,
-                                        "entry_id": translated.entry_id,
-                                        "error": snippet(&format!("{:#}", err))
-                                    }),
-                                );
-                                rel_failed += 1;
-                                rel_processed += 1;
-                                continue;
-                            }
-                            let item_result: anyhow::Result<()> = {
-                                let conn = db_arc.lock().await;
-                                match crate::db::jobs::create_item(
-                                    &conn,
-                                    &crate::db::jobs::CreateItemRequest {
-                                        job_id: jid,
-                                        domain: wp_base.to_string(),
-                                        relation_id: relation.id,
-                                        business_line: business_line.to_string(),
-                                        object_type: "language_pack".to_string(),
-                                        wp_object_id: translated.entry_id,
-                                        wp_object_subtype: subtype.to_string(),
-                                        task_type: "text".to_string(),
-                                        source_lang: effective_relation.source_lang.clone(),
-                                        target_lang: effective_relation.target_lang.clone(),
-                                        component_id: comp.template.id.clone(),
-                                        component_ids: vec![comp.template.id.clone()],
-                                        selected_component_id: params
-                                            .selected_component_id
-                                            .clone()
-                                            .or_else(|| Some(comp.template.id.clone())),
-                                        effective_source_lang: Some(
-                                            effective_relation.source_lang.clone(),
-                                        ),
-                                        effective_target_lang: Some(
-                                            effective_relation.target_lang.clone(),
-                                        ),
-                                        editable_overrides: params.editable_overrides.clone(),
-                                        raw_path: raw_path.clone(),
-                                        client_task_id: idempotency_key.clone(),
-                                        max_retries: 2,
-                                    },
-                                ) {
-                                    Ok(item_id) => {
-                                        if let Err(err) = crate::db::jobs::update_item_translated_path(
-                                            &conn,
-                                            item_id,
-                                            &translated_path,
-                                        ) {
-                                            Err(err)
-                                        } else if let Err(err) = crate::db::jobs::update_item_status(
-                                            &conn,
-                                            item_id,
-                                            "pending_review",
-                                            None,
-                                        ) {
-                                            Err(err)
-                                        } else {
-                                            Ok(())
-                                        }
-                                    }
-                                    Err(err) => Err(err),
-                                }
-                            };
+                            let item_result = persist_language_pack_batch_for_review(
+                                db_arc, jid, &data_dir, wp_base, relation, &effective_relation,
+                                business_line, subtype, &lp_items,
+                                std::slice::from_ref(translated), &idempotency_key, route_secret,
+                                &i18n_payload, &comp.template.id, &params,
+                            ).await;
                             if let Err(err) = item_result {
                                 let _ = log_event(
                                     log_file,
@@ -2056,16 +2783,8 @@ pub(crate) async fn discover_and_translate(
                         }
                         continue;
                     } else {
-                        let _ = log_event(
-                            log_file,
-                            "warning",
-                            "discovery.language_pack_review_mode_unavailable",
-                            json!({
-                                "relation_id": relation.id,
-                                "business_line": business_line,
-                                "subtype": subtype,
-                                "reason": "db/job unavailable; falling back to immediate callback"
-                            }),
+                        anyhow::bail!(
+                            "LANGUAGE_PACK_AUTHORITY_REQUIRED: review storage unavailable; no immediate callback"
                         );
                     }
                 }
@@ -2126,12 +2845,10 @@ pub(crate) async fn discover_and_translate(
                                 wp_base,
                                 token,
                                 worker_config,
-                                route_secret,
                                 log_file,
                                 callback_sem,
                             )
                             .await
-                            .map(|_| ())
                         }
                         Err(err) => Err(err),
                     }
@@ -2153,30 +2870,29 @@ pub(crate) async fn discover_and_translate(
                             let wp_base = wp_base.to_string();
                             let token = token.to_string();
                             let worker_id = worker_config.worker_id.clone();
+                            let device_id = worker_config.device_id.clone();
                             let idempotency_key = idempotency_key.clone();
                             let i18n_payload = i18n_payload.clone();
-                            let route_secret_owned = route_secret.map(|s| s.to_string());
                             async move {
                                 send_i18n_translation_callback(
                                     &client,
                                     &wp_base,
                                     &token,
                                     &worker_id,
+                                    &device_id,
                                     &idempotency_key,
                                     &i18n_payload,
-                                    route_secret_owned.as_deref(),
                                 )
                                 .await
                             }
                         },
                     )
                     .await
-                    .map(|_| ())
+                    .map(|_| translated_entries.len())
                 };
                 match i18n_result {
-                    Ok(_) => {
+                    Ok(count) => {
                         adaptive.on_success();
-                        let count = translated_entries.len();
                         let _ = log_event(
                             log_file,
                             "info",
@@ -2189,7 +2905,7 @@ pub(crate) async fn discover_and_translate(
                             }),
                         );
                         rel_completed += count;
-                        rel_processed += count;
+                        rel_processed += translated_entries.len();
                     }
                     Err(err) => {
                         adaptive.on_error_message(&format!("{:#}", err));
@@ -2215,7 +2931,8 @@ pub(crate) async fn discover_and_translate(
         // Touch last_run_at and finalize job status
         if let Some(ref db_arc) = db {
             let conn = db_arc.lock().await;
-            touch_last_run_at(&conn, &domain_key, relation.id);
+            touch_last_run_at(&conn, &domain_key, relation.id)
+                .context("confirm discovery last-run projection")?;
         }
         // Finalize job in DB (after normal content + language-pack branches)
         if let (Some(ref db_arc), Some(jid)) = (&db, *job_id) {
@@ -2223,19 +2940,38 @@ pub(crate) async fn discover_and_translate(
             let rf = rel_failed;
             let rp = rel_processed;
             let conn = db_arc.lock().await;
-            let _ =
-                crate::db::jobs::increment_job_counters(&conn, jid, rc as i64, rf as i64, rp as i64);
-            let has_pending = rp > (rc + rf);
-            let final_status = if has_pending {
-                "partial"
-            } else if rf == 0 {
+            // Existing items stay with their original job on dedup. An empty
+            // successful scan owns no pending work; run attempts are not rows.
+            let empty_status = if rf == 0 {
                 "completed"
             } else if rc == 0 {
                 "failed"
             } else {
                 "partial"
             };
-            let _ = crate::db::jobs::update_job_status(&conn, jid, final_status);
+            match crate::db::jobs::project_job_from_items(&conn, jid, true, empty_status) {
+                Ok(final_status) => {
+                    let _ = log_event(
+                        log_file,
+                        "info",
+                        "job.finalized",
+                        json!({
+                            "job_id": jid,
+                            "relation_id": relation.id,
+                            "status": final_status,
+                            "completed": rc,
+                            "failed": rf,
+                            "processed": rp,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    let _ = log_event(log_file, "warning", "job.finalize_failed", json!({
+                        "job_id": jid, "error": snippet(&format!("{err:#}")),
+                    }));
+                    return Ok((rel_processed, rel_completed, rel_failed + 1));
+                }
+            }
         }
 
         let relation_elapsed_ms = relation_started_at.elapsed().as_millis() as u64;
@@ -2252,17 +2988,23 @@ pub(crate) async fn discover_and_translate(
             }),
         );
 
-        (rel_processed, rel_completed, rel_failed)
+        Ok::<_, anyhow::Error>((rel_processed, rel_completed, rel_failed))
         }); // end relation_joins.spawn(async move { ... })
     } // end for relation in relations
 
     // Collect relation concurrency results
+    let mut relation_storage_error = None;
     while let Some(join_result) = relation_joins.join_next().await {
         match join_result {
-            Ok((p, c, f)) => {
+            Ok(Ok((p, c, f))) => {
                 report.processed += p;
                 report.completed += c;
                 report.failed += f;
+            }
+            Ok(Err(err)) => {
+                if relation_storage_error.is_none() {
+                    relation_storage_error = Some(err);
+                }
             }
             Err(e) => {
                 let _ = log_event(
@@ -2274,6 +3016,12 @@ pub(crate) async fn discover_and_translate(
                 report.failed += 1;
             }
         }
+    }
+
+    // Drain siblings before surfacing storage failure: do not cancel a
+    // concurrent provider request merely because another relation failed.
+    if let Some(error) = relation_storage_error {
+        return Err(error.context("discovery relation state unavailable"));
     }
 
     report.avg_elapsed_ms = domain_started_at.elapsed().as_millis() as u64;
@@ -2296,6 +3044,3 @@ pub(crate) async fn discover_and_translate(
 
 // Translation helper functions have been moved to pipeline.rs.
 // Discovery execution helpers live in execute.rs.
-
-#[cfg(test)]
-mod tests;

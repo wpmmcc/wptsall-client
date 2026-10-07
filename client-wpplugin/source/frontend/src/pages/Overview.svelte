@@ -13,6 +13,7 @@
     type OverviewStatsData,
     type WorkerStartPreflightData,
   } from '../lib/api/worker';
+  import { listPendingReviewItems } from '../lib/api/items';
   import { getWpClientApiToastCopy } from '../lib/errors/wpClientApi';
   import {
     formatBusinessLineLabel,
@@ -30,8 +31,13 @@
   import { status, fetchStatus } from '../lib/stores/status';
   import { showToast } from '../lib/stores/toast';
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../lib/modal-a11y';
 
   let pollInput = $state('20');
+  // 12号批 H 小项②: optional per-run item cap for the manual Run Once
+  // button. Empty (or non-positive) = server default; a positive integer
+  // is forwarded as max_items_per_run so an operator can bound one run.
+  let maxItemsInput = $state('');
   let runLoading = $state(false);
   let startLoading = $state(false);
   let stopLoading = $state(false);
@@ -42,6 +48,14 @@
   let preflightModalData = $state<WorkerStartPreflightData | null>(null);
   let preflightResolver: ((value: boolean | null) => void) | null = null;
   let showDetails = $state(true);
+  let pendingReviewTotal = $state(0);
+  let pendingReviewLoading = $state(false);
+
+  let {
+    onOpenPendingReview,
+  }: {
+    onOpenPendingReview?: () => void;
+  } = $props();
 
   let runs = $derived(($status?.worker_recent_runs ?? []) as WorkerRunRecord[]);
 
@@ -70,7 +84,11 @@
       const forceStart = await confirmWorkerStartPreflight(preflight.data);
       if (forceStart === null) return;
 
-      const r = await runWorkerOnce();
+      const parsedCap = Number.parseInt(maxItemsInput.trim(), 10);
+      const runBody = Number.isFinite(parsedCap) && parsedCap > 0
+        ? { max_items_per_run: parsedCap }
+        : {};
+      const r = await runWorkerOnce(runBody);
       if (isOk(r)) { showToast('success', $_('overview.worker_done')); void fetchStatus(); }
       else {
         const toast = getWpClientApiToastCopy($_('overview.run_failed'), r.error, 'worker_run');
@@ -175,9 +193,22 @@
     if (hasData(r)) stats = r.data;
   }
 
+  async function loadPendingReviewCount() {
+    pendingReviewLoading = true;
+    try {
+      const r = await listPendingReviewItems({ countOnly: true });
+      if (hasData(r) && r.data) pendingReviewTotal = r.data.total ?? 0;
+    } catch {
+      pendingReviewTotal = 0;
+    } finally {
+      pendingReviewLoading = false;
+    }
+  }
+
   onMount(() => {
     if ($status?.worker_loop_poll_seconds) pollInput = String($status.worker_loop_poll_seconds);
     loadStats();
+    loadPendingReviewCount();
   });
 </script>
 
@@ -187,12 +218,47 @@
   <p class="text-sm text-gray-500 mt-1">{$_('overview.subtitle')}</p>
 </div>
 
+<!-- Pending review inbox CTA -->
+<div
+  class="mb-6 rounded-xl border px-5 py-4 flex items-center justify-between gap-4 flex-wrap
+    {pendingReviewTotal > 0 ? 'border-amber-200 bg-amber-50' : 'border-gray-200 bg-white'}"
+  data-testid="overview-pending-review"
+>
+  <div>
+    <h3 class="text-sm font-medium text-gray-900">{$_('overview.pending_review_title')}</h3>
+    <p class="text-xs text-gray-500 mt-0.5">
+      {#if pendingReviewLoading}
+        {$_('common.loading')}
+      {:else if pendingReviewTotal > 0}
+        {$_('overview.pending_review_count', { values: { count: pendingReviewTotal } })}
+      {:else}
+        {$_('overview.pending_review_empty')}
+      {/if}
+    </p>
+  </div>
+  {#if onOpenPendingReview}
+    <button
+      type="button"
+      data-testid="overview-open-pending"
+      onclick={onOpenPendingReview}
+      class="text-xs px-3 py-1.5 rounded-lg font-medium transition-colors
+        {pendingReviewTotal > 0
+          ? 'bg-amber-600 text-white hover:bg-amber-700'
+          : 'border border-gray-200 text-gray-700 hover:bg-gray-50'}"
+    >
+      {$_('overview.pending_review_cta')}
+    </button>
+  {/if}
+</div>
+
 {#if showPreflightModal && preflightModalData}
   <div
     class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-    role="button"
+    role="dialog"
+    aria-modal="true"
     tabindex="0"
     aria-label={$_('overview.preflight_title')}
+    use:modalA11y={{ onClose: () => closePreflightModal(null) }}
     onclick={(e) => {
       if (e.target === e.currentTarget) closePreflightModal(null);
     }}
@@ -396,6 +462,22 @@
       {/if}
     </div>
     <div class="flex items-center gap-2">
+      <!-- 12号批 H 小项②: per-run item cap for the manual run (empty = server default). -->
+      <!-- CLIENT-P2-03 (3.8flash): the old w-20 (80px) number input with an 18-char
+           placeholder truncated to a broken "Run-onc" (spinners eat ~20px, leaving
+           ~60px visible). A text label carries the meaning; the input keeps only a
+           short "Default" placeholder at a wider w-28. -->
+      <span class="text-xs text-gray-500 whitespace-nowrap">{$_('overview.run_once_max_items')}</span>
+      <input
+        type="number"
+        min="1"
+        bind:value={maxItemsInput}
+        data-testid="overview-run-once-max-items"
+        aria-label={$_('overview.run_once_max_items')}
+        title={$_('overview.run_once_max_items')}
+        placeholder={$_('overview.run_once_max_items_placeholder')}
+        class="w-28 border border-gray-200 rounded-lg px-2 py-1.5 text-xs text-gray-700 placeholder:text-gray-400"
+      />
       <button onclick={runOnce} disabled={runLoading}
         data-testid="overview-run-once"
         class="px-3 py-1.5 bg-blue-600 text-white text-xs rounded-lg hover:bg-blue-700 disabled:opacity-60 transition-colors whitespace-nowrap">

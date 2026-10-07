@@ -42,6 +42,13 @@ const REQUEST_WRAPPED_PATHS = new Set([
   '/api/integrations/pack/export',
   '/api/integrations/pack/preview',
   '/api/integrations/pack/import',
+  // 批 M / doc21 G1 (docker-wp-journey resurrection): run_worker_once takes a
+  // `request: WorkerRunOnceRequest` arg (all fields serde-defaulted). The
+  // shared caller sends the flat body ({} or { max_items_per_run }), so the
+  // bridge must wrap it — without this, every Desktop Run Once invoke failed
+  // Tauri arg validation ("missing required key request") and the manual run
+  // never started.
+  '/api/worker/run-once',
 ]);
 
 const PATH_TO_COMMAND: Record<string, string> = {
@@ -64,7 +71,7 @@ const PATH_TO_COMMAND: Record<string, string> = {
   '/api/components': 'list_components',
   '/api/components/configure': 'configure_component',
   '/api/components/configure-mock': 'configure_mock_component',
-  '/api/provider-catalog': 'list_provider_catalog',
+  '/api/provider-catalog': 'proxy_webui_request',
   '/api/provider-catalog/refresh': 'refresh_provider_catalog',
   '/api/components/local/install-from-catalog': 'install_catalog_template',
   '/api/integrations/pack/export': 'export_integration_pack',
@@ -191,10 +198,12 @@ function resolveDynamicRoute(
       return { command: 'save_item_translated', args: { itemId: id, request: body } };
     if (tail.length === 1 && tail[0] === 'approve' && method === 'POST')
       return { command: 'approve_item', args: { itemId: id } };
+    if (tail.length === 1 && tail[0] === 'reject' && method === 'POST')
+      return { command: 'reject_item', args: { itemId: id, request: body } };
     if (tail.length === 1 && tail[0] === 'resubmit' && method === 'POST')
       return { command: 'resubmit_item', args: { itemId: id } };
     if (tail.length === 1 && tail[0] === 'retranslate' && method === 'POST')
-      return { command: 'retranslate_item', args: { itemId: id } };
+      return { command: 'retranslate_item', args: { itemId: id, request: body } };
   }
   if (resource === 'components' && segments[2] === 'local' && segments.length >= 4) {
     const componentId = decodeURIComponent(segments[3]);
@@ -228,6 +237,25 @@ export async function apiFetch<T>(
   path: string,
   options: { method?: string; body?: unknown } = {}
 ): Promise<ApiResult<T>> {
+  // In browser dev / screenshot mode without Tauri runtime, fall back to the live WebUI daemon
+  if (
+    typeof window !== 'undefined' &&
+    !(window as any).__TAURI_INTERNALS__ &&
+    !(window as any).__VITEST__ &&
+    !import.meta.env.VITEST
+  ) {
+    try {
+      const res = await fetch(path, {
+        method: options.method ?? 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+      });
+      return (await res.json()) as ApiResult<T>;
+    } catch (e) {
+      return { success: false, error: { code: 'DEV_PREVIEW_ERROR', message: String(e) } };
+    }
+  }
+
   const method = options.method ?? 'GET';
   const body = options.body && typeof options.body === 'object'
     ? (options.body as Record<string, unknown>)
@@ -249,8 +277,64 @@ export async function apiFetch<T>(
     return tauriCall<T>(dynamic.command, dynamic.args);
   }
 
+  if (pathname === '/api/domain-tokens/upsert' && method === 'POST') {
+    // §65 (cursor item 5): pass the full WebUI upsert field set through to
+    // add_site instead of trimming to URL/token/secret only — the desktop
+    // bridge must stay field-complete for rename + identity pinning.
+    return tauriCall<T>('add_site', {
+      request: {
+        wp_url: (body.api_base_url as string) || (body.wp_url as string),
+        token: (body.wp_client_token as string) || (body.token as string),
+        route_secret: (body.route_secret as string) || undefined,
+        existing_api_base_url: (body.existing_api_base_url as string) || undefined,
+        plugin_identity: (body.plugin_identity as string) || undefined,
+      },
+    });
+  }
+
+  if (pathname === '/api/domain-tokens/delete' && method === 'POST') {
+    return tauriCall<T>('remove_site', {
+      siteId: (body.api_base_url as string) || (body.siteId as string),
+    });
+  }
+
+  if (pathname === '/api/domain-tokens/test' && method === 'POST') {
+    return tauriCall<T>('test_connection', {
+      siteId: (body.api_base_url as string) || (body.siteId as string),
+    });
+  }
+
+  if (
+    pathname === '/api/worker/start-check' ||
+    pathname === '/api/worker/config' ||
+    pathname === '/api/components/refresh' ||
+    pathname === '/api/stats/overview' ||
+    pathname === '/api/components/capabilities' ||
+    pathname === '/api/components/test' ||
+    pathname === '/api/components/template'
+  ) {
+    // worker/config must proxy: the dedicated configure_worker command drops
+    // review_mode / workflow fields and cannot serve GET.
+    return tauriCall<T>('proxy_webui_request', {
+      method,
+      path: pathname,
+      body: Object.keys(body).length > 0 ? body : undefined,
+    });
+  }
+
   const command = PATH_TO_COMMAND[pathname];
-  if (!command) {
+  if (!command || command === 'proxy_webui_request') {
+    // Explicit proxy routes (catalog) and unmapped shared routes use the
+    // embedded agent with their complete query, keeping Desktop/WebUI parity.
+    if (pathname.startsWith('/api/')) {
+      const qs = params.toString();
+      const fullPath = qs ? `${pathname}?${qs}` : pathname;
+      return tauriCall<T>('proxy_webui_request', {
+        method,
+        path: fullPath,
+        body: Object.keys(body).length > 0 ? body : undefined,
+      });
+    }
     return {
       success: false,
       error: { code: 'UNKNOWN_PATH', message: `No command mapped for: ${path}` },

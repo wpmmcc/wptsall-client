@@ -1,5 +1,6 @@
 <script lang="ts">
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../lib/modal-a11y';
   import { isOk } from '../lib/api/client';
   import { deleteDomainToken, importSiteConnection, testDomainToken, upsertDomainToken } from '../lib/api/sites';
   import { getWpClientApiToastCopy } from '../lib/errors/wpClientApi';
@@ -11,6 +12,8 @@
     token_prefix: string;
     token_len: number;
     route_secret_set?: boolean;
+    plugin_identity?: string | null;
+    identity_verified_at?: string | null;
   }
 
   // Modal 状态
@@ -95,8 +98,10 @@
     testingUrl = url;
     try {
       const r = await testDomainToken(url);
-      if (isOk(r)) showToast('success', $_('sites.connection_ok', { values: { url } }));
-      else {
+      if (isOk(r)) {
+        showToast('success', $_('sites.connection_ok', { values: { url } }));
+        await fetchStatus();
+      } else {
         const toast = getWpClientApiToastCopy($_('sites.connection_failed'), r.error, 'site_test');
         showToast('error', toast.message, toast.detail);
       }
@@ -129,12 +134,44 @@
         importDeviceLabel = '';
         await fetchStatus();
       } else {
-        showToast('error', $_('sites.import_pack_failed'), r.error?.message);
+        if (r.error?.code === 'PAIRING_DEVICE_MISMATCH') {
+          showToast('error', $_('sites.device_mismatch_title'), $_('sites.device_mismatch_detail'));
+        } else {
+          showToast('error', $_('sites.import_pack_failed'), r.error?.message);
+        }
       }
     } finally { importingPack = false; }
   }
 
+  function getHealthState(t: TokenItem): 'verified' | 'stale' | 'unknown' {
+    if (!t.identity_verified_at) return 'unknown';
+    try {
+      const verified = new Date(t.identity_verified_at).getTime();
+      if (isNaN(verified)) return 'unknown';
+      const ageMs = Date.now() - verified;
+      if (ageMs <= 24 * 3600 * 1000) return 'verified';
+      return 'stale';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  let filterType = $state<'all' | 'wpmmcc_ats' | 'wpmmcc' | 'unknown'>('all');
+  let filterDomain = $state('');
+
   let tokens = $derived(($status?.domain_token_bindings ?? []) as TokenItem[]);
+
+  let filteredTokens = $derived(
+    tokens.filter((t) => {
+      if (filterType === 'wpmmcc_ats' && t.plugin_identity !== 'wpmmcc_ats') return false;
+      if (filterType === 'wpmmcc' && t.plugin_identity !== 'wpmmcc') return false;
+      if (filterType === 'unknown' && t.plugin_identity) return false;
+      if (filterDomain.trim()) {
+        return t.api_base_url.toLowerCase().includes(filterDomain.trim().toLowerCase());
+      }
+      return true;
+    })
+  );
 </script>
 
 <div class="mb-6">
@@ -173,32 +210,109 @@
 
 <!-- 已绑定 Token -->
 <div class="bg-white border border-gray-200 rounded-xl overflow-hidden mb-4">
-  <div class="px-5 py-3 border-b border-gray-100 flex items-center justify-between">
-    <h3 class="font-medium text-gray-900 text-sm">{$_('sites.bound_sites', { values: { count: tokens.length } })}</h3>
-    <button onclick={openAdd}
-      data-testid="sites-add-site"
-      class="px-3 py-1.5 bg-blue-600 text-white text-xs rounded-lg hover:bg-blue-700 transition-colors">
-      {$_('sites.add_site')}
-    </button>
+  <div class="px-5 py-3 border-b border-gray-100 flex flex-wrap items-center justify-between gap-3">
+    <div class="flex items-center gap-2">
+      <h3 class="font-medium text-gray-900 text-sm">{$_('sites.bound_sites', { values: { count: tokens.length } })}</h3>
+      <div class="inline-flex rounded-lg border border-gray-200 p-0.5 bg-gray-50 text-xs ml-2">
+        <button
+          type="button"
+          data-testid="sites-filter-all"
+          onclick={() => filterType = 'all'}
+          class="px-2.5 py-1 rounded-md transition-colors {filterType === 'all' ? 'bg-white text-gray-900 font-medium shadow-xs' : 'text-gray-500 hover:text-gray-900'}">
+          {$_('sites.filter_all')} ({tokens.length})
+        </button>
+        <button
+          type="button"
+          data-testid="sites-filter-ats"
+          onclick={() => filterType = 'wpmmcc_ats'}
+          class="px-2.5 py-1 rounded-md transition-colors {filterType === 'wpmmcc_ats' ? 'bg-white text-blue-700 font-medium shadow-xs' : 'text-gray-500 hover:text-gray-900'}">
+          {$_('sites.filter_ats')} ({tokens.filter(t => t.plugin_identity === 'wpmmcc_ats').length})
+        </button>
+        <button
+          type="button"
+          data-testid="sites-filter-wpmmcc"
+          onclick={() => filterType = 'wpmmcc'}
+          class="px-2.5 py-1 rounded-md transition-colors {filterType === 'wpmmcc' ? 'bg-white text-purple-700 font-medium shadow-xs' : 'text-gray-500 hover:text-gray-900'}">
+          {$_('sites.filter_wpmmcc')} ({tokens.filter(t => t.plugin_identity === 'wpmmcc').length})
+        </button>
+        <button
+          type="button"
+          data-testid="sites-filter-unknown"
+          onclick={() => filterType = 'unknown'}
+          class="px-2.5 py-1 rounded-md transition-colors {filterType === 'unknown' ? 'bg-white text-gray-700 font-medium shadow-xs' : 'text-gray-500 hover:text-gray-900'}">
+          {$_('sites.filter_unknown')} ({tokens.filter(t => !t.plugin_identity).length})
+        </button>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <input
+        type="text"
+        data-testid="sites-search"
+        bind:value={filterDomain}
+        placeholder={$_('sites.search_placeholder')}
+        class="border border-gray-200 rounded-lg px-2.5 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 w-44"
+      />
+      <button onclick={openAdd}
+        data-testid="sites-add-site"
+        class="px-3 py-1.5 bg-blue-600 text-white text-xs rounded-lg hover:bg-blue-700 transition-colors">
+        {$_('sites.add_site')}
+      </button>
+    </div>
   </div>
   <table class="w-full text-sm">
     <thead>
       <tr class="text-xs text-gray-500 bg-gray-50">
         <th class="px-4 py-2.5 text-left font-medium">{$_('sites.th_domain')}</th>
+        <th class="px-4 py-2.5 text-left font-medium">{$_('sites.th_plugin_identity')}</th>
+        <th class="px-4 py-2.5 text-left font-medium">{$_('sites.th_health')}</th>
         <th class="px-4 py-2.5 text-left font-medium">{$_('sites.th_wp_token')}</th>
         <th class="px-4 py-2.5 text-left font-medium">{$_('sites.th_route_secret')}</th>
         <th class="px-4 py-2.5 text-right font-medium">{$_('sites.th_actions')}</th>
       </tr>
     </thead>
     <tbody>
-      {#if tokens.length === 0}
-        <tr><td colspan="4" class="px-4 py-8 text-center text-gray-400">
+      {#if filteredTokens.length === 0}
+        <tr><td colspan="6" class="px-4 py-8 text-center text-gray-400">
           {$_('sites.no_sites')}
         </td></tr>
       {:else}
-        {#each tokens as t}
+        {#each filteredTokens as t}
+          {@const health = getHealthState(t)}
           <tr class="border-t border-gray-50 hover:bg-gray-50/50">
             <td class="px-4 py-3 text-gray-700 font-mono text-xs">{t.api_base_url}</td>
+            <td class="px-4 py-3 text-xs">
+              {#if t.plugin_identity === 'wpmmcc'}
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-purple-100 text-purple-700" title={t.identity_verified_at ? `Verified: ${t.identity_verified_at}` : ''}>
+                  {$_('sites.badge_wpmmcc')}
+                </span>
+              {:else if t.plugin_identity === 'wpmmcc_ats'}
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-semibold bg-blue-100 text-blue-700" title={t.identity_verified_at ? `Verified: ${t.identity_verified_at}` : ''}>
+                  {$_('sites.badge_ats')}
+                </span>
+              {:else}
+                <span class="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-gray-100 text-gray-500">
+                  {$_('sites.unverified')}
+                </span>
+              {/if}
+            </td>
+            <td class="px-4 py-3 text-xs">
+              {#if health === 'verified'}
+                <span class="inline-flex items-center gap-1.5 text-green-700 font-medium text-xs">
+                  <span class="w-2 h-2 rounded-full bg-green-500"></span>
+                  {$_('sites.health_verified')}
+                </span>
+              {:else if health === 'stale'}
+                <span class="inline-flex items-center gap-1.5 text-amber-700 font-medium text-xs">
+                  <span class="w-2 h-2 rounded-full bg-amber-500"></span>
+                  {$_('sites.health_stale')}
+                </span>
+              {:else}
+                <span class="inline-flex items-center gap-1.5 text-gray-500 text-xs">
+                  <span class="w-2 h-2 rounded-full bg-gray-400"></span>
+                  {$_('sites.health_unknown')}
+                </span>
+              {/if}
+            </td>
             <td class="px-4 py-3 font-mono text-xs">
               <span class="text-gray-500">{t.token_prefix}</span>
               <span class="text-gray-400 ml-1">({t.token_len} {$_('common.chars')})</span>
@@ -230,9 +344,11 @@
 <!-- 添加/编辑 Modal -->
 {#if showModal}
   <div class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-    role="button"
+    role="dialog"
+    aria-modal="true"
     tabindex="0"
     aria-label={$_('sites.close_modal')}
+    use:modalA11y={{ onClose: closeModal }}
     onclick={(e) => { if (e.target === e.currentTarget) closeModal(); }}
     onkeydown={handleModalBackdropKeydown}>
     <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">

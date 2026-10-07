@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::web_ui::routes::errors::err_public;
+
 pub(in crate::web_ui::routes) async fn handle_components_refresh(
     socket: &mut TcpStream,
     state: &Arc<Mutex<WebUiState>>,
@@ -56,7 +58,7 @@ pub(in crate::web_ui::routes) async fn handle_components_refresh(
             if let Some(response) = maybe_write_upstream_api_error(socket, &err).await {
                 return response;
             }
-            write_error_response(socket, "COMPONENTS_REFRESH_FAILED", &format!("{:#}", err)).await
+            write_error_response(socket, "COMPONENTS_REFRESH_FAILED", &err_public(&err)).await
         }
     }
 }
@@ -153,10 +155,8 @@ pub(in crate::web_ui::routes) async fn handle_components_capabilities(
 /// are never routing candidates (they do not appear in
 /// `format_component_map`). A missing inline template is a local data
 /// problem, never a reason to contact the website.
-async fn respond_local_components_capabilities(
-    socket: &mut TcpStream,
-) -> anyhow::Result<()> {
-    let doc = crate::web_ui::routes::components::helpers::load_local_components_runtime_doc();
+async fn respond_local_components_capabilities(socket: &mut TcpStream) -> anyhow::Result<()> {
+    let doc = crate::web_ui::routes::components::helpers::load_local_components_runtime_doc()?;
     let mut items: Vec<Value> = Vec::new();
     let mut format_map: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -167,12 +167,10 @@ async fn respond_local_components_capabilities(
             .and_then(|value| serde_json::from_value(value).ok());
         let available = component.enabled && template.is_some();
         let content_formats = match &template {
-            Some(template) => {
-                crate::component_rt::loader::resolve_local_supported_content_formats(
-                    &component.kind,
-                    template,
-                )
-            }
+            Some(template) => crate::component_rt::loader::resolve_local_supported_content_formats(
+                &component.kind,
+                template,
+            ),
             None => Vec::new(),
         };
         items.push(json!({
@@ -195,12 +193,10 @@ async fn respond_local_components_capabilities(
         // Routing candidates: enabled components with a usable local template.
         if let Some(template) = template.as_ref() {
             if component.enabled {
-                for format in
-                    crate::component_rt::loader::resolve_local_supported_content_formats(
-                        &component.kind,
-                        template,
-                    )
-                {
+                for format in crate::component_rt::loader::resolve_local_supported_content_formats(
+                    &component.kind,
+                    template,
+                ) {
                     format_map
                         .entry(format)
                         .or_default()
@@ -397,7 +393,7 @@ pub(in crate::web_ui::routes) async fn handle_server_components_search(
                 socket,
                 "500 Internal Server Error",
                 "SERVER_ERROR",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await
         }

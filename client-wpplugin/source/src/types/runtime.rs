@@ -15,6 +15,11 @@ use super::{
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub worker_id: String,
+    /// opus5 A-03 (AF-03): stable WP device identity this worker acts as.
+    /// Threaded explicitly into every `wp_*_with_transport*` HTTP call; the
+    /// HTTP layer never re-reads env. Seeded once at boot from
+    /// [`crate::config::wp_device_id_override`] / the stable DB identity.
+    pub device_id: String,
     pub task_pull_statuses: Vec<String>,
     pub task_concurrency: usize,
     pub retry_max: u32,
@@ -24,7 +29,19 @@ pub struct WorkerConfig {
     pub default_max_input_chars: u64,
     pub default_split_strategy: String,
     pub discovery_mode: bool,
+    /// Per-run snapshot; zero keeps the explicitly configured unbounded mode.
+    pub discovery_max_items_per_run: usize,
     pub review_mode: bool,
+}
+
+impl WorkerConfig {
+    pub fn apply_discovery_item_limit(&mut self, limit: Option<usize>) {
+        // A zero request override historically means use the configured
+        // default, while an environment default of zero means unbounded.
+        if let Some(limit) = limit.filter(|limit| *limit > 0) {
+            self.discovery_max_items_per_run = limit;
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +84,11 @@ pub(crate) struct NonTextComponentOutcome {
 #[derive(Debug, Clone, Default)]
 pub struct DomainRunReport {
     pub api_base_url: String,
+    /// GAP-06 收尾: run-scoped trace id (`disc-…`), sent outbound as
+    /// `X-WPTSALL-Trace-Id` and logged with the run lifecycle so client/WP/
+    /// provider timelines correlate. Empty for early-exit reports that never
+    /// issued an outbound request.
+    pub trace_id: String,
     pub pulled: usize,
     pub processed: usize,
     pub completed: usize,
@@ -96,6 +118,7 @@ impl AtomicRunCounters {
 
         DomainRunReport {
             api_base_url: api_base_url.to_string(),
+            trace_id: String::new(),
             pulled: 0,
             processed: self.processed.load(Relaxed),
             completed: self.completed.load(Relaxed),
@@ -152,6 +175,8 @@ pub(crate) struct WebUiUpsertBindingRequest {
     pub(crate) oauth_ids: Vec<String>,
     pub(crate) auth_strategy: Option<KeySelectionStrategy>,
     #[serde(default)]
+    pub(crate) language_map: Option<HashMap<String, String>>,
+    #[serde(default)]
     pub(crate) constraints_override: Option<ComponentConstraints>,
     #[serde(default)]
     pub(crate) request_overrides: Option<ComponentRequestOverrides>,
@@ -198,6 +223,7 @@ pub(crate) struct WebUiUpsertDomainTokenRequest {
     pub(crate) existing_api_base_url: Option<String>,
     pub(crate) wp_client_token: Option<String>,
     pub(crate) route_secret: Option<String>,
+    pub(crate) plugin_identity: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -214,6 +240,8 @@ pub(crate) struct WebUiWorkerConfigRequest {
     pub(crate) global_translation_concurrency: Option<u64>,
     pub(crate) global_callback_concurrency: Option<u64>,
     pub(crate) relation_max_pending_callbacks: Option<u64>,
+    pub(crate) storage_max_retained_units: Option<u64>,
+    pub(crate) storage_max_reserved_bytes: Option<u64>,
     pub(crate) adaptive_rate_control: Option<bool>,
     pub(crate) adaptive_max_delay_ms: Option<u64>,
     pub(crate) callback_concurrency: Option<u64>,
@@ -255,6 +283,18 @@ pub(crate) struct WebUiComponentTemplateRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct WebUiLogsRequest {
     pub(crate) limit: Option<usize>,
+    /// Optional minimum level filter (`debug`/`info`/`warn`/`error`).
+    /// Lines below this level are dropped after the tail read.
+    #[serde(default)]
+    pub(crate) min_level: Option<String>,
+    /// Exclusive upper bound on `ts_ms` — return lines older than this cursor
+    /// (page backward / "load older").
+    #[serde(default)]
+    pub(crate) before_ts_ms: Option<u64>,
+    /// Optional event-name prefix filter (e.g. `review.`) — only lines whose
+    /// `event` field starts with this prefix are returned.
+    #[serde(default)]
+    pub(crate) event_prefix: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -281,6 +321,8 @@ pub(crate) struct WebUiWorkerRunRecord {
 pub(crate) struct WebUiRuntimeControl {
     pub(crate) worker_running: Arc<AtomicBool>,
     pub(crate) worker_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    pub(crate) worker_stop: Arc<tokio::sync::Notify>,
+    pub(crate) worker_lifecycle: Arc<Mutex<()>>,
 }
 
 impl WebUiRuntimeControl {
@@ -288,6 +330,8 @@ impl WebUiRuntimeControl {
         Self {
             worker_running: Arc::new(AtomicBool::new(false)),
             worker_handle: Arc::new(Mutex::new(None)),
+            worker_stop: Arc::new(tokio::sync::Notify::new()),
+            worker_lifecycle: Arc::new(Mutex::new(())),
         }
     }
 }

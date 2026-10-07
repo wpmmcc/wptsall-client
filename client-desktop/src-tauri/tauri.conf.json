@@ -14,10 +14,10 @@
       {
         "label": "main",
         "title": "WPTSALL Translation Client",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 900,
-        "minHeight": 600,
+        "width": 1024,
+        "height": 680,
+        "minWidth": 800,
+        "minHeight": 560,
         "center": true,
         "visible": true,
         "resizable": true,
@@ -27,7 +27,8 @@
       }
     ],
     "trayIcon": {
-      "iconPath": "icons/icon.png",
+      "id": "default",
+      "iconPath": "icons/128x128.png",
       "iconAsTemplate": false,
       "tooltip": "WPTSALL Client"
     },

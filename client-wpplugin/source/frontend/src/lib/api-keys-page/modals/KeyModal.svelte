@@ -1,5 +1,6 @@
 <script lang="ts">
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../../modal-a11y';
   import type { KeyFormState, VendorKeyItem } from '../types';
 
   export let open = false;
@@ -7,19 +8,25 @@
   export let keyForm: KeyFormState;
   export let keyModalFieldId: (field: string) => string;
   export let handleBackdropKeydown: (event: KeyboardEvent, close: () => void) => void;
+  export let knownVendorIds: string[] = [];
   export let onSave: () => void | Promise<void>;
   export let onClose: () => void;
+  export let onTest: (() => void | Promise<void>) | undefined = undefined;
+  export let testing = false;
+  export let testResult: string = '';
 </script>
 
 {#if open}
   <div
     class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-    role="button"
+    role="dialog"
+    aria-modal="true"
     tabindex="0"
     aria-label={$_('key_modal.close_modal')}
     onclick={(e) => {
       if (e.target === e.currentTarget) onClose();
     }}
+    use:modalA11y={{ onClose }}
     onkeydown={(e) => handleBackdropKeydown(e, onClose)}>
     <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md">
       <h3 class="font-semibold text-gray-900 mb-4">
@@ -33,8 +40,18 @@
             class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono" />
           <input
             bind:value={keyForm.vendor_id}
+            list={keyModalFieldId('vendor-id-options')}
             placeholder={$_('key_modal.placeholder_vendor_id')}
             class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm" />
+          {#if knownVendorIds.length}
+            <!-- B 组结构化（tasks/5.3falsh2/12）：vendor_id 建议列表防手打偏差
+                 （typo → 密钥在池、组件绑定对不上）；保留手输不堵新 vendor。 -->
+            <datalist id={keyModalFieldId('vendor-id-options')}>
+              {#each knownVendorIds as vendorId (vendorId)}
+                <option value={vendorId}></option>
+              {/each}
+            </datalist>
+          {/if}
         {/if}
         <div>
           <label for={keyModalFieldId('label')} class="block text-xs font-medium text-gray-700 mb-1">
@@ -48,7 +65,7 @@
         </div>
         <div>
           <label for={keyModalFieldId('auth-json')} class="block text-xs text-gray-500 mb-1">
-            Auth Values (JSON)
+            {$_('key_modal.auth_values_json')}
           </label>
           <textarea
             id={keyModalFieldId('auth-json')}
@@ -56,6 +73,7 @@
             rows="3"
             placeholder={'{ "api_key": "sk-xxx" }'}
             class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono"></textarea>
+          <p class="text-[11px] text-gray-500 mt-1">{$_('key_modal.auth_hint')}</p>
         </div>
         <div class="flex gap-2">
           <div class="flex-1">
@@ -121,7 +139,22 @@
           <input type="checkbox" bind:checked={keyForm.enabled} /> {$_('common.enabled')}
         </label>
       </div>
-      <div class="flex gap-2 mt-5">
+      {#if testResult}
+        <p class="mt-3 text-xs text-gray-600 bg-gray-50 border border-gray-100 rounded-lg px-3 py-2" data-testid="provider-test-result">
+          {testResult}
+        </p>
+      {/if}
+      <div class="flex gap-2 mt-5 flex-wrap">
+        {#if onTest}
+          <button
+            type="button"
+            data-testid="provider-test-btn"
+            onclick={onTest}
+            disabled={testing}
+            class="flex-1 py-2 border border-indigo-200 text-indigo-700 text-sm rounded-lg hover:bg-indigo-50 disabled:opacity-50">
+            {testing ? $_('common.loading') : $_('vendor_keys.test_connectivity')}
+          </button>
+        {/if}
         <button
           onclick={onSave}
           class="flex-1 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700">

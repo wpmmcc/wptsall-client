@@ -221,6 +221,7 @@
 <div class="bg-white border border-gray-200 rounded-xl p-4 mb-4">
   <div class="flex items-center gap-3 flex-wrap">
     <input
+      data-testid="history-domain-filter"
       bind:value={filterDomain}
       placeholder={$_('history.filter_domain')}
       class="border border-gray-200 rounded-lg px-3 py-1.5 text-sm w-52"
@@ -237,12 +238,14 @@
       <option value="pending_callback">{$_('history.status_pending_callback')}</option>
     </select>
     <input
+      data-testid="history-search-filter"
       bind:value={filterSearch}
       placeholder={$_('history.filter_search')}
       class="border border-gray-200 rounded-lg px-3 py-1.5 text-sm w-48"
       oninput={() => { page = 1; }}
     />
     <button
+      data-testid="history-clear-filters"
       onclick={clearFilters}
       class="px-3 py-1.5 border border-gray-200 text-gray-600 text-sm rounded-lg hover:bg-gray-50 transition-colors"
     >

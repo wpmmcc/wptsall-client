@@ -1,191 +1,109 @@
 name: Multi-OS build and package
-
 on:
   push:
   pull_request:
   workflow_dispatch:
-
+  workflow_call:
+permissions:
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-
-# Public-repo runner builds (the source is public, so GitHub-hosted runners
-# can compile it directly — no host cross-compile needed for these lanes).
-#
-# webui-build: release build of the core binary on each OS, a live loopback
-# smoke (/api/status), and a standard kit layout (bin + ui + version stamps +
-# SHA256SUMS) assembled and uploaded per platform. Signed production kits
-# still flow through the private host pipeline; this lane proves the source
-# tree builds, runs, and packages on every supported desktop OS.
-#
-# desktop-build: release build of the Tauri crate on each OS (compile gate;
-# native installer packaging remains fail-closed per CLIENT-PACKAGING
-# policy until each format has real tooling evidence).
 jobs:
-  webui-build:
-    name: WebUI release build + smoke + kit (${{ matrix.os }})
-    # 2026-09-12 (12-cell matrix): one leg per SHIPPED platform — the six
-    # keys updater.rs probes (linux/windows x86_64+aarch64, darwin
-    # x86_64+aarch64). The plat mapping below must keep emitting exactly
-    # those keys (note arm64 → aarch64: RUNNER_ARCH says ARM64, the OTA
-    # platform key says aarch64). darwin-x86_64 rides the macos-15-intel
-    # transition label (macos-13 retired 2025-12-04).
+  package:
+    name: ${{ matrix.product }} kit and native package (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
+        product: [webui, desktop]
         os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
-    env:
-      SMOKE_PORT: '18123'
+        include:
+          - { os: ubuntu-latest, platform: linux-x86_64, kind: deb }
+          - { os: ubuntu-24.04-arm, platform: linux-aarch64, kind: deb }
+          - { os: windows-latest, platform: windows-x86_64, kind: nsis }
+          - { os: windows-11-arm, platform: windows-aarch64, kind: nsis }
+          - { os: macos-latest, platform: darwin-aarch64, kind: dmg }
+          - { os: macos-15-intel, platform: darwin-x86_64, kind: dmg }
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
-
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
-
-      # The Rust core embeds frontend/dist at compile time (static_html.rs
-      # include_str!) — same contract as the CI unit-test job.
-      - name: Build WebUI frontend
+          cache-dependency-path: |
+            client-wpplugin/source/frontend/package-lock.json
+            client-desktop/frontend/package-lock.json
+      - name: Build production WebUI
         working-directory: client-wpplugin/source/frontend
-        run: |
-          npm ci
-          npm run build
-
+        run: npm ci && npm run check && npm run build
+      - name: Build production Desktop UI
+        if: matrix.product == 'desktop'
+        working-directory: client-desktop/frontend
+        run: npm ci && npm run check && npm run build
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux' && matrix.product == 'desktop'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libssl-dev
+      - name: Install Windows native packager
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          if ($LASTEXITCODE -notin @(0, 3010)) { exit $LASTEXITCODE }
+          Join-Path ${env:ProgramFiles(x86)} 'NSIS' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: client-wpplugin/source
-
-      - name: Release build (core binary)
-        run: cargo build --release --bin wptsall-client --manifest-path client-wpplugin/source/Cargo.toml
-
-      - name: Assemble kit layout
-        shell: bash
+          workspaces: |
+            client-wpplugin/source
+            client-desktop/src-tauri
+      - name: Compile production release binary
+        env:
+          PRODUCT: ${{ matrix.product }}
+          CARGO_PROFILE_RELEASE_STRIP: symbols
         run: |
-          set -euo pipefail
-          version="$(cat "$GITHUB_WORKSPACE/VERSION" | tr -d '[:space:]')"
-          plat="$(echo "$RUNNER_OS-$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]' \
-            | sed 's/macos/darwin/;s/x64/x86_64/;s/arm64/aarch64/')"
-          ext=''
-          if [ "$RUNNER_OS" = "Windows" ]; then ext='.exe'; fi
-          stage="$RUNNER_TEMP/kit-stage/wptsall-client-webui"
-          rm -rf "$RUNNER_TEMP/kit-stage"
-          mkdir -p "$stage/bin" "$stage/ui/webui"
-          cp "client-wpplugin/source/target/release/wptsall-client$ext" "$stage/bin/"
-          cp -r client-wpplugin/source/frontend/dist/. "$stage/ui/webui/"
-          echo "$version" > "$stage/VERSION"
-          echo "$version" > "$stage/VERSION-BINARY"
-          echo "$version" > "$stage/VERSION-WEBUI"
-          echo "$plat" > "$stage/PLATFORM.txt"
-          ( cd "$RUNNER_TEMP/kit-stage/wptsall-client-webui" \
-            && find . -type f -print0 | sort -z | xargs -0 sha256sum > ../SHA256SUMS \
-            && mv ../SHA256SUMS ./SHA256SUMS )
-          # Create and read the tarball via relative paths: Windows tar treats
-          # "D:\..." absolute arguments as host:file remotes ("Cannot connect
-          # to D:"). Also avoid piping tar into head (SIGPIPE under pipefail).
-          kit="kit-webui-$plat.tar.gz"
-          ( cd "$RUNNER_TEMP/kit-stage" && tar -czf "../$kit" wptsall-client-webui )
-          echo "kit layout:"
-          ( cd "$RUNNER_TEMP" && tar -tzf "$kit" > "$RUNNER_TEMP/kit-list.txt" )
-          head -n 20 "$RUNNER_TEMP/kit-list.txt"
-          ( cd "$RUNNER_TEMP/kit-stage/wptsall-client-webui" && sha256sum -c SHA256SUMS >/dev/null \
-            && echo 'SHA256SUMS verified' )
-
-      - name: Live smoke (staged binary serves /api/status)
-        shell: bash
-        run: |
-          set -euo pipefail
-          ext=''
-          if [ "$RUNNER_OS" = "Windows" ]; then ext='.exe'; fi
-          bin="$RUNNER_TEMP/kit-stage/wptsall-client-webui/bin/wptsall-client$ext"
-          home="$RUNNER_TEMP/webui-smoke"
-          rm -rf "$home" && mkdir -p "$home/data"
-          WPTSALL_WEB_UI=1 \
-          WPTSALL_WEB_UI_BIND="127.0.0.1:$SMOKE_PORT" \
-          WPTSALL_WEB_UI_PORT="$SMOKE_PORT" \
-          WPTSALL_DATA_DIR="$home/data" \
-          WPTSALL_DB_PATH="$home/wptsall.db" \
-          WPTSALL_LOG_FILE="$home/client.log" \
-          WPTSALL_INSTALL_ROOT="$RUNNER_TEMP/kit-stage/wptsall-client-webui" \
-            "$bin" > "$home/stdout.log" 2>&1 &
-          client_pid=$!
-          ready=0
-          for _ in $(seq 1 40); do
-            if curl -fsS "http://127.0.0.1:$SMOKE_PORT/api/status" > "$home/status.json" 2>/dev/null; then
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "$ready" != "1" ]; then
-            echo "---- client stdout ----" ; cat "$home/stdout.log" || true
-            echo "---- client log ----" ; cat "$home/client.log" || true
-            echo "WebUI smoke failed to bind on $RUNNER_OS" >&2
-            exit 1
+          if [ "$PRODUCT" = webui ]; then
+            cargo build --locked --release --bin wptsall-client --manifest-path client-wpplugin/source/Cargo.toml
+          else
+            cargo build --locked --release --manifest-path client-desktop/src-tauri/Cargo.toml
           fi
-          grep -q '"success":true' "$home/status.json" || {
-            echo "unexpected /api/status payload:" >&2; cat "$home/status.json" >&2; exit 1;
-          }
-          echo "smoke-ok on $RUNNER_OS: $(head -c 200 "$home/status.json")"
-          kill "$client_pid" 2>/dev/null || true
-          wait "$client_pid" 2>/dev/null || true
-
-      - name: Upload kit artifact
+      - name: Assemble validated kit and native installer
+        env:
+          PRODUCT: ${{ matrix.product }}
+          PLATFORM: ${{ matrix.platform }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\r\n' < VERSION)"
+          triple="$(rustc -vV | awk '/^host:/{print $2}')"
+          ext=''
+          [ "$RUNNER_OS" != Windows ] || ext='.exe'
+          if [ "$PRODUCT" = webui ]; then
+            binary="client-wpplugin/source/target/release/wptsall-client$ext"
+            ui="client-wpplugin/source/frontend/dist"
+          else
+            binary="client-desktop/src-tauri/target/release/wptsall-desktop$ext"
+            ui="client-desktop/frontend/dist"
+          fi
+          python install-client/packaging/assemble-kit.py "$PRODUCT" --binary "$binary" --ui "$ui" \
+            --version "$version" --platform "$PLATFORM" --triple "$triple" --out "$RUNNER_TEMP/kits"
+          python install-client/packaging/native-pack.py "$PRODUCT" \
+            --kit "$RUNNER_TEMP/kits/kit-$PRODUCT-$PLATFORM.tar.gz" --version "$version" \
+            --kinds "portable,$KIND" --out "$RUNNER_TEMP/native"
+      - name: Upload current candidate products
         uses: actions/upload-artifact@v4
         with:
-          name: kit-webui-${{ matrix.os }}
-          path: ${{ runner.temp }}/kit-webui-*.tar.gz
+          name: candidate-${{ matrix.product }}-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/kits/*.tar.gz
+            ${{ runner.temp }}/native/*
           if-no-files-found: error
-
-  desktop-build:
-    name: Desktop (Tauri) release build (${{ matrix.os }})
-    # 2026-09-12 (12-cell matrix): one leg per shipped platform (same six
-    # labels as webui-build, incl. the macos-15-intel transition label).
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
-
-      # The desktop crate path-depends on the Rust core, which embeds the
-      # WebUI frontend dist at compile time — build it first.
-      - name: Build WebUI frontend
-        working-directory: client-wpplugin/source/frontend
-        run: |
-          npm ci
-          npm run build
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Tauri v2 Linux build dependencies
-        if: runner.os == 'Linux'
-        run: |
-          # The runner image's google-chrome apt source (any file format,
-          # list or deb822) intermittently hash-mismatches on dl.google.com
-          # and kills apt-get update; nothing installed here needs it.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome* || true
-          sudo sed -i '/dl\.google\.com/d' /etc/apt/sources.list 2>/dev/null || true
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
-            librsvg2-dev libayatana-appindicator3-dev libssl-dev
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: client-desktop/src-tauri
-
-      - name: Release build (Tauri crate)
-        run: cargo build --release --manifest-path client-desktop/src-tauri/Cargo.toml

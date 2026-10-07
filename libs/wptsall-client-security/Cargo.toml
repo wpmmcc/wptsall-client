@@ -28,11 +28,10 @@ uuid = { version = "1", features = ["v4"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-[dev-dependencies]
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
 [features]
 default = []
 mem-module = []
+# S8 (batch G, 2026-09-22): anti-tamper now ENFORCES by default (runtime
+# downgrade: WPTSALL_ANTITAMPER_WARN_ONLY=1). This feature is a no-op
+# compatibility alias kept for existing build-matrix invocations.
 strict-antitamper = []

@@ -189,10 +189,7 @@ pub(crate) trait NonTextExecutor: Send + Sync {
 pub(crate) struct PlaceholderNonTextExecutor;
 
 impl PlaceholderNonTextExecutor {
-    #[cfg(test)]
-    pub(crate) fn new() -> Self {
-        Self
-    }
+
 }
 
 #[async_trait]
@@ -299,18 +296,16 @@ fn extract_payload_field(payload: Option<&Value>, keys: &[&str]) -> Option<Strin
     None
 }
 
-#[cfg(test)]
-mod tests;
+
+
+pub(crate) mod recovery;
+pub(crate) mod recovery_store;
 
 // ---------------------------------------------------------------------------
 // Chunked media upload — WP Protocol v2 endpoints
 // ---------------------------------------------------------------------------
 
 use anyhow::Context;
-use std::io::SeekFrom;
-use tokio::fs::File as TokioFile;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncSeekExt;
 
 use crate::auth::verify_wp_response_signature_for_plaintext;
 
@@ -326,6 +321,10 @@ pub(crate) struct ChunkedUploadConfig {
     pub(crate) route_secret: Option<String>,
     /// Worker ID sent in `X-WPTSALL-Worker-ID`.
     pub(crate) worker_id: String,
+    /// opus5 A-03 (AF-03): stable WP device identity sent in
+    /// `X-WPTSALL-Device-Id`; threaded from the boot-level WorkerConfig,
+    /// never resolved from env at request time.
+    pub(crate) device_id: String,
     /// Chunk size in bytes (default: 5 MiB).  Zero means use default.
     pub(crate) chunk_size: usize,
 }
@@ -360,6 +359,25 @@ struct StatusResponse {
     total_chunks: usize,
     #[serde(default)]
     missing_chunks: Vec<usize>,
+}
+
+fn validate_chunk_status(status: &StatusResponse, expected: usize) -> anyhow::Result<bool> {
+    anyhow::ensure!(
+        expected > 0 && status.total_chunks == expected,
+        "chunk status count does not match this upload"
+    );
+    let mut seen = std::collections::HashSet::new();
+    for index in status.received_chunks.iter().chain(&status.missing_chunks) {
+        anyhow::ensure!(
+            *index < expected && seen.insert(*index),
+            "chunk status has duplicate, overlapping or out-of-range indices"
+        );
+    }
+    anyhow::ensure!(
+        seen.len() == expected,
+        "chunk status does not account for every chunk"
+    );
+    Ok(status.missing_chunks.is_empty())
 }
 
 /// Final result of a media upload (either single or chunked).
@@ -407,18 +425,38 @@ fn make_wp_url(wp_base: &str, endpoint: &str) -> String {
 // Standard auth headers
 // ---------------------------------------------------------------------------
 
-fn auth_headers(token: &str, worker_id: &str) -> reqwest::header::HeaderMap {
+fn auth_headers(token: &str, worker_id: &str, device_id: &str) -> reqwest::header::HeaderMap {
     let mut map = reqwest::header::HeaderMap::new();
     if let Ok(v) = reqwest::header::HeaderValue::from_str(token) {
         map.insert("X-WPTSALL-Client-Token", v);
     }
+    // Protocol v2 requires Device-Id on every authenticated client call.
+    // opus5 A-03 (AF-03): threaded from the boot-level identity via
+    // ChunkedUploadConfig — no env read at request time.
+    if !device_id.is_empty() {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(device_id) {
+            map.insert("X-WPTSALL-Device-Id", v);
+        }
+    }
     if let Ok(v) = reqwest::header::HeaderValue::from_str(worker_id) {
-        map.insert("X-WPTSALL-Worker-ID", v);
+        map.insert("X-WPTSALL-Worker-Id", v);
     }
     map.insert(
         "X-WPTSALL-Protocol-Version",
         reqwest::header::HeaderValue::from_static("2"),
     );
+    map.insert(
+        "X-Client-Version",
+        reqwest::header::HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    if let Ok(value) = crate::auth::build_request_id("media-upload").parse() {
+        map.insert(crate::config::REQUEST_ID_HEADER, value);
+    }
+    if let Some(trace) = crate::auth::current_run_trace_id() {
+        if let Ok(value) = trace.parse() {
+            map.insert(crate::config::TRACE_ID_HEADER, value);
+        }
+    }
     map
 }
 
@@ -443,17 +481,71 @@ fn add_signature_headers(
     }
 }
 
+async fn send_media_request(
+    client: &reqwest::Client,
+    config: &ChunkedUploadConfig,
+    method: reqwest::Method,
+    url: &str,
+    mut headers: reqwest::header::HeaderMap,
+    plaintext: Vec<u8>,
+    content_type: &str,
+) -> anyhow::Result<Value> {
+    let is_get = method == reqwest::Method::GET;
+    let body = if crate::auth::requires_transport_encryption(url) {
+        let (payload, nonce) = crate::crypto::transport_encrypt(&plaintext, &config.token)?;
+        headers.insert("X-WPTSALL-Transport", "encrypted".parse()?);
+        headers.insert("X-WPTSALL-Nonce", nonce.parse()?);
+        serde_json::to_vec(&serde_json::json!({
+            "encrypted_payload":payload,"nonce":nonce,"algorithm":"aes-256-gcm-v1"}))?
+    } else {
+        plaintext
+    };
+    let request = client
+        .request(method, url)
+        .headers(headers)
+        .header("Content-Type", content_type);
+    let request = if is_get { request } else { request.body(body) };
+    let response = request.send().await.map_err(|error| error.without_url())?;
+    let status = response.status();
+    let signature = response
+        .headers()
+        .get("X-WPTSALL-Response-Signature")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let transport = response
+        .headers()
+        .get("X-WPTSALL-Transport")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let body = response.text().await?;
+    anyhow::ensure!(status.is_success(), "media transport HTTP {status}");
+    crate::auth::process_wp_response(
+        &body,
+        &transport,
+        signature.as_deref(),
+        &config.token,
+        url,
+        true,
+    )
+    .map_err(|_| {
+        anyhow::anyhow!("media response could not be decoded or signature verified; retained")
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Public entry-point
 // ---------------------------------------------------------------------------
 
 /// Upload a local file to WP, automatically selecting single vs. chunked
-/// protocol based on file size and MIME type.
+/// protocol based on file size.
 ///
 /// Decision rule:
-/// - Images < 50 MiB  → single upload (`POST /media-upload`)
-/// - Images ≥ 50 MiB  → chunked upload
-/// - Audio / video / application/* → always chunked (regardless of size)
+/// - Files < 50 MiB  → single upload (`POST /media-upload`)
+/// - Files ≥ 50 MiB  → chunked upload (`init` / `chunk` / `status` / `complete`)
+///
+/// Note: older builds forced chunked for audio/video/application/*; that broke
+/// Lab/WP installs whose PHP `post_max_size` is below the 5 MiB chunk default.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn upload_file_to_wp(
     client: &reqwest::Client,
@@ -465,52 +557,21 @@ pub(crate) async fn upload_file_to_wp(
     task_id: i64,
     relation_id: i64,
 ) -> MediaUploadResult {
-    const SINGLE_UPLOAD_LIMIT: u64 = 50 * 1024 * 1024; // 50 MiB
-
-    // Determine file size.
-    let file_size = match tokio::fs::metadata(local_path).await {
-        Ok(m) => m.len(),
-        Err(e) => return MediaUploadResult::err(format!("failed to stat '{}': {}", local_path, e)),
-    };
-
-    let use_chunked = file_size >= SINGLE_UPLOAD_LIMIT
-        || content_type.starts_with("video/")
-        || content_type.starts_with("audio/")
-        || content_type == "application/pdf"
-        || content_type.starts_with("application/");
-
-    if use_chunked {
-        match chunked_upload(
-            client,
-            config,
-            local_path,
-            filename,
-            content_type,
-            file_size,
-            source_id,
-            task_id,
-            relation_id,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => MediaUploadResult::err(format!("chunked upload error: {}", e)),
-        }
-    } else {
-        match single_upload(
-            client,
-            config,
-            local_path,
-            filename,
-            content_type,
-            source_id,
-            task_id,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => MediaUploadResult::err(format!("single upload error: {}", e)),
-        }
+    match recovery::upload(
+        client,
+        config,
+        local_path,
+        filename,
+        content_type,
+        source_id,
+        task_id,
+        relation_id,
+        None,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => MediaUploadResult::err(format!("durable media upload: {error:#}")),
     }
 }
 
@@ -527,13 +588,13 @@ async fn single_upload(
     content_type: &str,
     source_id: i64,
     task_id: i64,
+    relation_id: i64,
+    recovery: Option<&recovery::Checkpoint>,
 ) -> anyhow::Result<MediaUploadResult> {
-    let file_bytes = tokio::fs::read(local_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("read '{}': {}", local_path, e))?;
+    let file_bytes = crate::retained_assets::read_async(local_path, 512 * 1024 * 1024).await?;
 
     let url = make_wp_url(&config.wp_base, "media-upload");
-    let mut headers = auth_headers(&config.token, &config.worker_id);
+    let mut headers = auth_headers(&config.token, &config.worker_id, &config.device_id);
 
     // Additional per-request metadata headers (mirrors submitter.rs conventions).
     if let Ok(v) = reqwest::header::HeaderValue::from_str(filename) {
@@ -545,13 +606,28 @@ async fn single_upload(
     if let Ok(v) = reqwest::header::HeaderValue::from_str(&source_id.to_string()) {
         headers.insert("X-WPTSALL-Source-ID", v);
     }
+    if relation_id > 0 {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&relation_id.to_string()) {
+            headers.insert("X-WPTSALL-Relation-ID", v);
+        }
+    }
     let task_id_str = task_id.to_string();
     let source_id_str = source_id.to_string();
-    let signed_headers = [
+    let relation_id_str = relation_id.to_string();
+    let mut signed_headers = vec![
         ("X-WPTSALL-Filename", filename),
         ("X-WPTSALL-Task-ID", task_id_str.as_str()),
         ("X-WPTSALL-Source-ID", source_id_str.as_str()),
     ];
+    if relation_id > 0 {
+        signed_headers.push(("X-WPTSALL-Relation-ID", relation_id_str.as_str()));
+    }
+    if let Some(row) = recovery {
+        headers.insert("X-WPTSALL-Operation-ID", row.operation_id.parse()?);
+        headers.insert("X-WPTSALL-Content-SHA256", row.sha256.parse()?);
+        signed_headers.push(("X-WPTSALL-Operation-ID", &row.operation_id));
+        signed_headers.push(("X-WPTSALL-Content-SHA256", &row.sha256));
+    }
     add_signature_headers(
         &mut headers,
         "POST",
@@ -561,32 +637,55 @@ async fn single_upload(
         &signed_headers,
     );
 
-    let response = client
-        .post(&url)
-        .headers(headers)
-        .header("Content-Type", content_type)
-        .body(file_bytes)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("single upload send: {}", e))?;
-    let status = response.status();
-    let response_sig = response
-        .headers()
-        .get("X-WPTSALL-Response-Signature")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let body_text = response
-        .text()
-        .await
-        .map_err(|e| anyhow::anyhow!("single upload read response body: {}", e))?;
-
-    parse_single_upload_response(
-        status,
-        &body_text,
-        response_sig.as_deref(),
-        &config.token,
+    let response = send_media_request(
+        client,
+        config,
+        reqwest::Method::POST,
         &url,
+        headers,
+        file_bytes,
+        content_type,
     )
+    .await?;
+    if let Some(row) = recovery {
+        verify_media_operation_response(&response, row)?;
+    }
+    parse_media_upload_result(response)
+}
+
+fn verify_media_operation_response(
+    value: &Value,
+    row: &recovery::Checkpoint,
+) -> anyhow::Result<()> {
+    let data = value.get("data").unwrap_or(value);
+    anyhow::ensure!(
+        data["operation_id"].as_str() == Some(&row.operation_id)
+            && data["content_sha256"].as_str() == Some(&row.sha256)
+            && data["source_id"].as_i64() == Some(row.source_id)
+            && data["task_id"].as_i64() == Some(row.task_id)
+            && data["relation_id"].as_i64() == Some(row.relation_id),
+        "media result does not match the signed operation scope; retained"
+    );
+    Ok(())
+}
+
+async fn single_upload_recoverable(
+    client: &reqwest::Client,
+    config: &ChunkedUploadConfig,
+    row: &recovery::Checkpoint,
+) -> anyhow::Result<MediaUploadResult> {
+    single_upload(
+        client,
+        config,
+        &row.asset,
+        &row.filename,
+        &row.content_type,
+        row.source_id,
+        row.task_id,
+        row.relation_id,
+        Some(row),
+    )
+    .await
 }
 
 /// Parse the JSON response from `POST /media-upload`.
@@ -609,7 +708,10 @@ fn parse_single_upload_response(
         true,
     )
     .with_context(|| "single upload response signature verification failed")?;
+    parse_media_upload_result(serde_json::from_str(body_text)?)
+}
 
+fn parse_media_upload_result(value: Value) -> anyhow::Result<MediaUploadResult> {
     #[derive(serde::Deserialize)]
     struct Resp {
         success: bool,
@@ -628,7 +730,7 @@ fn parse_single_upload_response(
         url: Option<String>,
     }
 
-    let resp: Resp = serde_json::from_str(body_text)
+    let resp: Resp = serde_json::from_value(value)
         .map_err(|e| anyhow::anyhow!("parse single upload response: {}", e))?;
 
     if !resp.success {
@@ -648,6 +750,10 @@ fn parse_single_upload_response(
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .ok_or_else(|| anyhow::anyhow!("missing attachment_id in single upload response"))?;
+    anyhow::ensure!(
+        attachment_id > 0,
+        "media upload attachment ID must be positive"
+    );
 
     let url = resp
         .data
@@ -666,83 +772,6 @@ fn parse_single_upload_response(
 const CHUNK_RETRY_MAX: usize = 3;
 const CHUNK_RETRY_DELAY_MS: u64 = 1_000;
 
-/// Execute the 4-step chunked upload protocol.
-#[allow(clippy::too_many_arguments)]
-async fn chunked_upload(
-    client: &reqwest::Client,
-    config: &ChunkedUploadConfig,
-    local_path: &str,
-    filename: &str,
-    content_type: &str,
-    file_size: u64,
-    source_id: i64,
-    task_id: i64,
-    relation_id: i64,
-) -> anyhow::Result<MediaUploadResult> {
-    let chunk_size = config.effective_chunk_size();
-    let chunk_count = (file_size as usize).div_ceil(chunk_size);
-
-    // ---- Step 1: Init -------------------------------------------------------
-    let upload_id = init_upload(
-        client,
-        config,
-        filename,
-        file_size,
-        chunk_count,
-        content_type,
-        source_id,
-        task_id,
-        relation_id,
-    )
-    .await?;
-
-    // ---- Step 2: Upload all chunks -----------------------------------------
-    upload_chunks(
-        client,
-        config,
-        local_path,
-        &upload_id,
-        chunk_count,
-        chunk_size,
-    )
-    .await?;
-
-    // ---- Step 3: Verify + re-upload missing chunks (up to 3 attempts) ------
-    for attempt in 0..CHUNK_RETRY_MAX {
-        let status = query_upload_status(client, config, &upload_id).await?;
-
-        if status.missing_chunks.is_empty() && status.received_chunks.len() >= status.total_chunks {
-            break;
-        }
-
-        if attempt == CHUNK_RETRY_MAX - 1 {
-            anyhow::bail!(
-                "chunked upload: {} chunks still missing after {} retries",
-                status.missing_chunks.len(),
-                CHUNK_RETRY_MAX
-            );
-        }
-
-        // Re-upload only the missing chunks.
-        for chunk_index in &status.missing_chunks {
-            upload_single_chunk(
-                client,
-                config,
-                local_path,
-                &upload_id,
-                *chunk_index,
-                chunk_size,
-            )
-            .await?;
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(CHUNK_RETRY_DELAY_MS)).await;
-    }
-
-    // ---- Step 4: Complete ---------------------------------------------------
-    complete_upload(client, config, &upload_id).await
-}
-
 // ---------------------------------------------------------------------------
 // Step 1 — Init
 // ---------------------------------------------------------------------------
@@ -758,11 +787,12 @@ async fn init_upload(
     source_id: i64,
     task_id: i64,
     relation_id: i64,
+    recovery: Option<&recovery::Checkpoint>,
 ) -> anyhow::Result<String> {
     let url = make_wp_url(&config.wp_base, "media-upload/init");
-    let mut headers = auth_headers(&config.token, &config.worker_id);
+    let mut headers = auth_headers(&config.token, &config.worker_id, &config.device_id);
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "filename":     filename,
         "total_size":   total_size,
         "chunk_count":  chunk_count,
@@ -771,41 +801,24 @@ async fn init_upload(
         "task_id":      task_id,
         "relation_id":  relation_id,
     });
+    if let Some(row) = recovery {
+        body["operation_id"] = serde_json::json!(row.operation_id);
+        body["content_sha256"] = serde_json::json!(row.sha256);
+        body["chunk_size"] = serde_json::json!(row.chunk_size);
+    }
     let body_bytes =
         serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!("serialize init body: {}", e))?;
     add_signature_headers(&mut headers, "POST", &url, &config.token, &body_bytes, &[]);
-
-    let response = client
-        .post(&url)
-        .headers(headers)
-        .header("Content-Type", "application/json")
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("init upload send: {}", e))?;
-    let status = response.status();
-    let response_sig = response
-        .headers()
-        .get("X-WPTSALL-Response-Signature")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let body_text = response
-        .text()
-        .await
-        .map_err(|e| anyhow::anyhow!("init upload read response body: {}", e))?;
-
-    if !status.is_success() {
-        anyhow::bail!("init upload HTTP {} — {}", status, body_text);
-    }
-
-    verify_wp_response_signature_for_plaintext(
-        &config.token,
-        body_text.as_bytes(),
-        response_sig.as_deref(),
+    let response = send_media_request(
+        client,
+        config,
+        reqwest::Method::POST,
         &url,
-        true,
+        headers,
+        body_bytes,
+        "application/json",
     )
-    .with_context(|| "init upload response signature verification failed")?;
+    .await?;
 
     #[derive(serde::Deserialize)]
     struct Wrapper {
@@ -817,7 +830,7 @@ async fn init_upload(
         upload_id: Option<String>,
     }
 
-    let wrapper: Wrapper = serde_json::from_str(&body_text)
+    let wrapper: Wrapper = serde_json::from_value(response)
         .map_err(|e| anyhow::anyhow!("parse init response: {}", e))?;
 
     if !wrapper.success {
@@ -830,34 +843,38 @@ async fn init_upload(
         .or(wrapper.upload_id)
         .ok_or_else(|| anyhow::anyhow!("init response missing upload_id"))?;
 
+    anyhow::ensure!(
+        !upload_id.trim().is_empty(),
+        "init response has empty upload_id"
+    );
+    reqwest::header::HeaderValue::from_str(&upload_id)
+        .context("init response upload_id cannot be used as a header")?;
     Ok(upload_id)
 }
 
-// ---------------------------------------------------------------------------
-// Step 2 — Upload all chunks sequentially
-// ---------------------------------------------------------------------------
-
-async fn upload_chunks(
+async fn init_upload_recoverable(
     client: &reqwest::Client,
     config: &ChunkedUploadConfig,
-    local_path: &str,
-    upload_id: &str,
-    chunk_count: usize,
-    chunk_size: usize,
-) -> anyhow::Result<()> {
-    for chunk_index in 0..chunk_count {
-        upload_single_chunk(
-            client,
-            config,
-            local_path,
-            upload_id,
-            chunk_index,
-            chunk_size,
-        )
-        .await?;
-    }
-    Ok(())
+    row: &recovery::Checkpoint,
+) -> anyhow::Result<String> {
+    init_upload(
+        client,
+        config,
+        &row.filename,
+        row.size,
+        usize::try_from(row.size)?.div_ceil(row.chunk_size),
+        &row.content_type,
+        row.source_id,
+        row.task_id,
+        row.relation_id,
+        Some(row),
+    )
+    .await
 }
+
+// ---------------------------------------------------------------------------
+// Step 2 — Upload only verified missing chunks
+// ---------------------------------------------------------------------------
 
 /// Read one chunk from the file and POST it to `POST /media-upload/chunk`.
 /// Retries up to `CHUNK_RETRY_MAX` times on failure.
@@ -875,78 +892,47 @@ async fn upload_single_chunk(
     let chunk_bytes: bytes::Bytes =
         bytes::Bytes::from(read_chunk(local_path, chunk_index, chunk_size).await?);
     let url = make_wp_url(&config.wp_base, "media-upload/chunk");
-
     let mut last_err = String::new();
     for attempt in 0..CHUNK_RETRY_MAX {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(CHUNK_RETRY_DELAY_MS)).await;
         }
-
-        let mut headers = auth_headers(&config.token, &config.worker_id);
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(upload_id) {
-            headers.insert("X-WPTSALL-Upload-ID", v);
-        }
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(&chunk_index.to_string()) {
-            headers.insert("X-WPTSALL-Chunk-Index", v);
-        }
-        let chunk_index_str = chunk_index.to_string();
-        let signed_headers = [
-            ("X-WPTSALL-Upload-ID", upload_id),
-            ("X-WPTSALL-Chunk-Index", chunk_index_str.as_str()),
-        ];
+        let mut headers = auth_headers(&config.token, &config.worker_id, &config.device_id);
+        headers.insert("X-WPTSALL-Upload-ID", upload_id.parse()?);
+        let index = chunk_index.to_string();
+        headers.insert("X-WPTSALL-Chunk-Index", index.parse()?);
         add_signature_headers(
             &mut headers,
             "POST",
             &url,
             &config.token,
-            chunk_bytes.as_ref(),
-            &signed_headers,
+            &chunk_bytes,
+            &[
+                ("X-WPTSALL-Upload-ID", upload_id),
+                ("X-WPTSALL-Chunk-Index", &index),
+            ],
         );
-
-        let response = match client
-            .post(&url)
-            .headers(headers)
-            .header("Content-Type", "application/octet-stream")
-            .body(chunk_bytes.clone())
-            .send()
-            .await
+        let response = match send_media_request(
+            client,
+            config,
+            reqwest::Method::POST,
+            &url,
+            headers,
+            chunk_bytes.to_vec(),
+            "application/octet-stream",
+        )
+        .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                last_err = format!("send error: {}", e);
+            Ok(response) => response,
+            Err(error) => {
+                last_err = format!("send error: {error}");
                 continue;
             }
         };
-
-        if response.status().is_success() {
-            let response_sig = response
-                .headers()
-                .get("X-WPTSALL-Response-Signature")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
-            let body = response.text().await.unwrap_or_default();
-            verify_wp_response_signature_for_plaintext(
-                &config.token,
-                body.as_bytes(),
-                response_sig.as_deref(),
-                &url,
-                true,
-            )
-            .with_context(|| "chunk upload response signature verification failed")?;
-            return Ok(());
-        }
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        last_err = format!("HTTP {} — {}", status, body);
+        anyhow::ensure!(response["success"] == true, "chunk upload rejected");
+        return Ok(());
     }
-
-    anyhow::bail!(
-        "chunk {} upload failed after {} attempts: {}",
-        chunk_index,
-        CHUNK_RETRY_MAX,
-        last_err
-    )
+    anyhow::bail!("chunk {chunk_index} upload failed after {CHUNK_RETRY_MAX} attempts: {last_err}")
 }
 
 /// Read exactly one chunk from a local file at the given chunk index.
@@ -955,100 +941,12 @@ async fn read_chunk(
     chunk_index: usize,
     chunk_size: usize,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut file = TokioFile::open(local_path)
-        .await
-        .map_err(|e| anyhow::anyhow!("open '{}': {}", local_path, e))?;
-
-    let offset = (chunk_index * chunk_size) as u64;
-    file.seek(SeekFrom::Start(offset))
-        .await
-        .map_err(|e| anyhow::anyhow!("seek in '{}': {}", local_path, e))?;
-
-    let mut buf = vec![0u8; chunk_size];
-    let n = file
-        .read(&mut buf)
-        .await
-        .map_err(|e| anyhow::anyhow!("read chunk {} from '{}': {}", chunk_index, local_path, e))?;
-    buf.truncate(n);
-
-    Ok(buf)
-}
-
-// ---------------------------------------------------------------------------
-// Step 3 — Status check
-// ---------------------------------------------------------------------------
-
-async fn query_upload_status(
-    client: &reqwest::Client,
-    config: &ChunkedUploadConfig,
-    upload_id: &str,
-) -> anyhow::Result<StatusResponse> {
-    let url = format!(
-        "{}?upload_id={}",
-        make_wp_url(&config.wp_base, "media-upload/status"),
-        upload_id
-    );
-    let mut headers = auth_headers(&config.token, &config.worker_id);
-    add_signature_headers(&mut headers, "GET", &url, &config.token, &[], &[]);
-
-    let response = client
-        .get(&url)
-        .headers(headers)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("status query send: {}", e))?;
-    let status = response.status();
-    let response_sig = response
-        .headers()
-        .get("X-WPTSALL-Response-Signature")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let body_text = response
-        .text()
-        .await
-        .map_err(|e| anyhow::anyhow!("status query read response body: {}", e))?;
-
-    if !status.is_success() {
-        anyhow::bail!("status query HTTP {} — {}", status, body_text);
-    }
-
-    verify_wp_response_signature_for_plaintext(
-        &config.token,
-        body_text.as_bytes(),
-        response_sig.as_deref(),
-        &url,
-        true,
-    )
-    .with_context(|| "status query response signature verification failed")?;
-
-    #[derive(serde::Deserialize)]
-    struct Wrapper {
-        success: bool,
-        #[serde(default)]
-        error: String,
-        data: Option<StatusResponse>,
-        // Flat layout fallback.
-        #[serde(default)]
-        received_chunks: Vec<usize>,
-        total_chunks: Option<usize>,
-        #[serde(default)]
-        missing_chunks: Vec<usize>,
-    }
-
-    let wrapper: Wrapper = serde_json::from_str(&body_text)
-        .map_err(|e| anyhow::anyhow!("parse status response: {}", e))?;
-
-    if !wrapper.success {
-        anyhow::bail!("status query rejected: {}", wrapper.error);
-    }
-
-    let status = wrapper.data.unwrap_or_else(|| StatusResponse {
-        received_chunks: wrapper.received_chunks,
-        total_chunks: wrapper.total_chunks.unwrap_or(0),
-        missing_chunks: wrapper.missing_chunks,
-    });
-
-    Ok(status)
+    anyhow::ensure!(chunk_size > 0, "chunk size must be positive");
+    let offset = chunk_index
+        .checked_mul(chunk_size)
+        .and_then(|offset| u64::try_from(offset).ok())
+        .ok_or_else(|| anyhow::anyhow!("chunk offset overflow"))?;
+    crate::retained_assets::range_async(local_path, offset, chunk_size, 512 * 1024 * 1024).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,89 +956,29 @@ async fn query_upload_status(
 async fn complete_upload(
     client: &reqwest::Client,
     config: &ChunkedUploadConfig,
-    upload_id: &str,
+    row: &recovery::Checkpoint,
 ) -> anyhow::Result<MediaUploadResult> {
+    let upload_id = row
+        .upload_id
+        .as_deref()
+        .context("media session identity missing")?;
     let url = make_wp_url(&config.wp_base, "media-upload/complete");
-    let mut headers = auth_headers(&config.token, &config.worker_id);
+    let mut headers = auth_headers(&config.token, &config.worker_id, &config.device_id);
 
     let body = serde_json::json!({ "upload_id": upload_id });
     let body_bytes =
         serde_json::to_vec(&body).map_err(|e| anyhow::anyhow!("serialize complete body: {}", e))?;
     add_signature_headers(&mut headers, "POST", &url, &config.token, &body_bytes, &[]);
-
-    let response = client
-        .post(&url)
-        .headers(headers)
-        .header("Content-Type", "application/json")
-        .body(body_bytes)
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("complete upload send: {}", e))?;
-    let status = response.status();
-    let response_sig = response
-        .headers()
-        .get("X-WPTSALL-Response-Signature")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let body_text = response
-        .text()
-        .await
-        .map_err(|e| anyhow::anyhow!("complete upload read response body: {}", e))?;
-
-    if !status.is_success() {
-        anyhow::bail!("complete upload HTTP {} — {}", status, body_text);
-    }
-
-    verify_wp_response_signature_for_plaintext(
-        &config.token,
-        body_text.as_bytes(),
-        response_sig.as_deref(),
+    let response = send_media_request(
+        client,
+        config,
+        reqwest::Method::POST,
         &url,
-        true,
+        headers,
+        body_bytes,
+        "application/json",
     )
-    .with_context(|| "complete upload response signature verification failed")?;
-
-    #[derive(serde::Deserialize)]
-    struct Resp {
-        success: bool,
-        #[serde(default)]
-        error: String,
-        data: Option<CompleteData>,
-        attachment_id: Option<serde_json::Value>,
-        url: Option<String>,
-    }
-    #[derive(serde::Deserialize)]
-    struct CompleteData {
-        attachment_id: Option<serde_json::Value>,
-        url: Option<String>,
-    }
-
-    let resp: Resp = serde_json::from_str(&body_text)
-        .map_err(|e| anyhow::anyhow!("parse complete response: {}", e))?;
-
-    if !resp.success {
-        anyhow::bail!("complete upload rejected: {}", resp.error);
-    }
-
-    let raw_id = resp
-        .data
-        .as_ref()
-        .and_then(|d| d.attachment_id.as_ref())
-        .or(resp.attachment_id.as_ref());
-
-    let attachment_id = raw_id
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-        })
-        .ok_or_else(|| anyhow::anyhow!("complete response missing attachment_id"))?;
-
-    let url = resp
-        .data
-        .as_ref()
-        .and_then(|d| d.url.clone())
-        .or(resp.url)
-        .unwrap_or_default();
-
-    Ok(MediaUploadResult::ok(attachment_id, url))
+    .await?;
+    verify_media_operation_response(&response, row)?;
+    parse_media_upload_result(response)
 }

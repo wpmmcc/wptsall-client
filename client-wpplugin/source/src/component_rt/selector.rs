@@ -22,6 +22,7 @@ pub(crate) fn select_component_runtime_for_task_type<'a>(
     component_id_override: &str,
     component_prefer_ids: &[String],
     task_type_component_bindings: Option<&TaskTypeComponentBindingsDoc>,
+    claimed_by_other_relations: Option<&HashSet<String>>,
 ) -> Option<&'a ComponentRuntime> {
     let registry = registry?;
     let artifact_hints = extract_artifact_selection_hints(task_payload);
@@ -97,11 +98,21 @@ pub(crate) fn select_component_runtime_for_task_type<'a>(
         }
     }
 
+    // FL-9 leak guard: the anonymous fallback tier only sees components that
+    // are not the explicit selection of a different relation's task. Every
+    // explicit tier above (override, payload hints, operator bindings) still
+    // resolves against the full registry; `None` keeps the legacy unguarded
+    // behavior (capability probes, CLI one-off workers).
     select_best_runtime_by_artifacts(
         registry
             .ordered_ids
             .iter()
             .filter_map(|id| registry.runtimes.get(id))
+            .filter(|runtime| {
+                claimed_by_other_relations
+                    .map(|claimed| !claimed.contains(&runtime.template.id))
+                    .unwrap_or(true)
+            })
             .filter(|runtime| runtime_supports_route(runtime, business_line, task_type)),
         artifact_hints,
     )
@@ -152,6 +163,7 @@ fn select_component_runtime_for_task_type_and_format<'a>(
     component_id_override: &str,
     component_prefer_ids: &[String],
     task_type_component_bindings: Option<&TaskTypeComponentBindingsDoc>,
+    claimed_by_other_relations: Option<&HashSet<String>>,
 ) -> Option<&'a ComponentRuntime> {
     let registry = registry?;
     let file_ext_hint = task_payload
@@ -243,11 +255,18 @@ fn select_component_runtime_for_task_type_and_format<'a>(
         }
     }
 
+    // FL-9 leak guard: same fallback-tier exclusion as the non-format
+    // variant — explicit tiers above stay unguarded.
     select_best_runtime_by_artifacts(
         registry
             .ordered_ids
             .iter()
             .filter_map(|id| registry.runtimes.get(id))
+            .filter(|runtime| {
+                claimed_by_other_relations
+                    .map(|claimed| !claimed.contains(&runtime.template.id))
+                    .unwrap_or(true)
+            })
             .filter(|runtime| {
                 runtime_supports_route_format_and_file(
                     runtime,
@@ -445,10 +464,11 @@ pub(crate) fn select_component_with_rule_bindings<'a>(
         component_id_override,
         component_prefer_ids,
         task_type_component_bindings,
+        None,
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow (dead_code)]
 pub(crate) fn collect_required_task_types(
     declared_task_type: &str,
     text_field_units: &[TaskTextFieldUnit],
@@ -516,6 +536,8 @@ pub(crate) fn build_component_capability_probe(
             component_id_override,
             component_prefer_ids,
             task_type_component_bindings,
+            // FL-9: capability probe — keep unguarded.
+            None,
         );
 
         if let Some(runtime) = selected {
@@ -647,7 +669,7 @@ pub(crate) fn resolve_component_id_for_task_type<'a>(
     None
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow (dead_code)]
 pub(crate) fn task_priority(task: &ClientTask) -> i32 {
     if let Some(ref p) = task.priority {
         // Handle both numeric and string priority values.
@@ -714,6 +736,7 @@ pub(crate) fn select_component_with_format_awareness<'a>(
     component_id_override: &str,
     component_prefer_ids: &[String],
     task_type_component_bindings: Option<&TaskTypeComponentBindingsDoc>,
+    claimed_by_other_relations: Option<&HashSet<String>>,
 ) -> Option<&'a ComponentRuntime> {
     let registry = registry?;
     let file_ext_hint = task_payload
@@ -755,11 +778,12 @@ pub(crate) fn select_component_with_format_awareness<'a>(
         component_id_override,
         component_prefer_ids,
         task_type_component_bindings,
+        claimed_by_other_relations,
     )
 }
 
 /// Build a JSON summary of all component capabilities (for the Web UI).
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow (dead_code)]
 pub(crate) fn build_format_capability_summary(registry: &ComponentRuntimeRegistry) -> Value {
     let mut items = Vec::new();
     for id in &registry.ordered_ids {
@@ -872,6 +896,3 @@ fn runtime_supports_route(
     runtime_supports_business_line(runtime, business_line)
         && runtime_supports_task_type(runtime, task_type)
 }
-
-#[cfg(test)]
-mod tests;

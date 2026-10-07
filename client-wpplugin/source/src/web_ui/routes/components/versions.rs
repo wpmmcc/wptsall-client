@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::web_ui::routes::errors::err_public;
+
 pub(in crate::web_ui::routes) async fn handle_component_version_create(
     socket: &mut TcpStream,
     _state: &Arc<Mutex<WebUiState>>,
@@ -17,7 +19,7 @@ pub(in crate::web_ui::routes) async fn handle_component_version_create(
     if version.is_empty() {
         return write_error_response(socket, "INVALID_VERSION", "version is required").await;
     }
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let Some(comp) = doc.components.get_mut(comp_id) else {
         return write_not_found_response(socket, "NOT_FOUND", "component not found").await;
     };
@@ -46,7 +48,7 @@ pub(in crate::web_ui::routes) async fn handle_component_version_create(
             socket,
             "422 Unprocessable Entity",
             "INVALID_COMPONENT_VERSION_KEYS",
-            &format!("{:#}", err),
+            &err_public(&err),
         )
         .await;
     }
@@ -98,6 +100,11 @@ pub(in crate::web_ui::routes) async fn handle_component_version_create(
         comp.active_version = Some(version.clone());
     }
     save_local_components_runtime_doc(&doc)?;
+    crate::logging::log_event_global(
+        "info",
+        "component.version_created",
+        json!({ "component_id": comp_id, "version": version }),
+    );
     let payload =
         json!({ "success": true, "data": { "component_id": comp_id, "version": version } });
     write_http_response(
@@ -118,7 +125,7 @@ pub(in crate::web_ui::routes) async fn handle_component_version_update(
 ) -> anyhow::Result<()> {
     let req: Value =
         serde_json::from_slice(body).with_context(|| "invalid PUT version json payload")?;
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let Some(comp) = doc.components.get_mut(comp_id) else {
         return write_not_found_response(socket, "NOT_FOUND", "component not found").await;
     };
@@ -143,7 +150,7 @@ pub(in crate::web_ui::routes) async fn handle_component_version_update(
                     socket,
                     "422 Unprocessable Entity",
                     "INVALID_COMPONENT_VERSION_KEYS",
-                    &format!("{:#}", err),
+                    &err_public(&err),
                 )
                 .await;
             }
@@ -179,6 +186,11 @@ pub(in crate::web_ui::routes) async fn handle_component_version_update(
         comp.active_version = Some(ver.to_string());
     }
     save_local_components_runtime_doc(&doc)?;
+    crate::logging::log_event_global(
+        "info",
+        "component.version_updated",
+        json!({ "component_id": comp_id, "version": ver }),
+    );
     let payload = json!({ "success": true, "data": { "component_id": comp_id, "version": ver } });
     write_http_response(
         socket,
@@ -195,7 +207,7 @@ pub(in crate::web_ui::routes) async fn handle_component_version_delete(
     comp_id: &str,
     ver: &str,
 ) -> anyhow::Result<()> {
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let Some(comp) = doc.components.get_mut(comp_id) else {
         return write_not_found_response(socket, "NOT_FOUND", "component not found").await;
     };
@@ -212,6 +224,11 @@ pub(in crate::web_ui::routes) async fn handle_component_version_delete(
             .map(|(version_id, _)| version_id.clone());
     }
     save_local_components_runtime_doc(&doc)?;
+    crate::logging::log_event_global(
+        "warn",
+        "component.version_deleted",
+        json!({ "component_id": comp_id, "version": ver, "deleted": removed }),
+    );
     let payload = json!({ "success": true, "data": { "component_id": comp_id, "version": ver, "deleted": removed } });
     write_http_response(
         socket,
@@ -246,7 +263,7 @@ pub(in crate::web_ui::routes) async fn handle_component_version_test(
         .unwrap_or("zh_CN")
         .to_string();
 
-    let doc = load_local_components_runtime_doc();
+    let doc = load_local_components_runtime_doc()?;
     let Some(comp) = doc.components.get(comp_id) else {
         return write_not_found_response(socket, "NOT_FOUND", "component not found").await;
     };
@@ -278,7 +295,7 @@ pub(in crate::web_ui::routes) async fn handle_component_version_test(
             return write_error_response(
                 socket,
                 "COMPONENT_API_VERSION_UNSUPPORTED",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await;
         }
@@ -319,7 +336,11 @@ pub(in crate::web_ui::routes) async fn handle_component_version_test(
         crate::component_rt::loader::apply_component_instance_overrides_to_template(
             &mut template,
             comp.component_overrides.as_ref(),
-        );
+        )?;
+        crate::component_rt::loader::apply_version_config_overrides_to_template(
+            &mut template,
+            &version_entry.config_overrides,
+        )?;
 
         let runtime = crate::types::ComponentRuntime {
             template,

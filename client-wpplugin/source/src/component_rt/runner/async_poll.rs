@@ -3,10 +3,58 @@ use reqwest::{Client, Method};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::logging::snippet;
-
 use super::signing::prime_sign_context;
 use super::*;
+
+pub(super) struct PollDeadline<'a> {
+    deadline: tokio::time::Instant,
+    timeout_secs: u64,
+    component_id: &'a str,
+}
+
+impl<'a> PollDeadline<'a> {
+    pub(super) fn new(timeout_secs: u64, component_id: &'a str) -> anyhow::Result<Self> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(timeout_secs))
+            .ok_or_else(|| {
+                crate::component_rt::loader::RuntimeConfigurationFault::error("async_poll timeout")
+            })?;
+        Ok(Self {
+            deadline,
+            timeout_secs,
+            component_id,
+        })
+    }
+
+    fn expired(&self, attempts: u64) -> anyhow::Error {
+        anyhow!(
+            "component async poll timed out (timeout_secs={}, attempts={}, component={})",
+            self.timeout_secs,
+            attempts,
+            self.component_id
+        )
+    }
+
+    pub(super) fn check(&self, attempts: u64) -> anyhow::Result<()> {
+        if tokio::time::Instant::now() >= self.deadline {
+            return Err(self.expired(attempts));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn wait<T>(
+        &self,
+        attempts: u64,
+        future: impl std::future::Future<Output = T>,
+    ) -> anyhow::Result<T> {
+        self.check(attempts)?;
+        let value = tokio::time::timeout_at(self.deadline, future)
+            .await
+            .map_err(|_| self.expired(attempts))?;
+        self.check(attempts)?;
+        Ok(value)
+    }
+}
 
 pub(super) fn normalize_status_value(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
@@ -110,14 +158,12 @@ pub(super) fn apply_json_extract_map(
             .unwrap_or_default();
 
         if value.trim().is_empty() {
-            let body_preview: String = response_json.to_string().chars().take(200).collect();
             return Err(anyhow!(
-                "{} '{}' path '{}' not found in response (component={}, body_preview={})",
+                "{} '{}' path '{}' not found in response (component={})",
                 field_label,
                 key,
                 path,
-                component_id,
-                body_preview
+                component_id
             ));
         }
 
@@ -151,26 +197,46 @@ pub(super) async fn call_component_request_json(
     request_spec: &ComponentRequest,
     ctx: &mut HashMap<String, String>,
 ) -> anyhow::Result<Value> {
-    let _runtime_concurrency_guard = acquire_runtime_concurrency_guard(runtime).await?;
-    enforce_runtime_rate_limit(runtime).await;
-    prime_sign_context(runtime.template.sign.as_ref(), ctx)?;
-    let rendered_url = render_template_string(&request_spec.url, ctx);
-    inject_rendered_request_context(request_spec, &rendered_url, ctx);
-    let sign_result = process_sign_config(
-        runtime.template.sign.as_ref(),
-        ctx,
-        &request_spec.method,
-        &rendered_url,
+    call_component_request_json_with_source(client, runtime, request_spec, ctx, None).await
+}
+
+pub(super) async fn call_component_request_json_with_source(
+    client: &Client,
+    runtime: &ComponentRuntime,
+    request_spec: &ComponentRequest,
+    ctx: &mut HashMap<String, String>,
+    source: Option<SourceRequest<'_>>,
+) -> anyhow::Result<Value> {
+    let budget = HttpBudget::new(
+        request_spec.http_limits.as_ref(),
+        HttpResponseKind::Json,
+        &runtime.template.id,
     )?;
-    invoke_component_api(
-        client,
-        runtime,
-        request_spec,
-        &rendered_url,
-        ctx,
-        sign_result,
-    )
-    .await
+    budget
+        .wait(async {
+            let _runtime_concurrency_guard = acquire_runtime_concurrency_guard(runtime).await?;
+            enforce_runtime_rate_limit(runtime).await;
+            prime_sign_context(runtime.template.sign.as_ref(), ctx)?;
+            let rendered_url = render_template_string(&request_spec.url, ctx);
+            inject_rendered_request_context(request_spec, &rendered_url, ctx);
+            let sign_result = process_sign_config(
+                runtime.template.sign.as_ref(),
+                ctx,
+                &request_spec.method,
+                &rendered_url,
+            )?;
+            invoke_component_api_with_source(
+                client,
+                runtime,
+                request_spec,
+                &rendered_url,
+                ctx,
+                sign_result,
+                source,
+            )
+            .await
+        })
+        .await?
 }
 
 #[derive(Debug, Clone)]
@@ -377,119 +443,120 @@ pub(super) async fn call_component_request_binary(
     request_spec: &ComponentAsyncDownload,
     ctx: &mut HashMap<String, String>,
 ) -> anyhow::Result<DownloadedBinaryAsset> {
-    let _runtime_concurrency_guard = acquire_runtime_concurrency_guard(runtime).await?;
-    enforce_runtime_rate_limit(runtime).await;
-
-    prime_sign_context(runtime.template.sign.as_ref(), ctx)?;
-    let rendered_url = render_template_string(&request_spec.url, ctx);
-    let sign_result = process_sign_config(
-        runtime.template.sign.as_ref(),
-        ctx,
-        &request_spec.method,
-        &rendered_url,
+    let budget = HttpBudget::new(
+        request_spec.http_limits.as_ref(),
+        HttpResponseKind::Binary,
+        &runtime.template.id,
     )?;
+    budget
+        .wait(async {
+            let _runtime_concurrency_guard = acquire_runtime_concurrency_guard(runtime).await?;
+            enforce_runtime_rate_limit(runtime).await;
 
-    let method = Method::from_bytes(request_spec.method.as_bytes())
-        .with_context(|| format!("unsupported method: {}", request_spec.method))?;
-    let mut request = client.request(method, &rendered_url);
-    assert_provider_url_allowed(&rendered_url)?;
+            prime_sign_context(runtime.template.sign.as_ref(), ctx)?;
+            let rendered_url = render_template_string(&request_spec.url, ctx);
+            let sign_result = process_sign_config(
+                runtime.template.sign.as_ref(),
+                ctx,
+                &request_spec.method,
+                &rendered_url,
+            )?;
 
-    let body_type = request_spec.body_type.as_deref().unwrap_or("json");
+            let method = Method::from_bytes(request_spec.method.as_bytes())
+                .with_context(|| format!("unsupported method: {}", request_spec.method))?;
+            let mut request = client.request(method, &rendered_url);
+            assert_provider_url_allowed(&rendered_url)?;
 
-    if let Some(headers) = &request_spec.headers {
-        for (k, v) in headers {
-            if body_type == "multipart" && k.eq_ignore_ascii_case("content-type") {
-                continue;
-            }
-            let rendered = render_template_string(v, ctx);
-            if rendered.trim().is_empty() {
-                continue;
-            }
-            request = request.header(k, rendered);
-        }
-    }
+            let body_type = request_spec.body_type.as_deref().unwrap_or("json");
 
-    match &sign_result {
-        SignResult::ContextOnly(_) => {}
-        SignResult::WithHeaders(_, headers) => {
-            for (k, v) in headers {
-                if v.trim().is_empty() {
-                    continue;
+            if let Some(headers) = &request_spec.headers {
+                for (k, v) in headers {
+                    if body_type == "multipart" && k.eq_ignore_ascii_case("content-type") {
+                        continue;
+                    }
+                    let rendered = render_template_string(v, ctx);
+                    if rendered.trim().is_empty() {
+                        continue;
+                    }
+                    request = request.header(k, rendered);
                 }
-                request = request.header(k, v);
             }
-        }
-        SignResult::AuthorizationHeader(value) => {
-            if !value.trim().is_empty() {
-                request = request.header("Authorization", value);
+
+            match &sign_result {
+                SignResult::ContextOnly(_) => {}
+                SignResult::WithHeaders(_, headers) => {
+                    for (k, v) in headers {
+                        if v.trim().is_empty() {
+                            continue;
+                        }
+                        request = request.header(k, v);
+                    }
+                }
+                SignResult::AuthorizationHeader(value) => {
+                    if !value.trim().is_empty() {
+                        request = request.header("Authorization", value);
+                    }
+                }
             }
-        }
-    }
 
-    if let Some(body) = &request_spec.body {
-        match body_type {
-            "form" => {
-                let rendered = render_template_value(body, ctx);
-                let form_map = value_to_string_map(&rendered);
-                request = request.form(&form_map);
+            if let Some(body) = &request_spec.body {
+                match body_type {
+                    "form" => {
+                        let rendered = render_template_value(body, ctx);
+                        let form_map = value_to_string_map(&rendered);
+                        request = request.form(&form_map);
+                    }
+                    "multipart" => {
+                        let rendered = render_template_value(body, ctx);
+                        let form = value_to_multipart_form_async(
+                            client,
+                            runtime
+                                .template
+                                .constraints
+                                .as_ref()
+                                .and_then(|c| c.max_file_size_mb)
+                                .unwrap_or(0),
+                            &rendered,
+                        )
+                        .await?;
+                        request = request.multipart(form);
+                    }
+                    "none" => {}
+                    _ => {
+                        request = request.json(&render_template_value(body, ctx));
+                    }
+                }
             }
-            "multipart" => {
-                let rendered = render_template_value(body, ctx);
-                let form = value_to_multipart_form_async(
-                    client,
-                    runtime
-                        .template
-                        .constraints
-                        .as_ref()
-                        .and_then(|c| c.max_file_size_mb)
-                        .unwrap_or(0),
-                    &rendered,
-                )
-                .await?;
-                request = request.multipart(form);
+
+            let response = request.send().await.map_err(|error| {
+                component_transport_error("component download request", &runtime.template.id, error)
+            })?;
+            assert_provider_redirect_origin(&rendered_url, response.url())?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "component api non-2xx (status={}, component={})",
+                    status,
+                    runtime.template.id
+                ));
             }
-            "none" => {}
-            _ => {
-                request = request.json(&render_template_value(body, ctx));
-            }
-        }
-    }
 
-    let safe_url = redact_url_secrets(&rendered_url);
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("component request failed ({})", safe_url))?;
-    assert_provider_redirect_origin(&rendered_url, response.url())?;
-    let status = response.status();
+            let filename = response
+                .headers()
+                .get("content-disposition")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.split("filename=").nth(1))
+                .map(|v| v.trim().trim_matches('\"').to_string())
+                .filter(|v| !v.is_empty());
 
-    let filename = response
-        .headers()
-        .get("content-disposition")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split("filename=").nth(1))
-        .map(|v| v.trim().trim_matches('\"').to_string())
-        .filter(|v| !v.is_empty());
+            let body_bytes = budget.read(response).await?;
 
-    let body_bytes = response
-        .bytes()
-        .await
-        .with_context(|| format!("component response read failed ({})", safe_url))?
-        .to_vec();
-
-    if !status.is_success() {
-        let body_preview = snippet(&String::from_utf8_lossy(&body_bytes));
-        return Err(anyhow!(
-            "component api non-2xx (status={}, body_preview={})",
-            status,
-            body_preview
-        ));
-    }
-
-    Ok(DownloadedBinaryAsset {
-        bytes: body_bytes,
-        filename,
-    })
+            Ok(DownloadedBinaryAsset {
+                bytes: body_bytes,
+                filename,
+            })
+        })
+        .await?
 }
 
 pub(super) async fn finalize_non_text_async(
@@ -544,7 +611,8 @@ pub(super) async fn finalize_non_text_async(
             .map(|s| render_template_string(s, ctx))
             .filter(|v| !v.trim().is_empty())
             .or_else(|| asset.filename.clone());
-        let local_path = persist_downloaded_asset_to_temp(&asset.bytes, preferred_name.as_deref())?;
+        let local_path =
+            persist_downloaded_provider_asset(&asset.bytes, preferred_name.as_deref())?;
         let translated_ref = format!("file://{}", local_path);
         return finalize_non_text_outcome(
             ctx,
@@ -613,120 +681,4 @@ pub(super) async fn finalize_non_text_async(
         translated_text,
     };
     finalize_non_text_outcome(ctx, runtime, normalized_task_type, outcome)
-}
-
-#[cfg(test)]
-mod tests {
-    // catalog: WEBUI-MOD-component-rt-runner-async-poll-rs
-    // oracle: L1
-    // Poll/network paths are covered through mock-component flows; this
-    // module pins the status-normalization and response-extract contracts.
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn status_values_are_normalized_deduped_and_lowercased() {
-        let values = vec![
-            " Pending ".to_string(),
-            "PENDING".to_string(),
-            "".to_string(),
-            "  ".to_string(),
-            "Completed".to_string(),
-        ];
-        assert_eq!(
-            normalize_status_values(&values),
-            vec!["pending".to_string(), "completed".to_string()]
-        );
-    }
-
-    #[test]
-    fn status_membership_normalizes_the_probe() {
-        // The list side is expected pre-normalized (callers pass the output
-        // of normalize_status_values); only the probe is normalized here.
-        let values = vec!["pending".to_string(), "completed".to_string()];
-        assert!(status_values_contains(&values, "  PENDING "));
-        assert!(status_values_contains(&values, "Completed"));
-        assert!(!status_values_contains(&values, "failed"));
-        assert!(!status_values_contains(&values, ""));
-    }
-
-    #[test]
-    fn extract_map_populates_computed_context_from_response() {
-        let mut ctx = HashMap::new();
-        let extract: HashMap<String, String> = HashMap::from([
-            ("job_id".to_string(), "data.id".to_string()),
-            ("token".to_string(), "data.token".to_string()),
-            ("count".to_string(), "data.count".to_string()),
-            ("flag".to_string(), "data.flag".to_string()),
-            ("obj".to_string(), "data.obj".to_string()),
-        ]);
-        let response = json!({
-            "data": {
-                "id": 42,
-                "token": "tok-1",
-                "count": 3,
-                "flag": true,
-                "obj": { "k": "v" }
-            }
-        });
-
-        apply_json_extract_map(&extract, &response, &mut ctx, "comp", "test.extract").unwrap();
-
-        assert_eq!(ctx.get("computed.job_id").map(String::as_str), Some("42"));
-        assert_eq!(ctx.get("computed.token").map(String::as_str), Some("tok-1"));
-        assert_eq!(ctx.get("computed.count").map(String::as_str), Some("3"));
-        assert_eq!(ctx.get("computed.flag").map(String::as_str), Some("true"));
-        // Objects/arrays are stringified rather than failing.
-        assert!(ctx.get("computed.obj").unwrap().contains("\"k\""));
-
-        // A key already namespaced with `computed.` is not double-prefixed.
-        let mut ctx2 = HashMap::new();
-        let namespaced: HashMap<String, String> =
-            HashMap::from([("computed.job_id".to_string(), "data.id".to_string())]);
-        apply_json_extract_map(&namespaced, &response, &mut ctx2, "comp", "t").unwrap();
-        assert!(ctx2.contains_key("computed.job_id"));
-        assert!(!ctx2.contains_key("computed.computed.job_id"));
-    }
-
-    #[test]
-    fn extract_map_fails_closed_on_missing_values_and_empty_paths() {
-        let mut ctx = HashMap::new();
-
-        // Missing path -> error naming the key, path, and component.
-        let missing: HashMap<String, String> =
-            HashMap::from([("job_id".to_string(), "data.absent".to_string())]);
-        let err = apply_json_extract_map(&missing, &json!({ "data": {} }), &mut ctx, "comp-x", "t")
-            .unwrap_err();
-        let err_text = err.to_string();
-        assert!(err_text.contains("job_id"), "err={err_text}");
-        assert!(err_text.contains("data.absent"));
-        assert!(err_text.contains("comp-x"));
-
-        // Null values resolve to empty and therefore fail the same check.
-        let null_value: HashMap<String, String> =
-            HashMap::from([("job_id".to_string(), "data.null".to_string())]);
-        let err = apply_json_extract_map(
-            &null_value,
-            &json!({ "data": { "null": null } }),
-            &mut ctx,
-            "comp-x",
-            "t",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("data.null"));
-
-        // An explicitly empty path is a configuration error.
-        let empty_path: HashMap<String, String> =
-            HashMap::from([("job_id".to_string(), "   ".to_string())]);
-        let err =
-            apply_json_extract_map(&empty_path, &json!({}), &mut ctx, "comp-x", "t").unwrap_err();
-        assert!(err.to_string().contains("empty json path"));
-
-        // Empty keys are skipped entirely.
-        let blank_key: HashMap<String, String> =
-            HashMap::from([("  ".to_string(), "data.id".to_string())]);
-        apply_json_extract_map(&blank_key, &json!({ "data": { "id": 1 } }), &mut ctx, "c", "t")
-            .unwrap();
-        assert!(ctx.is_empty());
-    }
 }

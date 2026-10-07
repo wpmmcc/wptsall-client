@@ -3,15 +3,28 @@ use std::path::Path;
 
 use crate::types::*;
 
+pub(crate) mod atomic_file;
+pub(crate) mod native_lock;
 mod binding_v2;
 mod components;
 mod crypto;
+pub(crate) use crypto::derive_retained_asset_key;
 mod domain_tokens;
+mod identity;
 mod integrations;
+pub(crate) use integrations::IntegrationDocumentLease;
 mod task_rules;
 
 pub(crate) fn load_component_bindings(path: &str) -> anyhow::Result<ComponentBindingsDoc> {
     components::load_component_bindings(path)
+}
+
+pub(crate) fn read_component_bindings(path: &str) -> anyhow::Result<ComponentBindingsDoc> {
+    components::read_component_bindings(path)
+}
+
+pub(crate) fn read_components_local(path: &str) -> anyhow::Result<ComponentsLocalDoc> {
+    components::read_components_local(path)
 }
 
 pub(crate) fn save_component_bindings(
@@ -30,6 +43,44 @@ pub(crate) fn save_domain_token_bindings(
     doc: &DomainTokenBindingsDoc,
 ) -> anyhow::Result<()> {
     domain_tokens::save_domain_token_bindings(path, doc)
+}
+
+/// Identity Contract v1.1 (C-1) re-exports: fail-closed identity gate,
+/// verification ping, and pairing-form hook. `identity_exclusion_first_notice`
+/// is the FL-3 once-per-(context, domain, identity) event dedup shared by
+/// the task-generation pre-filters and the lane-entry guard.
+pub(crate) use identity::{
+    classify_verify_outcome, format_rfc3339_utc, gate, identity_exclusion_first_notice, now_unix,
+    verify_identity, GateVerdict, VerifyOutcome,
+};
+
+/// Identity Contract v1.1 §2/§3: identity-aware verification base —
+/// `wpmmcc_ats` bindings verify on `wptsall/v2/{secret}/client/ping`,
+/// `wpmmcc` bindings on `wpmmcc/v1/{secret}/sync/ping`.
+pub(crate) use domain_tokens::build_verify_base_url;
+
+/// Pairing-form scaffolding (contract/identity-v1 §5): exercised by unit
+/// tests; wired into the live pairing flow at T-ID-4..7 once the wpmmcc-side
+/// pairing endpoint lands. Kept as contract surface, not dead code.
+#[allow(unused_imports)]
+pub(crate) use identity::{
+    validate_pairing_ends, PairingIdentityRejection, CODE_IDENTITY_MISMATCH, CODE_IDENTITY_STALE,
+    CODE_IDENTITY_UNKNOWN,
+};
+
+/// Identity Contract v1.1 §4 (C-1): shared v2→v3 identity backfill, used by
+/// both the bindings file loader and the SQLite cache loader.
+pub(crate) fn apply_v3_identity_backfill(doc: &mut DomainTokenBindingsDoc) {
+    domain_tokens::apply_v3_identity_backfill(doc)
+}
+
+/// Resolve the full binding entry (identity fields included, contract §4)
+/// for a domain. Key order mirrors the token/secret resolvers.
+pub(crate) fn resolve_entry_for_domain<'a>(
+    api_base_url: &str,
+    bindings_doc: &'a DomainTokenBindingsDoc,
+) -> Option<&'a DomainTokenBindingEntry> {
+    domain_tokens::resolve_entry_for_domain(api_base_url, bindings_doc)
 }
 
 pub(crate) fn normalize_api_base_url_key(input: &str) -> String {
@@ -102,7 +153,7 @@ pub(crate) fn parse_task_type_binding_key(raw: &str) -> Option<String> {
     task_rules::parse_task_type_binding_key(raw)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow (dead_code)]
 pub(crate) fn parse_content_format_binding_key(raw: &str) -> Option<String> {
     task_rules::parse_content_format_binding_key(raw)
 }
@@ -215,6 +266,10 @@ pub(crate) fn load_vendor_keys(path: &str) -> anyhow::Result<VendorKeysDoc> {
     integrations::load_vendor_keys(path)
 }
 
+pub(crate) fn read_vendor_keys(path: &str) -> anyhow::Result<VendorKeysDoc> {
+    integrations::read_document(path)
+}
+
 pub(crate) fn save_vendor_keys(path: &str, doc: &VendorKeysDoc) -> anyhow::Result<()> {
     integrations::save_vendor_keys(path, doc)
 }
@@ -227,6 +282,17 @@ pub(crate) fn load_vendor_oauth(path: &str) -> anyhow::Result<VendorOAuthDoc> {
     integrations::load_vendor_oauth(path)
 }
 
+pub(crate) fn read_vendor_oauth(path: &str) -> anyhow::Result<VendorOAuthDoc> {
+    integrations::read_document(path)
+}
+
+pub(crate) fn mutate_vendor_oauth_if_changed<R>(
+    path: &str,
+    update: impl FnOnce(&mut VendorOAuthDoc) -> anyhow::Result<(R, bool)>,
+) -> anyhow::Result<R> {
+    integrations::mutate_vendor_oauth_if_changed(path, update)
+}
+
 pub(crate) fn save_vendor_oauth(path: &str, doc: &VendorOAuthDoc) -> anyhow::Result<()> {
     integrations::save_vendor_oauth(path, doc)
 }
@@ -237,6 +303,10 @@ pub(crate) fn save_vendor_oauth(path: &str, doc: &VendorOAuthDoc) -> anyhow::Res
 
 pub(crate) fn load_proxy_profiles(path: &str) -> anyhow::Result<ProxyProfilesDoc> {
     integrations::load_proxy_profiles(path)
+}
+
+pub(crate) fn read_proxy_profiles(path: &str) -> anyhow::Result<ProxyProfilesDoc> {
+    integrations::read_document(path)
 }
 
 pub(crate) fn save_proxy_profiles(path: &str, doc: &ProxyProfilesDoc) -> anyhow::Result<()> {
@@ -260,7 +330,16 @@ pub(crate) fn bindings_secret() -> Option<String> {
     crypto::bindings_secret()
 }
 
-fn load_encrypted_or_plain(file_path: &Path) -> anyhow::Result<String> {
+/// S3/SEC-02 (07 audit, 12 批 A5): register the boot-resolved device
+/// identity as the default encryption-key source. Forwarded for the WebUI
+/// and worker entrypoints.
+pub(crate) fn set_default_device_id(device_id: &str) {
+    crypto::set_default_device_id(device_id)
+}
+
+
+
+pub(crate) fn load_encrypted_or_plain(file_path: &Path) -> anyhow::Result<String> {
     crypto::load_encrypted_or_plain(file_path)
 }
 
@@ -272,5 +351,29 @@ pub(crate) fn decrypt_from_bytes(data: &[u8]) -> anyhow::Result<String> {
     crypto::decrypt_from_bytes(data)
 }
 
-#[cfg(test)]
-mod tests;
+pub(crate) fn save_encrypted_file(path: &Path, plain: &str) -> anyhow::Result<()> {
+    save_encrypted_file_with_audit(path, plain, |detail| {
+        crate::logging::log_event_global("info", "configuration.encrypted_saved", detail);
+    })
+}
+
+pub(crate) fn save_encrypted_file_with_audit(
+    path: &Path,
+    plain: &str,
+    audit: impl FnOnce(serde_json::Value),
+) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let encoded = encrypt_for_save(plain)?;
+    atomic_file::install(path, &encoded)?;
+    // Receipt describes bytes this process installed, not a later read that
+    // another writer could replace. Never fingerprint plaintext or credentials.
+    audit(serde_json::json!({
+        "save_id": uuid::Uuid::new_v4().to_string(),
+        "writer_pid": std::process::id(),
+        "ciphertext_sha256": format!("{:x}", Sha256::digest(&encoded)),
+        "ciphertext_bytes": encoded.len(),
+        "storage_format": "WPTC-v1"
+    }));
+    Ok(())
+}

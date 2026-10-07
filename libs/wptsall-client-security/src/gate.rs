@@ -27,11 +27,17 @@ pub struct SecurityGate {
 impl SecurityGate {
     /// Phase 5: initialize all security subsystems at startup.
     pub fn bootstrap(config: SecurityConfig, current_binary: Option<&Path>) -> Result<Self> {
-        // Phase 7: anti-tamper
+        // Phase 7: anti-tamper — S8 (batch G): default enforce, with the
+        // `WPTSALL_ANTITAMPER_WARN_ONLY=1` env as the documented downgrade.
         antitamper::run_startup_checks(current_binary)?;
         if antitamper::injection_indicators_present() {
-            #[cfg(feature = "strict-antitamper")]
-            anyhow::bail!("injection indicators detected");
+            if antitamper::antitamper_warn_only() {
+                eprintln!(
+                    "[security] antitamper warning (warn-only mode): injection indicators detected"
+                );
+            } else {
+                anyhow::bail!("injection indicators detected");
+            }
         }
 
         // Phase 3: device identity

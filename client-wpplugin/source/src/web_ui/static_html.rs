@@ -6,6 +6,16 @@ use std::time::SystemTime;
 static CACHE: RwLock<Option<(Vec<u8>, SystemTime)>> = RwLock::new(None);
 
 const EMBEDDED_HTML: &str = include_str!("../../frontend/dist/index.html");
+const EMBEDDED_FAVICON_SVG: &[u8] = include_bytes!("../../frontend/public/favicon.svg");
+const EMBEDDED_FAVICON_ICO: &[u8] = include_bytes!("../../frontend/public/favicon.ico");
+
+pub(crate) fn web_ui_favicon_svg() -> &'static [u8] {
+    EMBEDDED_FAVICON_SVG
+}
+
+pub(crate) fn web_ui_favicon_ico() -> &'static [u8] {
+    EMBEDDED_FAVICON_ICO
+}
 
 fn candidate_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();

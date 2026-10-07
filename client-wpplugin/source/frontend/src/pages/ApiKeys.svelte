@@ -9,7 +9,11 @@
   import VendorKeysTab from '../lib/api-keys-page/VendorKeysTab.svelte';
 
   type Tab = 'vendors' | 'integration_pack' | 'wp_providers' | 'cloud_api_types' | 'keys' | 'oauth';
+  let { defaultTab = 'vendors' }: { defaultTab?: Tab } = $props();
   let activeTab = $state<Tab>('vendors');
+  $effect(() => {
+    if (defaultTab) activeTab = defaultTab;
+  });
 
   // P0-LF-04: the default page keeps the local signed provider catalog,
   // integration pack, vendor keys and OAuth configs. The official website

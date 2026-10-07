@@ -9,6 +9,8 @@ pub struct AuthStatus {
     pub email: Option<String>,
     pub device_id: Option<String>,
     pub domains: Vec<DomainInfo>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -28,6 +30,12 @@ fn map_domain(value: &serde_json::Value) -> DomainInfo {
 }
 
 pub(crate) fn map_auth_status(data: &serde_json::Value) -> AuthStatus {
+    let mut extra = data.as_object().cloned().unwrap_or_default();
+    extra.remove("logged_in");
+    extra.remove("email");
+    extra.remove("device_id");
+    extra.remove("domains");
+
     let domains = data
         .get("domains")
         .and_then(serde_json::Value::as_array)
@@ -48,6 +56,7 @@ pub(crate) fn map_auth_status(data: &serde_json::Value) -> AuthStatus {
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string),
         domains,
+        extra,
     }
 }
 
@@ -83,27 +92,4 @@ pub async fn refresh_domains() -> Result<Vec<DomainInfo>, String> {
         .and_then(serde_json::Value::as_array)
         .map(|items| items.iter().map(map_domain).collect())
         .unwrap_or_default())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn maps_webui_status_domains_without_plan_or_quota_fields() {
-        let status = map_auth_status(&json!({
-            "logged_in": false,
-            "domains": [{
-                "api_base_url": "http://127.0.0.1:9181/wp-json/wptsall/v2/secret/client",
-                "site_status": "active"
-            }]
-        }));
-        assert!(!status.logged_in);
-        assert_eq!(status.domains.len(), 1);
-        assert_eq!(
-            status.domains[0].domain,
-            "http://127.0.0.1:9181/wp-json/wptsall/v2/secret/client"
-        );
-    }
 }

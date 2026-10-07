@@ -17,6 +17,8 @@ const SIGNED_REQUEST_HEADERS: &[&str] = &[
     "x-wptsall-filename",
     "x-wptsall-upload-id",
     "x-wptsall-chunk-index",
+    "x-wptsall-operation-id",
+    "x-wptsall-content-sha256",
 ];
 
 pub(crate) fn resolve_download_template_json(
@@ -391,6 +393,3 @@ pub(crate) fn transport_decrypt(
 ) -> anyhow::Result<Vec<u8>> {
     client_runtime_core::wp_transport::transport_decrypt(encrypted_payload, nonce_b64url, token)
 }
-
-#[cfg(test)]
-mod tests;

@@ -15,7 +15,10 @@ pub(super) fn parse_query_string(query: &str) -> HashMap<String, String> {
     params
 }
 
-fn urldecode(s: &str) -> String {
+/// Percent-decode a URL path or query component (`%XX` and `+`).
+/// Used for query values and for path segments that carry encoded
+/// payloads (e.g. the domain in `/api/sync-pairs/credentials/:domain`).
+pub(super) fn urldecode(s: &str) -> String {
     let mut out = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0;

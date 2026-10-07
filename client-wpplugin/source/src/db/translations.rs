@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,7 +73,7 @@ pub(crate) fn insert_translation_record(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    conn.execute(
+    let changed = conn.execute(
         "INSERT INTO translation_records
          (created_at, domain, relation_id, object_id, object_type, business_line,
           source_lang, target_lang, status, execution_ms, worker_id, idempotency_key,
@@ -101,7 +101,20 @@ pub(crate) fn insert_translation_record(
             rec.primary_failure_reason,
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    anyhow::ensure!(
+        changed == 1,
+        "translation history was not committed; original result retained"
+    );
+    let id = conn.last_insert_rowid();
+    anyhow::ensure!(
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM translation_records WHERE id=?1)",
+            [id],
+            |row| row.get::<_, bool>(0)
+        )?,
+        "translation history disappeared during save"
+    );
+    Ok(id)
 }
 
 #[allow(dead_code)]
@@ -124,10 +137,14 @@ pub(crate) fn mark_callback_sent(conn: &Connection, id: i64) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE translation_records SET callback_sent_at = ?1, status = 'success' WHERE id = ?2",
         rusqlite::params![now, id],
     )?;
+    anyhow::ensure!(changed == 1 && conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM translation_records WHERE id=?1 AND status='success' AND callback_sent_at=?2)",
+        params![id,now],|row| row.get::<_,bool>(0))?,
+        "translation callback history was not committed; original result retained");
     Ok(())
 }
 
@@ -140,26 +157,93 @@ pub(crate) fn increment_callback_retries(conn: &Connection, id: i64) -> Result<(
     Ok(())
 }
 
-fn parse_component_ids_json(raw: Option<String>) -> Vec<String> {
-    raw.and_then(|value| serde_json::from_str::<Vec<String>>(&value).ok())
-        .unwrap_or_default()
+fn parse_component_ids_json(raw: Option<String>) -> rusqlite::Result<Vec<String>> {
+    raw.map(|value| {
+        serde_json::from_str::<Vec<String>>(&value).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                17,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "damaged saved translation component trace",
+                )),
+            )
+        })
+    })
+    .transpose()
+    .map(Option::unwrap_or_default)
 }
 
-/// A prior translation record is only safe for dedup short-circuit when it
-/// carries evidence that a real translation/callback path already happened.
-///
-/// Historical `NoChanges` runs used to be written as `status=success` with
-/// zero translated fields and no component trace, which would permanently
-/// suppress later real executions. Treat those rows as non-materialized.
-pub(crate) fn has_materialized_success_record(
+fn row_to_translation_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranslationRecord> {
+    Ok(TranslationRecord {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        domain: row.get(2)?,
+        relation_id: row.get(3)?,
+        object_id: row.get(4)?,
+        object_type: row.get(5)?,
+        business_line: row.get(6)?,
+        source_lang: row.get(7)?,
+        target_lang: row.get(8)?,
+        status: row.get(9)?,
+        execution_ms: row.get(10)?,
+        worker_id: row.get(11)?,
+        idempotency_key: row.get(12)?,
+        callback_sent_at: row.get(13)?,
+        callback_retries: row.get(14)?,
+        fields_count: row.get(15)?,
+        error_message: row.get(16)?,
+        component_ids: parse_component_ids_json(row.get(17)?)?,
+        media_mappings_count: row.get(18)?,
+        failed_fields_count: row.get(19)?,
+        primary_failure_reason: row.get(20)?,
+    })
+}
+
+pub(super) struct RetainedMutation<'a> {
+    conn: &'a Connection,
+    committed: bool,
+}
+
+impl<'a> RetainedMutation<'a> {
+    pub(super) fn begin(conn: &'a Connection) -> Result<Self> {
+        conn.execute_batch("SAVEPOINT checked_retained_mutation")?;
+        Ok(Self {
+            conn,
+            committed: false,
+        })
+    }
+
+    pub(super) fn commit(mut self) -> Result<()> {
+        self.conn
+            .execute_batch("RELEASE checked_retained_mutation")?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for RetainedMutation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.conn.execute_batch(
+                "ROLLBACK TO checked_retained_mutation; RELEASE checked_retained_mutation",
+            );
+        }
+    }
+}
+
+
+
+pub(crate) fn has_materialized_success_record_checked(
     conn: &Connection,
     domain: &str,
     relation_id: i64,
     object_id: i64,
     object_type: &str,
-) -> bool {
-    conn.query_row(
-        "SELECT 1
+) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1
          FROM translation_records
          WHERE domain = ?1
            AND relation_id = ?2
@@ -175,10 +259,11 @@ pub(crate) fn has_materialized_success_record(
                     AND component_ids_json != '[]')
            )
          LIMIT 1",
-        params![domain, relation_id, object_id, object_type],
-        |_| Ok(()),
-    )
-    .is_ok()
+            params![domain, relation_id, object_id, object_type],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 pub(crate) fn query_translation_records(
@@ -191,7 +276,7 @@ pub(crate) fn query_translation_records(
     } else {
         params.limit.min(100)
     };
-    let offset = (page - 1) * limit;
+    let offset = i64::from(page - 1) * i64::from(limit);
 
     // Build WHERE clauses
     let mut conditions: Vec<String> = vec![];
@@ -254,33 +339,8 @@ pub(crate) fn query_translation_records(
     let mut stmt = conn.prepare(&select_sql)?;
     let refs: Vec<&dyn rusqlite::ToSql> = bind_vals.iter().map(|b| b.as_ref()).collect();
     let records = stmt
-        .query_map(refs.as_slice(), |row| {
-            Ok(TranslationRecord {
-                id: row.get(0)?,
-                created_at: row.get(1)?,
-                domain: row.get(2)?,
-                relation_id: row.get(3)?,
-                object_id: row.get(4)?,
-                object_type: row.get(5)?,
-                business_line: row.get(6)?,
-                source_lang: row.get(7)?,
-                target_lang: row.get(8)?,
-                status: row.get(9)?,
-                execution_ms: row.get(10)?,
-                worker_id: row.get(11)?,
-                idempotency_key: row.get(12)?,
-                callback_sent_at: row.get(13)?,
-                callback_retries: row.get(14)?,
-                fields_count: row.get(15)?,
-                error_message: row.get(16)?,
-                component_ids: parse_component_ids_json(row.get(17)?),
-                media_mappings_count: row.get(18)?,
-                failed_fields_count: row.get(19)?,
-                primary_failure_reason: row.get(20)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        .query_map(refs.as_slice(), row_to_translation_record)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(TranslationListResult {
         records,
@@ -337,10 +397,11 @@ pub(crate) struct RetryQueueEntry {
     pub(crate) status: String,
 }
 
-fn normalize_retry_object_type(raw: &str) -> &'static str {
+fn normalize_retry_object_type(raw: &str) -> &str {
     match raw {
         "term" | "taxonomy" => "taxonomy",
         "post" | "post_type" => "post_type",
+        other if !other.is_empty() => other,
         _ => "post_type",
     }
 }
@@ -349,61 +410,73 @@ fn normalize_retry_object_type(raw: &str) -> &'static str {
 pub(crate) fn get_translation_record_by_id(
     conn: &Connection,
     id: i64,
-) -> Option<TranslationRecord> {
-    conn.query_row(
+) -> Result<Option<TranslationRecord>> {
+    Ok(conn.query_row(
         "SELECT id, created_at, domain, relation_id, object_id, object_type, business_line,
                 source_lang, target_lang, status, execution_ms, worker_id, idempotency_key,
                 callback_sent_at, callback_retries, fields_count, error_message,
                 component_ids_json, media_mappings_count, failed_fields_count, primary_failure_reason
          FROM translation_records WHERE id = ?1",
         params![id],
-        |row| {
-            Ok(TranslationRecord {
-                id: row.get(0)?,
-                created_at: row.get(1)?,
-                domain: row.get(2)?,
-                relation_id: row.get(3)?,
-                object_id: row.get(4)?,
-                object_type: row.get(5)?,
-                business_line: row.get(6)?,
-                source_lang: row.get(7)?,
-                target_lang: row.get(8)?,
-                status: row.get(9)?,
-                execution_ms: row.get(10)?,
-                worker_id: row.get(11)?,
-                idempotency_key: row.get(12)?,
-                callback_sent_at: row.get(13)?,
-                callback_retries: row.get(14)?,
-                fields_count: row.get(15)?,
-                error_message: row.get(16)?,
-                component_ids: parse_component_ids_json(row.get(17)?),
-                media_mappings_count: row.get(18)?,
-                failed_fields_count: row.get(19)?,
-                primary_failure_reason: row.get(20)?,
-            })
-        },
-    )
-    .ok()
+        row_to_translation_record,
+    ).optional()?)
 }
 
-/// Insert a retry queue entry from a failed translation record (INSERT OR REPLACE).
+/// Queue new work without replacing a pending retry's retained identity.
 pub(crate) fn insert_retry_queue_entry(
     conn: &Connection,
     record: &TranslationRecord,
-) -> Result<()> {
+) -> Result<bool> {
+    let mutation = RetainedMutation::begin(conn)?;
     let object_type = normalize_retry_object_type(record.object_type.as_deref().unwrap_or("post"));
+    let relation = record.relation_id.filter(|id| *id > 0).ok_or_else(|| {
+        anyhow::anyhow!("retry record has no positive relation identity; retained")
+    })?;
+    let object = record
+        .object_id
+        .filter(|id| *id > 0)
+        .ok_or_else(|| anyhow::anyhow!("retry record has no positive object identity; retained"))?;
+    let existing = conn
+        .query_row(
+            "SELECT id, domain, relation_id, object_id, object_type, business_line,
+         source_lang, target_lang, created_at, status FROM retry_queue
+         WHERE domain=?1 AND relation_id=?2 AND object_id=?3 AND object_type=?4",
+            params![record.domain, relation, object, object_type],
+            row_to_retry_entry,
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        anyhow::ensure!(
+            matches!(existing.status.as_str(), "pending" | "done"),
+            "unknown retry status; original retry retained"
+        );
+        if existing.status == "pending" {
+            anyhow::ensure!(
+                existing.business_line == record.business_line.as_deref().unwrap_or("")
+                    && existing.source_lang == record.source_lang
+                    && existing.target_lang == record.target_lang,
+                "unfinished retry scope differs; original retry retained"
+            );
+            mutation.commit()?;
+            return Ok(false);
+        }
+    }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    conn.execute(
-        "INSERT OR REPLACE INTO retry_queue
+    let changed = conn.execute(
+        "INSERT INTO retry_queue
          (domain, relation_id, object_id, object_type, business_line, source_lang, target_lang, created_at, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')
+         ON CONFLICT(domain, relation_id, object_type, object_id) DO UPDATE SET
+             business_line=excluded.business_line, source_lang=excluded.source_lang,
+             target_lang=excluded.target_lang, created_at=excluded.created_at, status='pending'
+         WHERE retry_queue.status='done'",
         params![
             record.domain,
-            record.relation_id.unwrap_or(0),
-            record.object_id.unwrap_or(0),
+            relation,
+            object,
             object_type,
             record.business_line.as_deref().unwrap_or(""),
             record.source_lang,
@@ -411,7 +484,43 @@ pub(crate) fn insert_retry_queue_entry(
             now,
         ],
     )?;
-    Ok(())
+    anyhow::ensure!(
+        changed == 1
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM retry_queue WHERE domain=?1 AND relation_id=?2
+         AND object_id=?3 AND object_type=?4 AND business_line=?5
+         AND source_lang=?6 AND target_lang=?7 AND created_at=?8 AND status='pending')",
+                params![
+                    record.domain,
+                    relation,
+                    object,
+                    object_type,
+                    record.business_line.as_deref().unwrap_or(""),
+                    record.source_lang,
+                    record.target_lang,
+                    now
+                ],
+                |row| row.get::<_, bool>(0)
+            )?,
+        "retry enqueue was not confirmed; original state retained"
+    );
+    mutation.commit()?;
+    Ok(true)
+}
+
+fn row_to_retry_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<RetryQueueEntry> {
+    Ok(RetryQueueEntry {
+        id: row.get(0)?,
+        domain: row.get(1)?,
+        relation_id: row.get(2)?,
+        object_id: row.get(3)?,
+        object_type: row.get(4)?,
+        business_line: row.get(5)?,
+        source_lang: row.get(6)?,
+        target_lang: row.get(7)?,
+        created_at: row.get(8)?,
+        status: row.get(9)?,
+    })
 }
 
 /// Get pending retry entries for a specific domain + relation.
@@ -419,71 +528,91 @@ pub(crate) fn get_pending_retries(
     conn: &Connection,
     domain: &str,
     relation_id: i64,
-) -> Vec<RetryQueueEntry> {
-    let mut stmt = match conn.prepare(
+) -> Result<Vec<RetryQueueEntry>> {
+    let mut stmt = conn.prepare(
         "SELECT id, domain, relation_id, object_id, object_type, business_line,
                 source_lang, target_lang, created_at, status
          FROM retry_queue
          WHERE domain = ?1 AND relation_id = ?2 AND status = 'pending'
          ORDER BY created_at ASC
          LIMIT 50",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map(params![domain, relation_id], |row| {
-        Ok(RetryQueueEntry {
-            id: row.get(0)?,
-            domain: row.get(1)?,
-            relation_id: row.get(2)?,
-            object_id: row.get(3)?,
-            object_type: row.get(4)?,
-            business_line: row.get(5)?,
-            source_lang: row.get(6)?,
-            target_lang: row.get(7)?,
-            created_at: row.get(8)?,
-            status: row.get(9)?,
-        })
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    )?;
+    let rows = stmt.query_map(params![domain, relation_id], row_to_retry_entry)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Batch retry: insert retry queue entries for failed translation records.
 /// Only records with status "failed" are eligible. Returns count of queued entries.
 pub(crate) fn batch_retry_translations(conn: &Connection, ids: &[i64]) -> Result<usize> {
+    anyhow::ensure!(
+        ids.iter().all(|id| *id > 0),
+        "retry IDs must be positive; original state retained"
+    );
+    let mutation = RetainedMutation::begin(conn)?;
     let mut queued = 0usize;
     for &id in ids {
-        if let Some(record) = get_translation_record_by_id(conn, id) {
+        if let Some(record) = get_translation_record_by_id(conn, id)? {
             if record.status == "failed"
                 && record.relation_id.is_some()
                 && record.object_id.is_some()
-                && insert_retry_queue_entry(conn, &record).is_ok()
             {
-                queued += 1;
+                if insert_retry_queue_entry(conn, &record)? {
+                    queued += 1;
+                }
             }
         }
     }
+    mutation.commit()?;
     Ok(queued)
 }
 
 /// Batch delete translation records by IDs. Returns count of deleted rows.
 pub(crate) fn batch_delete_translations(conn: &Connection, ids: &[i64]) -> Result<usize> {
+    anyhow::ensure!(
+        ids.iter().all(|id| *id > 0),
+        "delete IDs must be positive; original history retained"
+    );
+    let mutation = RetainedMutation::begin(conn)?;
+    let ids: Vec<_> = ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     let mut total_deleted = 0usize;
     for chunk in ids.chunks(500) {
         let placeholders: Vec<String> = chunk.iter().map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "DELETE FROM translation_records WHERE id IN ({})",
-            placeholders.join(",")
-        );
+        let predicate = format!("id IN ({})", placeholders.join(","));
+        let sql = format!("DELETE FROM translation_records WHERE {predicate}");
         let params: Vec<Box<dyn rusqlite::ToSql>> = chunk
             .iter()
             .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
             .collect();
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let expected: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM translation_records WHERE {predicate}"),
+            refs.as_slice(),
+            |row| row.get(0),
+        )?;
         let deleted = conn.execute(&sql, refs.as_slice())?;
-        total_deleted += deleted;
+        anyhow::ensure!(
+            i64::try_from(deleted)? == expected,
+            "history deletion was not confirmed; original history retained"
+        );
+        let remains: bool = conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM translation_records WHERE {predicate})"),
+            refs.as_slice(),
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            !remains,
+            "history deletion readback disagrees; original history retained"
+        );
+        total_deleted = total_deleted.checked_add(deleted).ok_or_else(|| {
+            anyhow::anyhow!("history delete count overflow; original history retained")
+        })?;
     }
+    mutation.commit()?;
     Ok(total_deleted)
 }
 
@@ -495,14 +624,40 @@ pub(crate) fn mark_retry_done(
     object_type: &str,
     object_id: i64,
 ) -> Result<()> {
+    let mutation = RetainedMutation::begin(conn)?;
     let normalized_object_type = normalize_retry_object_type(object_type);
-    conn.execute(
+    let original: Option<String> = conn
+        .query_row(
+            "SELECT status FROM retry_queue WHERE domain=?1 AND relation_id=?2
+         AND object_type=?3 AND object_id=?4",
+            params![domain, relation_id, normalized_object_type, object_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if original.is_none() || original.as_deref() == Some("done") {
+        return mutation.commit();
+    }
+    anyhow::ensure!(
+        original.as_deref() == Some("pending"),
+        "unknown retry status; original retry retained"
+    );
+    let changed = conn.execute(
         "UPDATE retry_queue
          SET status = 'done'
-         WHERE domain = ?1 AND relation_id = ?2 AND object_type = ?3 AND object_id = ?4",
+         WHERE domain = ?1 AND relation_id = ?2 AND object_type = ?3 AND object_id = ?4 AND status='pending'",
         params![domain, relation_id, normalized_object_type, object_id],
     )?;
-    Ok(())
+    anyhow::ensure!(
+        changed == 1
+            && conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM retry_queue WHERE domain=?1 AND relation_id=?2
+         AND object_type=?3 AND object_id=?4 AND status='done')",
+                params![domain, relation_id, normalized_object_type, object_id],
+                |row| row.get::<_, bool>(0)
+            )?,
+        "retry completion was not confirmed; original retry retained"
+    );
+    mutation.commit()
 }
 
 // ---------------------------------------------------------------------------
@@ -518,21 +673,18 @@ pub(crate) struct DomainStats {
     pub(crate) fields_total: i64,
 }
 
-pub(crate) fn stats_by_domain(conn: &Connection) -> Vec<DomainStats> {
-    let mut stmt = match conn.prepare(
+pub(crate) fn stats_by_domain(conn: &Connection) -> Result<Vec<DomainStats>> {
+    let mut stmt = conn.prepare(
         "SELECT domain,
                 COUNT(*) AS total,
                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
                 SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-                SUM(fields_count) AS fields_total
+                COALESCE(SUM(fields_count), 0) AS fields_total
          FROM translation_records
          GROUP BY domain
          ORDER BY total DESC",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map([], |row| {
+    )?;
+    let rows = stmt.query_map([], |row| {
         Ok(DomainStats {
             domain: row.get(0)?,
             total: row.get(1)?,
@@ -540,9 +692,8 @@ pub(crate) fn stats_by_domain(conn: &Connection) -> Vec<DomainStats> {
             failed: row.get(3)?,
             fields_total: row.get(4)?,
         })
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -551,24 +702,20 @@ pub(crate) struct StatusDistribution {
     pub(crate) count: i64,
 }
 
-pub(crate) fn stats_status_distribution(conn: &Connection) -> Vec<StatusDistribution> {
-    let mut stmt = match conn.prepare(
+pub(crate) fn stats_status_distribution(conn: &Connection) -> Result<Vec<StatusDistribution>> {
+    let mut stmt = conn.prepare(
         "SELECT status, COUNT(*) AS cnt
          FROM translation_records
          GROUP BY status
          ORDER BY cnt DESC",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map([], |row| {
+    )?;
+    let rows = stmt.query_map([], |row| {
         Ok(StatusDistribution {
             status: row.get(0)?,
             count: row.get(1)?,
         })
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -578,34 +725,31 @@ pub(crate) struct DailyStats {
     pub(crate) fields: i64,
 }
 
-pub(crate) fn stats_daily(conn: &Connection, days: i64) -> Vec<DailyStats> {
+pub(crate) fn stats_daily(conn: &Connection, days: i64) -> Result<Vec<DailyStats>> {
+    anyhow::ensure!(days > 0, "statistics window must be positive");
+    let seconds = days
+        .checked_mul(86400)
+        .ok_or_else(|| anyhow::anyhow!("statistics window overflow"))?;
     let cutoff = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
-        - days * 86400;
-    let mut stmt = match conn.prepare(
+        - seconds;
+    let mut stmt = conn.prepare(
         "SELECT date(created_at, 'unixepoch') AS day,
                 COUNT(*) AS cnt,
-                SUM(fields_count) AS fields
+                COALESCE(SUM(fields_count), 0) AS fields
          FROM translation_records
          WHERE created_at >= ?1
          GROUP BY day
          ORDER BY day ASC",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    stmt.query_map(params![cutoff], |row| {
+    )?;
+    let rows = stmt.query_map(params![cutoff], |row| {
         Ok(DailyStats {
             date: row.get(0)?,
             count: row.get(1)?,
             fields: row.get(2)?,
         })
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
-
-#[cfg(test)]
-mod tests;

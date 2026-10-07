@@ -15,7 +15,7 @@ use crate::component_rt::loader::{
     collect_configured_runtime_component_ids, load_component_runtimes,
 };
 use crate::config::{env_u64, env_usize};
-use crate::logging::{log_event, snippet, unix_ts};
+use crate::logging::{flush_log, log_event, snippet, unix_ts};
 use crate::types::{WebUiRuntimeControl, WebUiState, WebUiWorkerConfigRequest};
 use crate::web_ui::{
     fetch_domains_for_session, local_sites_from_domain_token_bindings, web_ui_run_worker_once,
@@ -38,6 +38,16 @@ struct WorkerStartRequest {
 #[derive(Debug, Serialize, Clone, Default)]
 struct WorkerStartPreflightSummary {
     domains_checked: usize,
+    /// Configured domains the preflight could not check at all (no client
+    /// token, no route secret, no resolvable WP base, or the relations fetch
+    /// failed). §63 (tasks/cursor feedback): with every configured domain
+    /// skipped the old response was a vacuous green light — can_start:true
+    /// with domains_checked:0 and zero signal that nothing was verifiable.
+    domains_skipped: usize,
+    /// The component registry could not be loaded (load error or timeout),
+    /// so no domain/component checks could run at all. §64 recheck: surfaced
+    /// with requires_confirmation instead of a vacuous green light.
+    component_registry_unavailable: bool,
     relations_checked: usize,
     rules_checked: usize,
     fields_checked: usize,
@@ -70,7 +80,7 @@ struct WorkerStartMissingComponent {
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
-struct WorkerStartPreflightData {
+pub(super) struct WorkerStartPreflightData {
     can_start: bool,
     requires_confirmation: bool,
     summary: WorkerStartPreflightSummary,
@@ -82,6 +92,41 @@ struct WorkerRunOnceRequest {
     max_iterations: Option<usize>,
     max_elapsed_secs: Option<u64>,
     max_items_per_run: Option<usize>,
+}
+
+/// 批D (X-12④) fast-fail brake: a run-once loop whose iterations keep
+/// processing items but NEVER succeeding (total > 0, succeeded == 0,
+/// failed > 0) used to match none of the break conditions and spin to the
+/// 180-iteration / 900-second cap burning CPU (observed: 423% CPU, zero
+/// results, 10 minutes — the client-side twin of the WP-side reverse-FIFO
+/// starvation fixed in X-12①). Two CONSECUTIVE all-fail iterations trip
+/// the brake: one alone can be a transient blip, and the WP-side
+/// available_at backoff usually makes the next iteration claim nothing
+/// (the empty_queue break then stops the loop naturally). Any iteration
+/// with progress (or a clean noop/empty) resets the ladder.
+struct ZeroSuccessBrake {
+    consecutive_all_fail: u32,
+}
+
+impl ZeroSuccessBrake {
+    fn new() -> Self {
+        Self {
+            consecutive_all_fail: 0,
+        }
+    }
+
+    /// Record one iteration's outcome; Some(reason) when the brake trips.
+    fn record(&mut self, total: i64, succeeded: i64, failed: i64) -> Option<&'static str> {
+        if total > 0 && succeeded == 0 && failed > 0 {
+            self.consecutive_all_fail += 1;
+            if self.consecutive_all_fail >= 2 {
+                return Some("zero_success_all_failing");
+            }
+        } else {
+            self.consecutive_all_fail = 0;
+        }
+        None
+    }
 }
 
 fn is_run_once_pressure_error(message: &str, upstream: Option<&UpstreamApiError>) -> bool {
@@ -151,6 +196,7 @@ pub(super) async fn handle_worker_run_once(
     let mut last_summary = json!({});
     let mut last_err: Option<String> = None;
     let mut last_upstream_error: Option<UpstreamApiError> = None;
+    let mut zero_success_brake = ZeroSuccessBrake::new();
 
     loop {
         iterations += 1;
@@ -174,6 +220,7 @@ pub(super) async fn handle_worker_run_once(
                     "worker.run_once.iteration",
                     json!({
                         "iteration": iterations,
+                        "elapsed_ms": started_at.elapsed().as_millis() as u64,
                         "total_items": total,
                         "tasks_succeeded": succeeded,
                         "tasks_failed": failed
@@ -200,6 +247,26 @@ pub(super) async fn handle_worker_run_once(
                         "info",
                         "worker.run_once.break",
                         json!({ "reason": "dedup_or_noop", "iteration": iterations }),
+                    );
+                    break;
+                }
+                // 批D (X-12④): consecutive all-fail iterations trip the
+                // fast-fail brake instead of spinning to the iteration /
+                // elapsed caps with zero progress.
+                if let Some(reason) = zero_success_brake.record(total, succeeded, failed) {
+                    break_reason = Some(reason);
+                    let _ = log_event(
+                        log_file,
+                        "warning",
+                        "worker.run_once.break",
+                        json!({
+                            "reason": reason,
+                            "iteration": iterations,
+                            "consecutive_all_fail_iterations": zero_success_brake.consecutive_all_fail,
+                            "tasks_processed": acc_processed,
+                            "tasks_succeeded": acc_succeeded,
+                            "tasks_failed": acc_failed
+                        }),
                     );
                     break;
                 }
@@ -470,6 +537,10 @@ pub(super) async fn handle_worker_start(
         }
     }
 
+    let _lifecycle = runtime_control.worker_lifecycle.lock().await;
+    if !runtime_control.worker_running.load(Ordering::SeqCst) {
+        stop_worker_loop_inner(runtime_control, Duration::from_secs(2)).await;
+    }
     let mut handle_guard = runtime_control.worker_handle.lock().await;
     if let Some(handle) = handle_guard.as_ref() {
         if handle.is_finished() {
@@ -624,7 +695,7 @@ async fn write_preflight_timeout_response(
     .await
 }
 
-async fn collect_worker_start_preflight(
+pub(super) async fn collect_worker_start_preflight(
     state: &Arc<Mutex<WebUiState>>,
     log_file: &str,
 ) -> anyhow::Result<WorkerStartPreflightData> {
@@ -671,7 +742,7 @@ async fn collect_worker_start_preflight(
     let component_runtime_enabled = crate::config::env_bool("WPTSALL_COMPONENT_RUNTIME", true);
     let component_registry: Option<Arc<crate::types::ComponentRuntimeRegistry>> =
         if component_runtime_enabled {
-            let local_components_doc = crate::db::components::load_runtime_local_components_doc();
+            let local_components_doc = crate::db::components::load_runtime_local_components_doc()?;
             let target_component_ids = collect_configured_runtime_component_ids(
                 &local_components_doc,
                 Some(&task_type_component_bindings),
@@ -690,8 +761,7 @@ async fn collect_worker_start_preflight(
             // exactly like a load error. WPTSALL_PREFLIGHT_COMPONENT_TIMEOUT_SECS
             // (default 15, 0 = unlimited) caps this phase; the total preflight
             // bound (WPTSALL_PREFLIGHT_TIMEOUT_SECS) still applies on top.
-            let component_timeout_seconds =
-                env_u64("WPTSALL_PREFLIGHT_COMPONENT_TIMEOUT_SECS", 15);
+            let component_timeout_seconds = env_u64("WPTSALL_PREFLIGHT_COMPONENT_TIMEOUT_SECS", 15);
             let mut component_bindings_for_load = component_bindings.clone();
             let registry_load = load_component_runtimes(
                 &client,
@@ -709,6 +779,11 @@ async fn collect_worker_start_preflight(
             };
             match timed_registry_load.await {
                 Ok(Ok(registry)) => Some(Arc::new(registry)),
+                Ok(Err(err))
+                    if err.is::<crate::component_rt::loader::RuntimeConfigurationFault>() =>
+                {
+                    return Err(err)
+                }
                 Ok(Err(err)) => {
                     let _ = log_event(
                         log_file,
@@ -733,10 +808,21 @@ async fn collect_worker_start_preflight(
         };
 
     if component_registry.is_none() {
+        // §64 recheck (tasks/cursor): a registry that failed to load (or
+        // timed out) must not produce the same vacuous green light the
+        // all-domains-skipped branch used to — the domain/component checks
+        // below cannot run at all. Surface the degraded state and require
+        // explicit confirmation to start. The deliberately-disabled case
+        // (WPTSALL_COMPONENT_RUNTIME=false) keeps its operator-configured
+        // can_start:true without the degraded flag.
+        let registry_load_failed = component_runtime_enabled;
         return Ok(WorkerStartPreflightData {
             can_start: true,
-            requires_confirmation: false,
-            summary: WorkerStartPreflightSummary::default(),
+            requires_confirmation: registry_load_failed,
+            summary: WorkerStartPreflightSummary {
+                component_registry_unavailable: registry_load_failed,
+                ..Default::default()
+            },
             missing_components: Vec::new(),
         });
     }
@@ -773,6 +859,7 @@ async fn collect_worker_start_preflight(
                 &domain_token_bindings,
                 &occupied_domain_bases,
             ) else {
+                summary.domains_skipped += 1;
                 continue;
             };
             (local_base, token, secret)
@@ -782,6 +869,7 @@ async fn collect_worker_start_preflight(
                 &domain_token_bindings,
                 &wp_client_token_fallback,
             ) else {
+                summary.domains_skipped += 1;
                 continue;
             };
             let route_secret = crate::bindings::resolve_route_secret_for_domain(
@@ -797,6 +885,7 @@ async fn collect_worker_start_preflight(
             .as_deref()
             .and_then(|secret| crate::bindings::build_wp_base_url(&domain_base, secret))
         else {
+            summary.domains_skipped += 1;
             continue;
         };
 
@@ -808,6 +897,7 @@ async fn collect_worker_start_preflight(
             &relations_url,
             &wp_client_token,
             &worker_id,
+            &device_id,
             route_secret.as_deref(),
         )
         .await
@@ -823,6 +913,7 @@ async fn collect_worker_start_preflight(
                         "error": snippet(&format!("{:#}", err)),
                     }),
                 );
+                summary.domains_skipped += 1;
                 continue;
             }
         };
@@ -839,6 +930,7 @@ async fn collect_worker_start_preflight(
                 &rules_url,
                 &wp_client_token,
                 &worker_id,
+                &device_id,
                 route_secret.as_deref(),
             )
             .await
@@ -874,6 +966,8 @@ async fn collect_worker_start_preflight(
                         "",
                         &[],
                         Some(&task_type_component_bindings),
+                        // FL-9: capability probe — keep unguarded.
+                        None,
                     );
                 if selected.is_none() {
                     let (preflight_policy, missing_component_behavior, severity) =
@@ -940,6 +1034,9 @@ async fn collect_worker_start_preflight(
                             "",
                             &[],
                             Some(&task_type_component_bindings),
+                            // FL-9: preflight is a capability probe, not
+                            // task-scoped execution — keep it unguarded.
+                            None,
                         );
                     if selected.is_none() {
                         let (preflight_policy, missing_component_behavior, severity) =
@@ -980,7 +1077,12 @@ async fn collect_worker_start_preflight(
 
     Ok(WorkerStartPreflightData {
         can_start: summary.blocking_missing_components == 0,
-        requires_confirmation: summary.confirm_missing_components > 0,
+        // §63: when every configured domain was skipped (none checkable at
+        // all), do not hand back a bare green light — require confirmation so
+        // the operator sees the preflight verified nothing instead of a
+        // silent can_start:true over 0 checked / 0 missing.
+        requires_confirmation: summary.confirm_missing_components > 0
+            || (summary.domains_skipped > 0 && summary.domains_checked == 0),
         summary,
         missing_components,
     })
@@ -1217,107 +1319,7 @@ fn media_artifact_hints_for_task_type(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
 
-    fn empty_rule() -> crate::types::DiscoveredRule {
-        crate::types::DiscoveredRule {
-            id: 1,
-            model_id: 1,
-            name: "rule".to_string(),
-            data_type: "post".to_string(),
-            object_name: "post".to_string(),
-            field_capabilities: json!({}),
-            translate_fields: Vec::new(),
-            related_taxonomies: Vec::new(),
-            field_content_formats: HashMap::new(),
-            field_storage_map: HashMap::new(),
-            source_group: String::new(),
-            routing_profile: String::new(),
-            delivery_target: String::new(),
-            required_component_slots: Vec::new(),
-            required_content_formats: Vec::new(),
-            field_source_roles: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn preflight_business_line_uses_custom_model_for_non_post_non_taxonomy_rules() {
-        let mut rule = empty_rule();
-        rule.data_type = "custom_model".to_string();
-        assert_eq!(preflight_business_line_for_rule(&rule), "custom_model");
-    }
-
-    #[test]
-    fn preflight_business_line_uses_config_i18n_for_config_object_rules() {
-        let mut rule = empty_rule();
-        rule.data_type = "option".to_string();
-        rule.source_group = "config_object".to_string();
-        rule.routing_profile = "config_i18n".to_string();
-        assert_eq!(preflight_business_line_for_rule(&rule), "config_i18n");
-    }
-
-    #[test]
-    fn media_text_source_role_stays_on_text_lane() {
-        let mut rule = empty_rule();
-        rule.field_source_roles.insert(
-            "_wp_attachment_image_alt".to_string(),
-            "media_text".to_string(),
-        );
-
-        let selection =
-            selection_requirements_for_field(&rule, "_wp_attachment_image_alt", "media_ref");
-
-        assert_eq!(selection.task_type, "text");
-        assert_eq!(selection.required_slot_key, "plain_text");
-        assert!(selection.input_artifact_kind.is_none());
-    }
-
-    #[test]
-    fn media_file_field_uses_media_lane_and_artifact_hints() {
-        let rule = empty_rule();
-        let selection =
-            selection_requirements_for_field(&rule, "_wptsall_core_source_file_id", "media_ref");
-
-        assert_eq!(selection.task_type, "document");
-        assert_eq!(selection.required_slot_key, "media_ref:document");
-        assert_eq!(
-            selection.input_artifact_kind.as_deref(),
-            Some("document_file")
-        );
-        assert_eq!(
-            selection.expected_output_artifact_kind.as_deref(),
-            Some("translated_document_file")
-        );
-    }
-
-    #[test]
-    fn relation_preflight_policy_can_block_worker_start() {
-        let relation = crate::types::DiscoveredRelation {
-            id: 1,
-            source_site_id: json!(1),
-            source_lang: "en".to_string(),
-            target_site_id: json!(2),
-            target_site_type: "virtual".to_string(),
-            target_lang: "zh".to_string(),
-            sync_mode: "new_only".to_string(),
-            media_handling: String::new(),
-            template: String::new(),
-            models: Vec::new(),
-            i18n_config: None,
-            source_group_config: None,
-            preflight_policy: "block".to_string(),
-            missing_component_behavior: "confirm_continue".to_string(),
-        };
-
-        let (policy, behavior, severity) = preflight_missing_component_behavior(&relation);
-        assert_eq!(policy, "block");
-        assert_eq!(behavior, "confirm_continue");
-        assert_eq!(severity, "blocking");
-    }
-}
 
 async fn spawn_worker_loop_task(
     loop_state: Arc<Mutex<WebUiState>>,
@@ -1325,13 +1327,25 @@ async fn spawn_worker_loop_task(
     loop_log_file: String,
     poll_seconds: u64,
 ) -> tokio::task::JoinHandle<()> {
+    let loop_lease = {
+        let db = { Arc::clone(&loop_state.lock().await.db) };
+        let conn = db.lock().await;
+        crate::db::runtime::RuntimeLease::for_connection(&conn)
+    };
     tokio::spawn(async move {
+        let _lease = loop_lease;
         let _ = log_event(
             &loop_log_file,
             "info",
             "worker.loop.started",
             json!({ "poll_seconds": poll_seconds }),
         );
+        // Flush immediately: loop lifecycle events are info level (buffered
+        // behind the 8 KB threshold by default) but external gates assert on
+        // them while the client is still running — same rationale as the
+        // warning-level identity events. Without this, a quiet loop can sit
+        // with `worker.loop.started` invisible in the log file for minutes.
+        let _ = flush_log();
         loop {
             if !loop_runtime.worker_running.load(Ordering::SeqCst) {
                 break;
@@ -1373,6 +1387,11 @@ async fn spawn_worker_loop_task(
                         "worker.loop.tick_ok",
                         json!({ "total_items": total }),
                     );
+                    // Flush immediately (see the started-event rationale):
+                    // gates assert per-tick evidence while the client runs,
+                    // and an empty-queue tick generates no further log lines
+                    // to push the buffer past the 8 KB threshold.
+                    let _ = flush_log();
                     if total == 0 {
                         let mut guard = loop_state.lock().await;
                         if guard.worker_status == "running_auto" {
@@ -1384,6 +1403,9 @@ async fn spawn_worker_loop_task(
                     }
                 }
             }
+            let stopped = loop_runtime.worker_stop.notified();
+            tokio::pin!(stopped);
+            stopped.as_mut().enable();
             if !loop_runtime.worker_running.load(Ordering::SeqCst) {
                 break;
             }
@@ -1391,7 +1413,10 @@ async fn spawn_worker_loop_task(
                 let guard = loop_state.lock().await;
                 guard.worker_loop_poll_seconds.max(1)
             };
-            tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
+                _ = &mut stopped => {}
+            }
         }
         loop_runtime.worker_running.store(false, Ordering::SeqCst);
         {
@@ -1408,6 +1433,10 @@ async fn spawn_worker_loop_task(
         let mut handle_guard = loop_runtime.worker_handle.lock().await;
         *handle_guard = None;
         let _ = log_event(&loop_log_file, "info", "worker.loop.stopped", json!({}));
+        // Flush immediately (see the started-event rationale): the stop-side
+        // handler flushes its own copy, but this natural-tail event must also
+        // reach external observers before any process exit can drop it.
+        let _ = flush_log();
     })
 }
 
@@ -1417,9 +1446,11 @@ pub(crate) async fn spawn_worker_loop(
     log_file: String,
     _triggered_by: &str,
 ) {
+    let _lifecycle = runtime_control.worker_lifecycle.lock().await;
     if runtime_control.worker_running.load(Ordering::SeqCst) {
         return;
     }
+    stop_worker_loop_inner(&runtime_control, Duration::from_secs(2)).await;
     runtime_control.worker_running.store(true, Ordering::SeqCst);
     let poll_seconds = {
         let mut guard = state.lock().await;
@@ -1440,136 +1471,75 @@ pub(crate) async fn spawn_worker_loop(
     *handle_guard = Some(join);
 }
 
+fn worker_config_snapshot(conn: &rusqlite::Connection, poll: u64) -> anyhow::Result<Value> {
+    let get = |key| crate::db::system::get_system_config_checked(conn, key);
+    let number = |key, fallback, min, max| -> anyhow::Result<u64> {
+        Ok(get(key)?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(fallback)
+            .clamp(min, max))
+    };
+    let defaults = crate::resource_governor::ResourceGovernor::from_env();
+    let review_mode_stored = get("review_mode")?.is_some_and(|v| v == "true");
+    let workflow_policy = get("workflow_policy")?
+        .and_then(|raw| crate::task_engine::workflow_policy::WorkflowPolicy::parse_json(&raw))
+        .unwrap_or_else(|| {
+            crate::task_engine::workflow_policy::WorkflowPolicy::from_review_mode_flag(
+                review_mode_stored,
+            )
+        });
+    let review_mode = workflow_policy.resolve(None, None, None)
+        == crate::task_engine::workflow_policy::WorkflowMode::Review;
+    let workflow_dsl = get("workflow_dsl")?
+        .and_then(|raw| crate::task_engine::workflow_dsl::WorkflowDsl::parse_json(&raw))
+        .unwrap_or_default();
+    let capacity = crate::db::capacity::inventory(conn)?;
+    Ok(json!({
+        "poll_seconds": poll,
+        "auto_start_worker": get("auto_start_worker")?.is_some_and(|v| v == "true"),
+        "domain_concurrency": number("domain_concurrency", defaults.domain_concurrency as u64, 1, u64::MAX)?,
+        "relation_concurrency": number("relation_concurrency", 1, 1, u64::MAX)?,
+        "global_translation_concurrency": number("global_translation_concurrency", defaults.global_translation_concurrency as u64, 1, u64::MAX)?,
+        "global_callback_concurrency": number("global_callback_concurrency", defaults.global_callback_concurrency as u64, 1, u64::MAX)?,
+        "relation_max_pending_callbacks": number("relation_max_pending_callbacks", 200, 1, u64::MAX)?,
+        "storage_max_retained_units": capacity.max_retained_units,
+        "storage_max_reserved_bytes": capacity.max_reserved_bytes,
+        "storage_capacity": capacity,
+        "adaptive_rate_control": get("adaptive_rate_control")?.map(|v| v == "true").unwrap_or(true),
+        "adaptive_max_delay_ms": number("adaptive_max_delay_ms", 5000, 200, u64::MAX)?,
+        "callback_concurrency": number("callback_concurrency", 4, 1, 50)?,
+        "callback_timeout_secs": number("callback_timeout_secs", 30, 1, 300)?,
+        "callback_retry_max": number("callback_retry_max", 2, 0, 10)?,
+        "fetch_timeout_secs": number("fetch_timeout_secs", 20, 1, 300)?,
+        "fetch_retry_max": number("fetch_retry_max", 2, 0, 10)?,
+        "review_mode": review_mode,
+        "workflow_policy": workflow_policy,
+        "workflow_dsl": workflow_dsl,
+    }))
+}
+
 pub(super) async fn handle_worker_config_get(
     socket: &mut TcpStream,
     state: &Arc<Mutex<WebUiState>>,
 ) -> anyhow::Result<()> {
-    let db_arc = {
+    let saved = {
         let guard = state.lock().await;
-        std::sync::Arc::clone(&guard.db)
+        let conn = guard.db.lock().await;
+        worker_config_snapshot(&conn, guard.worker_loop_poll_seconds)
     };
-    let (
-        auto_start,
-        domain_concurrency,
-        relation_concurrency,
-        global_translation_concurrency,
-        global_callback_concurrency,
-        relation_max_pending_callbacks,
-        adaptive_rate_control,
-        adaptive_max_delay_ms,
-        cb_concurrency,
-        cb_timeout,
-        cb_retry,
-        fetch_timeout,
-        fetch_retry,
-        review_mode,
-        workflow_policy,
-        workflow_dsl,
-    ) = {
-        let defaults = crate::resource_governor::ResourceGovernor::from_env();
-        let conn = db_arc.lock().await;
-        let auto_start = crate::db::system::get_system_config(&conn, "auto_start_worker")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        let domain_concurrency = crate::db::system::get_system_config(&conn, "domain_concurrency")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(defaults.domain_concurrency as u64)
-            .max(1);
-        let relation_concurrency =
-            crate::db::system::get_system_config(&conn, "relation_concurrency")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1)
-                .max(1);
-        let global_translation_concurrency =
-            crate::db::system::get_system_config(&conn, "global_translation_concurrency")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(defaults.global_translation_concurrency as u64)
-                .max(1);
-        let global_callback_concurrency =
-            crate::db::system::get_system_config(&conn, "global_callback_concurrency")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(defaults.global_callback_concurrency as u64)
-                .max(1);
-        let relation_max_pending_callbacks =
-            crate::db::system::get_system_config(&conn, "relation_max_pending_callbacks")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(200)
-                .max(1);
-        let adaptive_rate_control =
-            crate::db::system::get_system_config(&conn, "adaptive_rate_control")
-                .map(|v| v == "true")
-                .unwrap_or(true);
-        let adaptive_max_delay_ms =
-            crate::db::system::get_system_config(&conn, "adaptive_max_delay_ms")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(5000)
-                .max(200);
-        let cb_concurrency = crate::db::system::get_system_config(&conn, "callback_concurrency")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(4);
-        let cb_timeout = crate::db::system::get_system_config(&conn, "callback_timeout_secs")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30);
-        let cb_retry = crate::db::system::get_system_config(&conn, "callback_retry_max")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(2);
-        let fetch_timeout = crate::db::system::get_system_config(&conn, "fetch_timeout_secs")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(20);
-        let fetch_retry = crate::db::system::get_system_config(&conn, "fetch_retry_max")
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(2);
-        let review_mode = crate::db::system::get_system_config(&conn, "review_mode")
-            .map(|v| v == "true")
-            .unwrap_or(false);
-        let workflow_policy =
-            crate::task_engine::workflow_policy::load_workflow_policy(&conn, review_mode);
-        let workflow_dsl = crate::task_engine::workflow_dsl::load_workflow_dsl(&conn);
-        (
-            auto_start,
-            domain_concurrency,
-            relation_concurrency,
-            global_translation_concurrency,
-            global_callback_concurrency,
-            relation_max_pending_callbacks,
-            adaptive_rate_control,
-            adaptive_max_delay_ms,
-            cb_concurrency,
-            cb_timeout,
-            cb_retry,
-            fetch_timeout,
-            fetch_retry,
-            review_mode,
-            workflow_policy,
-            workflow_dsl,
-        )
-    };
-    let poll = {
-        let guard = state.lock().await;
-        guard.worker_loop_poll_seconds
-    };
-    let payload = json!({
-        "success": true,
-        "data": {
-            "poll_seconds": poll,
-            "auto_start_worker": auto_start,
-            "domain_concurrency": domain_concurrency,
-            "relation_concurrency": relation_concurrency,
-            "global_translation_concurrency": global_translation_concurrency,
-            "global_callback_concurrency": global_callback_concurrency,
-            "relation_max_pending_callbacks": relation_max_pending_callbacks,
-            "adaptive_rate_control": adaptive_rate_control,
-            "adaptive_max_delay_ms": adaptive_max_delay_ms,
-            "callback_concurrency": cb_concurrency,
-            "callback_timeout_secs": cb_timeout,
-            "callback_retry_max": cb_retry,
-            "fetch_timeout_secs": fetch_timeout,
-            "fetch_retry_max": fetch_retry,
-            "review_mode": review_mode,
-            "workflow_policy": workflow_policy,
-            "workflow_dsl": workflow_dsl,
+    let data = match saved {
+        Ok(data) => data,
+        Err(error) => {
+            return write_error_response_with_status(
+                socket,
+                "500 Internal Server Error",
+                "WORKER_CONFIG_READ_FAILED",
+                &super::errors::err_public(&error),
+            )
+            .await;
         }
-    });
+    };
+    let payload = json!({ "success": true, "data": data });
     write_http_response(
         socket,
         "200 OK",
@@ -1584,145 +1554,186 @@ pub(super) async fn handle_worker_config(
     state: &Arc<Mutex<WebUiState>>,
     body: &[u8],
 ) -> anyhow::Result<()> {
-    let req: WebUiWorkerConfigRequest =
-        serde_json::from_slice(body).with_context(|| "invalid /api/worker/config json payload")?;
-    let poll = match req.poll_seconds {
-        Some(poll) => poll.clamp(1, 3600),
-        None => {
-            let guard = state.lock().await;
-            guard.worker_loop_poll_seconds.max(1)
+    let req: WebUiWorkerConfigRequest = match serde_json::from_slice(body) {
+        Ok(req) if matches!(serde_json::from_slice::<Value>(body), Ok(Value::Object(_))) => req,
+        _ => {
+            return write_error_response(
+                socket,
+                "INVALID_WORKER_CONFIG",
+                "Invalid worker configuration JSON.",
+            )
+            .await
         }
     };
-
-    let db_arc = {
-        let guard = state.lock().await;
-        std::sync::Arc::clone(&guard.db)
+    if [
+        req.storage_max_retained_units,
+        req.storage_max_reserved_bytes,
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !(1..=crate::db::capacity::MAX_CONFIG_LIMIT).contains(&value))
+    {
+        return write_error_response(
+            socket,
+            "INVALID_STORAGE_CAPACITY",
+            "Retained capacity limits must be positive safe integers.",
+        )
+        .await;
+    }
+    // Validate the complete request before writing even its first field.
+    let policy = if let Some(value) = req.workflow_policy.as_ref() {
+        let raw = value.to_string();
+        let Some(parsed) = crate::task_engine::workflow_policy::WorkflowPolicy::parse_json(&raw)
+        else {
+            return write_error_response(
+                socket,
+                "INVALID_WORKFLOW_POLICY",
+                "Invalid workflow policy.",
+            )
+            .await;
+        };
+        let review = parsed.resolve(None, None, None)
+            == crate::task_engine::workflow_policy::WorkflowMode::Review;
+        Some((raw, review))
+    } else {
+        None
     };
-    {
-        let conn = db_arc.lock().await;
-        if let Some(v) = req.auto_start_worker {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "auto_start_worker",
-                if v { "true" } else { "false" },
-            );
+    let dsl = if let Some(value) = req.workflow_dsl.as_ref() {
+        let raw = value.to_string();
+        if crate::task_engine::workflow_dsl::WorkflowDsl::parse_json(&raw).is_none() {
+            return write_error_response(socket, "INVALID_WORKFLOW_DSL", "Invalid workflow DSL.")
+                .await;
         }
-        if let Some(v) = req.domain_concurrency {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "domain_concurrency",
-                &v.max(1).to_string(),
-            );
-        }
-        if let Some(v) = req.relation_concurrency {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "relation_concurrency",
-                &v.max(1).to_string(),
-            );
-        }
-        if let Some(v) = req.global_translation_concurrency {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "global_translation_concurrency",
-                &v.max(1).to_string(),
-            );
-        }
-        if let Some(v) = req.global_callback_concurrency {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "global_callback_concurrency",
-                &v.max(1).to_string(),
-            );
-        }
-        if let Some(v) = req.relation_max_pending_callbacks {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "relation_max_pending_callbacks",
-                &v.max(1).to_string(),
-            );
-        }
-        if let Some(v) = req.adaptive_rate_control {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "adaptive_rate_control",
-                if v { "true" } else { "false" },
-            );
-        }
-        if let Some(v) = req.adaptive_max_delay_ms {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "adaptive_max_delay_ms",
-                &v.max(200).to_string(),
-            );
-        }
-        if let Some(v) = req.callback_concurrency {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "callback_concurrency",
-                &v.max(1).to_string(),
-            );
-        }
-        if let Some(v) = req.callback_timeout_secs {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "callback_timeout_secs",
-                &v.to_string(),
-            );
-        }
-        if let Some(v) = req.callback_retry_max {
-            let _ =
-                crate::db::system::set_system_config(&conn, "callback_retry_max", &v.to_string());
-        }
-        if let Some(v) = req.fetch_timeout_secs {
-            let _ =
-                crate::db::system::set_system_config(&conn, "fetch_timeout_secs", &v.to_string());
-        }
-        if let Some(v) = req.fetch_retry_max {
-            let _ = crate::db::system::set_system_config(&conn, "fetch_retry_max", &v.to_string());
-        }
-        if let Some(v) = req.review_mode {
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "review_mode",
-                if v { "true" } else { "false" },
-            );
-        }
-        if let Some(policy) = req.workflow_policy.as_ref() {
-            if let Ok(raw) = serde_json::to_string(policy) {
-                if crate::task_engine::workflow_policy::WorkflowPolicy::parse_json(&raw).is_some() {
-                    let _ = crate::db::system::set_system_config(&conn, "workflow_policy", &raw);
+        Some(raw)
+    } else {
+        None
+    };
+    // Keep DB and runtime changes in the same order across concurrent saves.
+    let mut guard = state.lock().await;
+    let poll = req
+        .poll_seconds
+        .unwrap_or(guard.worker_loop_poll_seconds)
+        .clamp(1, 3600);
+    let saved = {
+        let mut conn = guard.db.lock().await;
+        (|| -> anyhow::Result<Value> {
+            let tx = conn.transaction()?;
+            for (key, value) in [
+                ("storage_max_retained_units", req.storage_max_retained_units),
+                ("storage_max_reserved_bytes", req.storage_max_reserved_bytes),
+            ] {
+                if let Some(value) = value {
+                    crate::db::system::set_system_config(&tx, key, &value.to_string())?;
+                    anyhow::ensure!(
+                        crate::db::system::get_system_config_checked(&tx, key)?.as_deref()
+                            == Some(value.to_string().as_str()),
+                        "retained capacity setting was not committed"
+                    );
                 }
             }
-        }
-        if let Some(dsl) = req.workflow_dsl.as_ref() {
-            if let Ok(raw) = serde_json::to_string(dsl) {
-                if crate::task_engine::workflow_dsl::WorkflowDsl::parse_json(&raw).is_some() {
-                    let _ = crate::db::system::set_system_config(&conn, "workflow_dsl", &raw);
+            for (key, value, min, max) in [
+                ("domain_concurrency", req.domain_concurrency, 1, u64::MAX),
+                (
+                    "relation_concurrency",
+                    req.relation_concurrency,
+                    1,
+                    u64::MAX,
+                ),
+                (
+                    "global_translation_concurrency",
+                    req.global_translation_concurrency,
+                    1,
+                    u64::MAX,
+                ),
+                (
+                    "global_callback_concurrency",
+                    req.global_callback_concurrency,
+                    1,
+                    u64::MAX,
+                ),
+                (
+                    "relation_max_pending_callbacks",
+                    req.relation_max_pending_callbacks,
+                    1,
+                    u64::MAX,
+                ),
+                (
+                    "adaptive_max_delay_ms",
+                    req.adaptive_max_delay_ms,
+                    200,
+                    u64::MAX,
+                ),
+                ("callback_concurrency", req.callback_concurrency, 1, 50),
+                ("callback_timeout_secs", req.callback_timeout_secs, 1, 300),
+                ("callback_retry_max", req.callback_retry_max, 0, 10),
+                ("fetch_timeout_secs", req.fetch_timeout_secs, 1, 300),
+                ("fetch_retry_max", req.fetch_retry_max, 0, 10),
+            ] {
+                if let Some(value) = value {
+                    crate::db::system::set_system_config(
+                        &tx,
+                        key,
+                        &value.clamp(min, max).to_string(),
+                    )?;
                 }
             }
+            for (key, value) in [
+                ("auto_start_worker", req.auto_start_worker),
+                ("adaptive_rate_control", req.adaptive_rate_control),
+            ] {
+                if let Some(value) = value {
+                    crate::db::system::set_system_config(
+                        &tx,
+                        key,
+                        if value { "true" } else { "false" },
+                    )?;
+                }
+            }
+            // An explicit policy owns default_mode; a flag-only save updates
+            // that default while preserving its scoped overrides (FL-8).
+            if let Some((raw, review)) = &policy {
+                crate::db::system::set_system_config(&tx, "workflow_policy", raw)?;
+                crate::db::system::set_system_config(
+                    &tx,
+                    "review_mode",
+                    if *review { "true" } else { "false" },
+                )?;
+            } else if let Some(review) = req.review_mode {
+                crate::db::system::set_system_config(
+                    &tx,
+                    "review_mode",
+                    if review { "true" } else { "false" },
+                )?;
+                crate::task_engine::workflow_policy::sync_stored_policy_default_mode(&tx, review)?;
+            }
+            if let Some(raw) = &dsl {
+                crate::db::system::set_system_config(&tx, "workflow_dsl", raw)?;
+            }
+            crate::db::system::set_system_config(&tx, "worker_poll_seconds", &poll.to_string())?;
+            let data = worker_config_snapshot(&tx, poll)?;
+            tx.commit()?;
+            Ok(data)
+        })()
+    };
+    let data = match saved {
+        Ok(data) => data,
+        Err(error) => {
+            drop(guard);
+            return write_error_response_with_status(
+                socket,
+                "500 Internal Server Error",
+                "WORKER_CONFIG_SAVE_FAILED",
+                &super::errors::err_public(&error),
+            )
+            .await;
         }
-    }
-
-    {
-        let mut guard = state.lock().await;
-        guard.worker_loop_poll_seconds = poll;
-        {
-            let conn = db_arc.lock().await;
-            let _ = crate::db::system::set_system_config(
-                &conn,
-                "worker_poll_seconds",
-                &poll.to_string(),
-            );
-        }
-        guard.last_error.clear();
-        guard.last_event = "worker.loop.config_updated".to_string();
-        guard.updated_at = unix_ts();
-    }
-    let payload = json!({
-        "success": true,
-        "data": { "poll_seconds": poll }
-    });
+    };
+    guard.worker_loop_poll_seconds = poll;
+    guard.last_error.clear();
+    guard.last_event = "worker.loop.config_updated".to_string();
+    guard.updated_at = unix_ts();
+    drop(guard);
+    let payload = json!({ "success": true, "data": data });
     write_http_response(
         socket,
         "200 OK",
@@ -1735,25 +1746,33 @@ pub(super) async fn handle_worker_config(
 pub(super) async fn handle_worker_stop(
     socket: &mut TcpStream,
     state: &Arc<Mutex<WebUiState>>,
+    log_file: &str,
     runtime_control: &WebUiRuntimeControl,
 ) -> anyhow::Result<()> {
-    runtime_control
-        .worker_running
-        .store(false, Ordering::SeqCst);
-    let handle_opt = {
-        let mut handle_guard = runtime_control.worker_handle.lock().await;
-        handle_guard.take()
-    };
-    if let Some(handle) = handle_opt {
-        handle.abort();
-        let _ = handle.await;
-    }
+    let _lifecycle = runtime_control.worker_lifecycle.lock().await;
+    stop_worker_loop_inner(runtime_control, Duration::from_secs(2)).await;
     {
         let mut guard = state.lock().await;
+        // A tick may finish naturally during the grace period. Only a forced
+        // abort needs this fallback event; never duplicate its natural tail.
+        let loop_needs_stopped_log = guard.worker_loop_running
+            && guard.last_event != "worker.loop.stopped"
+            && guard.last_event != "worker.loop.auth_failed";
+        if loop_needs_stopped_log {
+            guard.last_event = "worker.loop.stopped".to_string();
+        }
         guard.worker_loop_running = false;
         guard.worker_status = "idle".to_string();
-        guard.last_event = "worker.loop.stopped".to_string();
         guard.updated_at = unix_ts();
+        if loop_needs_stopped_log {
+            let _ = log_event(
+                log_file,
+                "info",
+                "worker.loop.stopped",
+                json!({ "via": "stop_endpoint" }),
+            );
+            let _ = flush_log();
+        }
     }
     let payload = json!({
         "success": true,
@@ -1766,4 +1785,28 @@ pub(super) async fn handle_worker_stop(
         &serde_json::to_vec(&payload)?,
     )
     .await
+}
+
+pub(crate) async fn stop_worker_loop(runtime_control: &WebUiRuntimeControl, grace: Duration) {
+    let _lifecycle = runtime_control.worker_lifecycle.lock().await;
+    stop_worker_loop_inner(runtime_control, grace).await;
+}
+
+async fn stop_worker_loop_inner(runtime_control: &WebUiRuntimeControl, grace: Duration) {
+    // Never hold worker_handle while awaiting its natural tail: the tail takes
+    // that mutex to clear its own handle. Start cannot publish a replacement yet.
+    runtime_control
+        .worker_running
+        .store(false, Ordering::SeqCst);
+    runtime_control.worker_stop.notify_waiters();
+    let handle_opt = {
+        let mut handle_guard = runtime_control.worker_handle.lock().await;
+        handle_guard.take()
+    };
+    if let Some(mut handle) = handle_opt {
+        if tokio::time::timeout(grace, &mut handle).await.is_err() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
 }

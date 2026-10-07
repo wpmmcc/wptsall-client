@@ -10,6 +10,10 @@ pub struct SiteInfo {
     pub wp_url: String,
     pub connected: bool,
     pub languages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_verified_at: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -18,6 +22,15 @@ pub struct AddSiteRequest {
     pub token: String,
     #[serde(default)]
     pub route_secret: Option<String>,
+    /// §65 (cursor item 5): WebUI upsert rename field — when set, the
+    /// binding entry for `existing_api_base_url` is moved to the new
+    /// api_base_url instead of always creating a fresh entry.
+    #[serde(default)]
+    pub existing_api_base_url: Option<String>,
+    /// §65 (cursor item 5): optional plugin identity pin carried through to
+    /// the WebUI binding entry (frozen identity for verify-gated runs).
+    #[serde(default)]
+    pub plugin_identity: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -36,30 +49,35 @@ pub struct ImportedSiteConnection {
     pub token_len: usize,
     pub route_secret_set: bool,
     pub pairing_claimed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin_identity: Option<String>,
 }
 
 const CLIENT_ROUTE_MARKER: &str = "/wp-json/wptsall/v2/";
+const WPMMCC_ROUTE_MARKER: &str = "/wp-json/wpmmcc/v1/";
 
 pub fn parse_site_binding_input(
     wp_url: &str,
     route_secret: Option<&str>,
 ) -> (String, String) {
     let trimmed = wp_url.trim().trim_end_matches('/');
-    if let Some(index) = trimmed.find(CLIENT_ROUTE_MARKER) {
-        let api_base_url = trimmed[..index].trim_end_matches('/').to_string();
-        let rest = &trimmed[index + CLIENT_ROUTE_MARKER.len()..];
-        let parsed_secret = rest
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let final_secret = route_secret
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(&parsed_secret)
-            .to_string();
-        return (api_base_url, final_secret);
+    for marker in [CLIENT_ROUTE_MARKER, WPMMCC_ROUTE_MARKER] {
+        if let Some(index) = trimmed.find(marker) {
+            let api_base_url = trimmed[..index].trim_end_matches('/').to_string();
+            let rest = &trimmed[index + marker.len()..];
+            let parsed_secret = rest
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let final_secret = route_secret
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&parsed_secret)
+                .to_string();
+            return (api_base_url, final_secret);
+        }
     }
 
     (
@@ -105,6 +123,14 @@ fn site_from_domain(value: &Value) -> SiteInfo {
                     .collect()
             })
             .unwrap_or_default(),
+        plugin_identity: value
+            .get("plugin_identity")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        identity_verified_at: value
+            .get("identity_verified_at")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
     }
 }
 
@@ -126,6 +152,14 @@ fn site_from_binding(value: &Value) -> SiteInfo {
             .and_then(Value::as_bool)
             .unwrap_or(true),
         languages: Vec::new(),
+        plugin_identity: value
+            .get("plugin_identity")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        identity_verified_at: value
+            .get("identity_verified_at")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
     }
 }
 
@@ -168,6 +202,8 @@ pub async fn add_site(request: AddSiteRequest) -> Result<SiteInfo, String> {
             "api_base_url": api_base_url,
             "wp_client_token": request.token.trim(),
             "route_secret": route_secret,
+            "existing_api_base_url": request.existing_api_base_url,
+            "plugin_identity": request.plugin_identity,
         }),
     )
     .await?;
@@ -179,6 +215,8 @@ pub async fn add_site(request: AddSiteRequest) -> Result<SiteInfo, String> {
         wp_url: api_base_url,
         connected,
         languages: Vec::new(),
+        plugin_identity: None,
+        identity_verified_at: None,
     })
 }
 
@@ -218,6 +256,10 @@ pub async fn import_site_connection(
             .get("pairing_claimed")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        plugin_identity: data
+            .get("plugin_identity")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
     })
 }
 
@@ -239,29 +281,4 @@ pub async fn test_connection(site_id: String) -> Result<bool, String> {
     )
     .await
     .map(|_| true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_full_protocol_v2_client_url() {
-        let (base, secret) = parse_site_binding_input(
-            "http://127.0.0.1:9181/wp-json/wptsall/v2/abc123/client",
-            None,
-        );
-        assert_eq!(base, "http://127.0.0.1:9181");
-        assert_eq!(secret, "abc123");
-    }
-
-    #[test]
-    fn explicit_route_secret_overrides_url_secret() {
-        let (base, secret) = parse_site_binding_input(
-            "https://example.test/wp-json/wptsall/v2/from-url/client",
-            Some("from-form"),
-        );
-        assert_eq!(base, "https://example.test");
-        assert_eq!(secret, "from-form");
-    }
 }

@@ -9,8 +9,7 @@ use crate::logging::{log_event, snippet, unix_ts};
 use crate::types::{ApiResponse, OAuthTokenData, WebUiRuntimeControl, WebUiState};
 use crate::web_ui::{fetch_components_for_session, fetch_domains_for_session};
 
-use super::errors::{
-    maybe_write_upstream_api_error, write_error_response, write_error_response_with_status,
+use super::errors::{err_public, maybe_write_upstream_api_error, write_error_response, write_error_response_with_status,
     write_session_required,
 };
 use super::http::{parse_query_string, write_http_response};
@@ -38,7 +37,12 @@ pub(super) async fn handle_domains_refresh(
             guard.last_error.clear();
             guard.last_event = "domains.refreshed".to_string();
             guard.updated_at = unix_ts();
-            let payload = json!({ "success": true, "data": { "domains": redacted_domain_status_items(&guard.domains) } });
+            let payload = json!({ "success": true, "data": { "domains": redacted_domain_status_items(&guard.domains, &guard.domain_token_bindings) } });
+            crate::logging::log_event_global(
+                "info",
+                "auth.domains_refreshed",
+                json!({ "domains": guard.domains.len() }),
+            );
             write_http_response(
                 socket,
                 "200 OK",
@@ -52,7 +56,7 @@ pub(super) async fn handle_domains_refresh(
             if let Some(response) = maybe_write_upstream_api_error(socket, &err).await {
                 return response;
             }
-            write_error_response(socket, "DOMAINS_REFRESH_FAILED", &format!("{:#}", err)).await
+            write_error_response(socket, "DOMAINS_REFRESH_FAILED", &err_public(&err)).await
         }
     }
 }
@@ -118,7 +122,7 @@ pub(super) async fn handle_logout(
             if let Some(response) = maybe_write_upstream_api_error(socket, &err).await {
                 return response;
             }
-            return write_error_response(socket, "LOGOUT_FAILED", &format!("{:#}", err)).await;
+            return write_error_response(socket, "LOGOUT_FAILED", &err_public(&err)).await;
         }
         // Mark this as an informational logout, not a failure.
         {
@@ -146,6 +150,7 @@ pub(super) async fn handle_logout(
     }
 
     let payload = json!({ "success": true, "data": { "logged_in": false } });
+    crate::logging::log_event_global("info", "auth.logout_http", json!({}));
     write_http_response(
         socket,
         "200 OK",
@@ -209,6 +214,7 @@ pub(super) async fn handle_oauth_start(
         "success": true,
         "data": { "authorize_url": authorize_url }
     });
+    crate::logging::log_event_global("info", "auth.oauth_started", json!({}));
     write_http_response(
         socket,
         "200 OK",

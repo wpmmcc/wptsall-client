@@ -4,13 +4,17 @@
   import {
     createVendorKey,
     installCatalogTemplate,
+    installProviderCatalogVersion,
     listProviderCatalog,
+    listProviderCatalogVersions,
     refreshProviderCatalog,
     type ProviderCatalogItem,
+    type ProviderCatalogVersion,
   } from '../api/keys';
   import {
     createComponentVersion,
     quickTestLocalComponent,
+    updateComponentVersion,
     updateLocalComponent,
     upsertRuleBinding,
   } from '../api/components';
@@ -29,6 +33,13 @@
   let notice = $state('');
   let catalogVersion = $state<string | null>(null);
 
+  let versionsOpen = $state(false);
+  let versionsLoading = $state(false);
+  let versionsError = $state('');
+  let catalogVersions = $state<ProviderCatalogVersion[]>([]);
+  let versionsSource = $state('');
+  let installingVersion = $state<string | null>(null);
+
   let wizardOpen = $state(false);
   let wizardItem = $state<ProviderCatalogItem | null>(null);
   let wizardStep = $state<WizardStep>('install');
@@ -43,6 +54,8 @@
   let configModel = $state('');
   let configResponsePath = $state('');
   let quickTestText = $state('Hello world');
+  let quickTestSourceLang = $state('en_US');
+  let quickTestTargetLang = $state('zh_CN');
   let quickTestResult = $state('');
   let routeSlot = $state('plain_text');
 
@@ -93,14 +106,18 @@
     return typeof path === 'string' ? path : '';
   }
 
-  async function loadCatalog() {
+  async function loadCatalog(check = false) {
     loading = true;
     error = '';
     try {
-      const res = await listProviderCatalog({ q: query });
+      const res = await listProviderCatalog({ q: query, ...(check ? { check: true } : {}) });
       if (res.success) {
         items = res.data.items;
         catalogVersion = res.data.catalog_version;
+        const available = res.data.available_version;
+        if (available && available !== catalogVersion) {
+          notice = $_('vendor_catalog.new_version_available', { values: { version: available } });
+        }
       } else {
         error = res.error?.message ?? $_('vendor_catalog.load_failed');
       }
@@ -121,12 +138,61 @@
         error = refreshed.error?.message ?? $_('vendor_catalog.load_failed');
         return;
       }
-      notice = $_('vendor_catalog.refresh_local_success');
+      notice = $_(refreshed.data.offline ? 'vendor_catalog.offline_retained' : 'vendor_catalog.refresh_local_success');
       await loadCatalog();
     } catch (err: any) {
       error = err?.message ?? $_('vendor_catalog.load_failed');
     } finally {
       refreshing = false;
+    }
+  }
+
+  async function loadCatalogVersions() {
+    versionsLoading = true;
+    versionsError = '';
+    try {
+      const res = await listProviderCatalogVersions();
+      if (!res.success) {
+        versionsError = res.error?.message ?? $_('vendor_catalog.versions_load_failed');
+        catalogVersions = [];
+        return;
+      }
+      catalogVersions = res.data.versions ?? [];
+      versionsSource = res.data.source ?? '';
+      if (res.data.last_error) {
+        versionsError = res.data.last_error;
+      }
+    } catch (err: any) {
+      versionsError = err?.message ?? $_('vendor_catalog.versions_load_failed');
+    } finally {
+      versionsLoading = false;
+    }
+  }
+
+  async function toggleVersionsPanel() {
+    versionsOpen = !versionsOpen;
+    if (versionsOpen && catalogVersions.length === 0) {
+      await loadCatalogVersions();
+    }
+  }
+
+  async function pinCatalogVersion(version: string) {
+    if (!window.confirm($_('vendor_catalog.confirm_version', { values: { version } }))) return;
+    installingVersion = version;
+    notice = '';
+    error = '';
+    try {
+      const res = await installProviderCatalogVersion(version);
+      if (!res.success) {
+        error = res.error?.message ?? $_('vendor_catalog.install_version_failed');
+        return;
+      }
+      notice = $_('vendor_catalog.install_version_ok', { values: { version } });
+      await loadCatalog();
+    } catch (err: any) {
+      error = err?.message ?? $_('vendor_catalog.install_version_failed');
+    } finally {
+      installingVersion = null;
     }
   }
 
@@ -162,6 +228,8 @@
     configModel = templateModel(item);
     configResponsePath = templateResponsePath(item);
     quickTestText = 'Hello world';
+    quickTestSourceLang = 'en_US';
+    quickTestTargetLang = 'zh_CN';
     quickTestResult = '';
     routeSlot = item.supported_content_formats?.[0] || 'plain_text';
     wizardOpen = true;
@@ -262,6 +330,9 @@
         key_ids: [keyId],
         auth_type: 'key',
         remarks: 'created by provider setup wizard',
+        // Persist URL/model overrides here — quick-test alone does not write them,
+        // and runtime would otherwise keep the catalog official endpoint.
+        config_overrides: buildConfigOverrides(),
       });
       if (!versionRes.success) {
         wizardNotice = $_('vendor_catalog.wizard_key_ok_version_skip');
@@ -293,8 +364,8 @@
         auth_values: authValues,
         config_overrides: buildConfigOverrides(),
         text: quickTestText || 'Hello world',
-        source_lang: 'en_US',
-        target_lang: 'zh_CN',
+        source_lang: quickTestSourceLang.trim() || 'en_US',
+        target_lang: quickTestTargetLang.trim() || 'zh_CN',
       });
       if (!res.success) {
         wizardError = res.error?.message ?? $_('vendor_catalog.wizard_test_failed');
@@ -330,6 +401,16 @@
     wizardError = '';
     wizardNotice = '';
     try {
+      const overrides = buildConfigOverrides();
+      if (Object.keys(overrides).length > 0) {
+        const verRes = await updateComponentVersion(localComponentId, 'v1', {
+          config_overrides: overrides,
+        });
+        if (!verRes.success) {
+          wizardError = verRes.error?.message ?? $_('vendor_catalog.wizard_enable_failed');
+          return;
+        }
+      }
       const res = await updateLocalComponent(localComponentId, { enabled: true });
       if (!res.success) {
         wizardError = res.error?.message ?? $_('vendor_catalog.wizard_enable_failed');
@@ -380,7 +461,7 @@
   }
 
   onMount(() => {
-    loadCatalog();
+    loadCatalog(true);
   });
 </script>
 
@@ -418,7 +499,7 @@
         <option value="live-verified">live-verified</option>
       </select>
       <button
-        onclick={loadCatalog}
+        onclick={() => loadCatalog()}
         disabled={loading}
         class="text-xs border border-gray-200 px-3 py-1.5 rounded-lg hover:bg-gray-50 text-gray-600 disabled:opacity-50">
         {$_('common.refresh')}
@@ -429,8 +510,69 @@
         class="text-xs bg-blue-600 text-white px-3 py-1.5 rounded-lg hover:bg-blue-700 disabled:opacity-50">
         {$_('vendor_catalog.verify_local')}
       </button>
+      <button
+        type="button"
+        data-testid="catalog-versions-toggle"
+        onclick={toggleVersionsPanel}
+        class="text-xs border border-gray-200 px-3 py-1.5 rounded-lg hover:bg-gray-50 text-gray-600">
+        {$_('vendor_catalog.versions')}
+      </button>
     </div>
   </div>
+
+  {#if versionsOpen}
+    <div class="border-b border-gray-100 px-5 py-4 bg-gray-50/80" data-testid="catalog-versions-panel">
+      <div class="flex items-center justify-between gap-2 mb-2">
+        <p class="text-xs text-gray-600">
+          {$_('vendor_catalog.versions_hint')}
+          {#if versionsSource}
+            <span class="text-gray-400"> · {versionsSource}</span>
+          {/if}
+        </p>
+        <button
+          type="button"
+          class="text-xs text-blue-600 hover:underline disabled:opacity-50"
+          disabled={versionsLoading}
+          onclick={loadCatalogVersions}
+        >
+          {versionsLoading ? $_('common.loading') : $_('common.refresh')}
+        </button>
+      </div>
+      {#if versionsError}
+        <p class="text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded px-2 py-1.5 mb-2">{versionsError}</p>
+      {/if}
+      {#if !versionsLoading && catalogVersions.length === 0}
+        <p class="text-xs text-gray-400">{$_('vendor_catalog.versions_empty')}</p>
+      {:else}
+        <ul class="space-y-1.5 max-h-48 overflow-y-auto">
+          {#each catalogVersions as ver (ver.version)}
+            <li class="flex items-center justify-between gap-3 text-xs bg-white border border-gray-200 rounded-lg px-3 py-2">
+              <div class="min-w-0">
+                <span class="font-mono font-medium text-gray-800">{ver.version}</span>
+                {#if ver.released_at}
+                  <span class="text-gray-400 ml-2">{ver.released_at}</span>
+                {/if}
+                {#if ver.entries_count != null}
+                  <span class="text-gray-400 ml-2">{ver.entries_count} entries</span>
+                {/if}
+              </div>
+              <button
+                type="button"
+                data-testid={`catalog-install-version-${ver.version}`}
+                disabled={installingVersion === ver.version}
+                onclick={() => pinCatalogVersion(ver.version)}
+                class="shrink-0 text-xs px-2.5 py-1 rounded-md bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
+              >
+                {installingVersion === ver.version
+                  ? $_('common.loading')
+                  : $_('vendor_catalog.install_version')}
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  {/if}
 
   {#if error}
     <div class="border-b border-red-200 bg-red-50 px-5 py-3 text-sm text-red-700">{error}</div>
@@ -574,6 +716,22 @@
               class="mt-1 block w-full max-w-md text-xs border border-gray-200 px-3 py-1.5 rounded-lg"
               data-testid="wizard-test-text" />
           </label>
+          <div class="flex gap-3 max-w-md">
+            <label class="block text-xs text-gray-500 flex-1">
+              {$_('vendor_catalog.wizard_test_source_lang')}
+              <input
+                bind:value={quickTestSourceLang}
+                class="mt-1 block w-full text-xs border border-gray-200 px-3 py-1.5 rounded-lg font-mono"
+                data-testid="wizard-test-source-lang" />
+            </label>
+            <label class="block text-xs text-gray-500 flex-1">
+              {$_('vendor_catalog.wizard_test_target_lang')}
+              <input
+                bind:value={quickTestTargetLang}
+                class="mt-1 block w-full text-xs border border-gray-200 px-3 py-1.5 rounded-lg font-mono"
+                data-testid="wizard-test-target-lang" />
+            </label>
+          </div>
           {#if quickTestResult}
             <pre class="text-xs bg-white border border-gray-200 rounded-lg p-2 max-w-xl overflow-auto">{quickTestResult}</pre>
           {/if}
@@ -641,12 +799,26 @@
     </thead>
     <tbody>
       {#if loading}
-        <tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">{$_('common.loading')}</td></tr>
+        <tr>
+          <td colspan="7" class="px-4 py-8 text-center text-gray-400" data-testid="apikeys-vendors-loading">
+            {#if items.length === 0}
+              <!-- 3.8flash A3: the first catalog view on a clean client triggers an
+                   online fetch inline (server-side, now 3s-bounded); say so — a
+                   silent "Loading…" read as a hang when the network is offline
+                   (the built-in templates still load after the timeout). -->
+              {$_('vendor_catalog.first_fetch_loading')}
+            {:else}
+              {$_('common.loading')}
+            {/if}
+          </td>
+        </tr>
       {:else if filteredItems.length === 0}
-        <tr><td colspan="7" class="px-4 py-8 text-center text-gray-400">{$_('vendor_catalog.no_data')}</td></tr>
+        <tr><td colspan="7" class="px-4 py-8 text-center text-gray-400" data-testid="apikeys-vendors-empty">{$_('vendor_catalog.no_data')}</td></tr>
       {:else}
         {#each filteredItems as item (item.entry_id + item.template_id)}
-          <tr class="border-t border-gray-50 align-top hover:bg-gray-50/50">
+          <tr
+            class="border-t border-gray-50 align-top hover:bg-gray-50/50"
+            data-testid={`catalog-entry-${item.entry_id}`}>
             <td class="px-4 py-3">
               <div class="font-medium text-gray-800">{item.name || item.template_id}</div>
               <div class="font-mono text-[11px] text-gray-400 mt-1">{item.template_id}</div>

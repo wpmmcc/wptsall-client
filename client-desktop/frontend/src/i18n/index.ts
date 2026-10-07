@@ -2,9 +2,38 @@ import { addMessages, init, getLocaleFromNavigator, locale, _ } from 'svelte-i18
 import { get } from 'svelte/store';
 import en from './locales/en.json';
 import zhCN from './locales/zh-CN.json';
+import webuiEn from '../../../../client-wpplugin/source/frontend/src/i18n/locales/en.json';
+import webuiZhCN from '../../../../client-wpplugin/source/frontend/src/i18n/locales/zh-CN.json';
 
-addMessages('en', en);
-addMessages('zh-CN', zhCN);
+interface LocaleDict {
+  [key: string]: string | LocaleDict | (string | LocaleDict)[] | null;
+}
+
+function isPlainDict(value: unknown): value is LocaleDict {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function deepMerge(base: LocaleDict, override: LocaleDict): LocaleDict {
+  const out: LocaleDict = { ...base };
+  for (const [key, value] of Object.entries(override)) {
+    const baseValue = out[key];
+    if (isPlainDict(baseValue) && isPlainDict(value)) {
+      out[key] = deepMerge(baseValue, value);
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
+// P 双层收敛：WebUI page 册为基层、desktop 自家册覆写其上。原 flat 基层
+// （client-wpplugin/source/locales/*.json）已裁至 Rust 域 24 键（CLI/OAuth/
+// tray 独占），desktop SPA 不引用其任何键，故弃用该层。
+const enDict = deepMerge(webuiEn as unknown as LocaleDict, en as unknown as LocaleDict);
+const zhCNDict = deepMerge(webuiZhCN as unknown as LocaleDict, zhCN as unknown as LocaleDict);
+
+addMessages('en', enDict);
+addMessages('zh-CN', zhCNDict);
 
 // P0-LF-05 (mirrors the WebUI client): versioned local storage key. Locale
 // persistence stays on this device — no network, no account preference.

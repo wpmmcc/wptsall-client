@@ -1,0 +1,98 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090D16" />
+      <stop offset="45%" stop-color="#0F172A" />
+      <stop offset="100%" stop-color="#1E1B4B" />
+    </linearGradient>
+
+    <!-- Border Glow Gradient -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.8" />
+      <stop offset="50%" stop-color="#818CF8" stop-opacity="0.5" />
+      <stop offset="100%" stop-color="#C084FC" stop-opacity="0.85" />
+    </linearGradient>
+
+    <!-- Ambient Top-Left Light -->
+    <radialGradient id="ambientLight" cx="30%" cy="25%" r="65%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.22" />
+      <stop offset="50%" stop-color="#6366F1" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#0F172A" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Cyan to Blue Flow Gradient -->
+    <linearGradient id="cyanBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="50%" stop-color="#0284C7" />
+      <stop offset="100%" stop-color="#2563EB" />
+    </linearGradient>
+
+    <!-- Violet to Purple Flow Gradient -->
+    <linearGradient id="violetPurple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#A855F7" />
+      <stop offset="50%" stop-color="#7C3AED" />
+      <stop offset="100%" stop-color="#4F46E5" />
+    </linearGradient>
+
+    <!-- Glowing Core Gradient -->
+    <radialGradient id="coreGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="40%" stop-color="#E0F2FE" />
+      <stop offset="70%" stop-color="#38BDF8" stop-opacity="0.8" />
+      <stop offset="100%" stop-color="#6366F1" stop-opacity="0" />
+    </radialGradient>
+
+    <!-- Drop Shadows & Filters -->
+    <filter id="subtleGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+
+    <filter id="shadowFilter" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000000" flood-opacity="0.6" />
+    </filter>
+  </defs>
+
+  <!-- Squircle Container with Soft Shadow -->
+  <g filter="url(#shadowFilter)">
+    <!-- Base Squircle -->
+    <rect x="36" y="36" width="440" height="440" rx="100" ry="100" fill="url(#bgGrad)" />
+    <!-- Ambient Light Overlay -->
+    <rect x="36" y="36" width="440" height="440" rx="100" ry="100" fill="url(#ambientLight)" />
+    <!-- Elegant Stroke Border -->
+    <rect x="36" y="36" width="440" height="440" rx="100" ry="100" fill="none" stroke="url(#borderGrad)" stroke-width="4" />
+  </g>
+
+  <!-- Central Dynamic Vector Mark: WPTSALL Translation & Sync Ribbon -->
+  <g id="brandSymbol" filter="url(#subtleGlow)">
+    <!-- Sync / Translation Infinity Loop Path (Bottom Flow: Violet to Cyan) -->
+    <path d="M 330 200 C 375 200, 405 225, 405 265 C 405 310, 365 345, 310 345 C 240 345, 195 265, 155 265 C 125 265, 107 282, 107 302 C 107 325, 125 345, 160 345 L 175 345"
+          fill="none" stroke="url(#violetPurple)" stroke-width="26" stroke-linecap="round" stroke-linejoin="round" />
+
+    <!-- Sync / Translation Infinity Loop Path (Top Flow: Cyan to Violet) -->
+    <path d="M 182 312 C 137 312, 107 287, 107 247 C 107 202, 147 167, 202 167 C 272 167, 317 247, 357 247 C 387 247, 405 230, 405 210 C 405 187, 387 167, 352 167 L 337 167"
+          fill="none" stroke="url(#cyanBlue)" stroke-width="26" stroke-linecap="round" stroke-linejoin="round" />
+
+    <!-- Top Flow Arrow Head (Cyan, Pointing Right into Target Orbit) -->
+    <path d="M 345 150 L 372 167 L 345 184 Z" fill="#38BDF8" />
+
+    <!-- Bottom Flow Arrow Head (Violet, Pointing Left into Source Orbit) -->
+    <path d="M 167 328 L 140 345 L 167 362 Z" fill="#A855F7" />
+
+    <!-- Left Orbit Source Orb (WordPress Blue) -->
+    <circle cx="165" cy="240" r="18" fill="url(#cyanBlue)" />
+    <circle cx="165" cy="240" r="9" fill="#FFFFFF" opacity="0.9" />
+
+    <!-- Right Orbit Target Orb (Sync / Translation Purple) -->
+    <circle cx="347" cy="272" r="18" fill="url(#violetPurple)" />
+    <circle cx="347" cy="272" r="9" fill="#FFFFFF" opacity="0.9" />
+
+    <!-- Center Bridge Nexus Core (Translation Fusion Engine) -->
+    <circle cx="256" cy="256" r="32" fill="url(#coreGlow)" />
+    <circle cx="256" cy="256" r="12" fill="#FFFFFF" />
+
+    <!-- Geometric Diamond Accent at Core -->
+    <path d="M 256 232 L 268 256 L 256 280 L 244 256 Z" fill="#38BDF8" opacity="0.75" />
+  </g>
+</svg>

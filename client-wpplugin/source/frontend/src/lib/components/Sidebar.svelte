@@ -4,6 +4,7 @@
   import { _ } from 'svelte-i18n';
   import { locale } from 'svelte-i18n';
   import { setLocale } from '../i18n';
+  import BrandLogo from './BrandLogo.svelte';
 
   let { currentPage, onNavigate, onLogout, mobileOpen = false }: {
     currentPage: string;
@@ -21,11 +22,13 @@
   let legacyMode = $derived($status?.runtime_mode === 'legacy_server_control_plane');
 
   type NavItem = { id: string; labelKey: string; icon: typeof LayoutDashboard; legacyOnly?: boolean };
+  // Order mirrors self-serve journey: Sites → Keys → Components → Tasks → Ops.
+  // (Doc 03 §3.1 target is 5 modules; this 8-entry list is the shared parity baseline.)
   const navItems: NavItem[] = [
     { id: 'overview',    labelKey: 'nav.overview',    icon: LayoutDashboard },
     { id: 'sites',       labelKey: 'nav.sites',       icon: Globe },
-    { id: 'components',  labelKey: 'nav.components',  icon: Puzzle },
     { id: 'apikeys',     labelKey: 'nav.api_keys',    icon: Key },
+    { id: 'components',  labelKey: 'nav.components',  icon: Puzzle },
     { id: 'tasks',       labelKey: 'nav.tasks',       icon: ListTodo },
     { id: 'logs',        labelKey: 'nav.logs',        icon: FileText },
     { id: 'history',     labelKey: 'nav.history',     icon: ClipboardList },
@@ -40,8 +43,12 @@
     fixed lg:static inset-0 z-40 transition-transform
     ${mobileOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}`}
   aria-label={$_('a11y.main_navigation')}>
-  <div class="px-4 py-5 border-b border-gray-200">
-    <h1 class="text-gray-950 font-semibold text-sm tracking-wide">{$_('app.title')}</h1>
+  <div class="px-4 py-4 border-b border-gray-200 flex items-center gap-3">
+    <BrandLogo size={32} className="shadow-sm rounded-lg" />
+    <div class="min-w-0">
+      <h1 class="text-gray-950 font-bold text-sm tracking-tight truncate">{$_('app.title')}</h1>
+      <p class="text-[10px] text-gray-500 font-medium leading-tight truncate">Translate &amp; Sync</p>
+    </div>
   </div>
 
   <div class="flex-1 py-3 px-2 space-y-0.5">

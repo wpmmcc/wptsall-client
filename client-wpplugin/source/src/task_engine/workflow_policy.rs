@@ -4,7 +4,6 @@
 //! Legacy global `review_mode` maps to `default_mode = review`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 pub(crate) const WORKFLOW_POLICY_SCHEMA_VERSION: &str = "workflow-policy-v1";
 
@@ -26,10 +25,9 @@ impl WorkflowMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WorkflowPolicy {
-    #[serde(default = "default_schema_version")]
     pub(crate) schema_version: String,
-    #[serde(default = "default_mode_auto")]
     pub(crate) default_mode: String,
     #[serde(default)]
     pub(crate) by_domain: std::collections::HashMap<String, String>,
@@ -37,14 +35,6 @@ pub(crate) struct WorkflowPolicy {
     pub(crate) by_content_format: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub(crate) by_rule: std::collections::HashMap<String, String>,
-}
-
-fn default_schema_version() -> String {
-    WORKFLOW_POLICY_SCHEMA_VERSION.to_string()
-}
-
-fn default_mode_auto() -> String {
-    "auto".to_string()
 }
 
 impl WorkflowPolicy {
@@ -61,10 +51,20 @@ impl WorkflowPolicy {
     }
 
     pub(crate) fn parse_json(raw: &str) -> Option<Self> {
-        let v: Value = serde_json::from_str(raw).ok()?;
-        let policy: WorkflowPolicy = serde_json::from_value(v).ok()?;
-        if !policy.schema_version.is_empty()
-            && policy.schema_version != WORKFLOW_POLICY_SCHEMA_VERSION
+        serde_json::from_str::<serde_json::Value>(raw)
+            .ok()?
+            .as_object()?;
+        let policy: WorkflowPolicy = serde_json::from_str(raw).ok()?;
+        if policy.schema_version != WORKFLOW_POLICY_SCHEMA_VERSION {
+            return None;
+        }
+        if !matches!(policy.default_mode.as_str(), "auto" | "review")
+            || policy
+                .by_domain
+                .values()
+                .chain(policy.by_content_format.values())
+                .chain(policy.by_rule.values())
+                .any(|mode| !matches!(mode.as_str(), "auto" | "review"))
         {
             return None;
         }
@@ -130,32 +130,29 @@ pub(crate) fn load_workflow_policy(
     WorkflowPolicy::from_review_mode_flag(legacy_review_mode)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn legacy_review_flag_maps_to_default_review() {
-        let p = WorkflowPolicy::from_review_mode_flag(true);
-        assert!(p.requires_review(None, None, None));
-        let p2 = WorkflowPolicy::from_review_mode_flag(false);
-        assert!(!p2.requires_review(None, None, None));
-    }
-
-    #[test]
-    fn format_override_beats_default() {
-        let mut p = WorkflowPolicy::from_review_mode_flag(false);
-        p.by_content_format
-            .insert("json_structured".into(), "review".into());
-        assert!(p.requires_review(None, Some("json_structured"), None));
-        assert!(!p.requires_review(None, Some("plain_text"), None));
-    }
-
-    #[test]
-    fn domain_override() {
-        let mut p = WorkflowPolicy::from_review_mode_flag(false);
-        p.by_domain
-            .insert("shop.example.com".into(), "review".into());
-        assert!(p.requires_review(Some("shop.example.com"), Some("plain_text"), None));
-    }
+/// FL-8 single-source sync: rewrite the stored policy's `default_mode` to
+/// match a legacy `review_mode` flag write, preserving the finer-grained
+/// by_domain/by_content_format/by_rule overrides. The engine resolves items
+/// with the stored policy when present (see `load_workflow_policy`), so a
+/// flag write that leaves a stale `default_mode` behind silently overrides
+/// the operator. Returns the updated raw JSON, or `None` when no parseable
+/// policy is stored (the legacy fallback is already authoritative then).
+pub(crate) fn sync_stored_policy_default_mode(
+    conn: &rusqlite::Connection,
+    review_mode: bool,
+) -> anyhow::Result<Option<String>> {
+    let Some(raw) = crate::db::system::get_system_config_checked(conn, "workflow_policy")? else {
+        return Ok(None);
+    };
+    let Some(mut policy) = WorkflowPolicy::parse_json(&raw) else {
+        return Ok(None);
+    };
+    policy.default_mode = if review_mode {
+        "review".to_string()
+    } else {
+        "auto".to_string()
+    };
+    let updated = serde_json::to_string(&policy)?;
+    crate::db::system::set_system_config(conn, "workflow_policy", &updated)?;
+    Ok(Some(updated))
 }

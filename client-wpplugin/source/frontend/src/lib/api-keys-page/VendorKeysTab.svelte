@@ -2,7 +2,7 @@
   import { _ } from 'svelte-i18n';
   import { onMount } from 'svelte';
   import { hasData, isOk } from '../api/client';
-  import { createVendorKey, deleteVendorKey, listVendorKeys, updateVendorKey } from '../api/keys';
+  import { createVendorKey, deleteVendorKey, listVendorKeys, testProvider, updateVendorKey } from '../api/keys';
   import { showToast } from '../stores/toast';
   import {
     handleBackdropKeydown,
@@ -19,6 +19,8 @@
   let showKeyModal = $state(false);
   let editingKey = $state<VendorKeyItem | null>(null);
   let filterVendorId = $state('');
+  let testingKey = $state(false);
+  let testResult = $state('');
   let keyForm = $state<KeyFormState>({
     id: '',
     vendor_id: '',
@@ -57,6 +59,7 @@
       max_file_size_mb: '100',
     };
     showKeyModal = true;
+    testResult = '';
   }
 
   function openEditKey(k: VendorKeyItem) {
@@ -74,15 +77,23 @@
       max_file_size_mb: String(k.max_file_size_mb ?? 0),
     };
     showKeyModal = true;
+    testResult = '';
   }
 
   async function saveKey() {
     let authValues: Record<string, string> = {};
-    try {
-      authValues = JSON.parse(keyForm.auth_json);
-    } catch {
-      showToast('error', $_('vendor_keys.auth_json_error'));
-      return;
+    const trimmed = (keyForm.auth_json || '').trim();
+    if (trimmed) {
+      if (!trimmed.startsWith('{')) {
+        authValues = { api_key: trimmed };
+      } else {
+        try {
+          authValues = JSON.parse(trimmed);
+        } catch {
+          showToast('error', $_('vendor_keys.auth_json_error'));
+          return;
+        }
+      }
     }
     if (!editingKey && !keyForm.id.trim()) {
       showToast('error', $_('vendor_keys.fill_key_id'));
@@ -133,6 +144,65 @@
     }
   }
 
+  async function testKeyFromModal() {
+    testingKey = true;
+    testResult = '';
+    try {
+      let authValues: Record<string, string> = {};
+      try {
+        authValues = JSON.parse(keyForm.auth_json || '{}');
+      } catch {
+        showToast('error', $_('vendor_keys.auth_json_error'));
+        return;
+      }
+      const body =
+        editingKey && Object.keys(authValues).length === 0
+          ? { key_id: editingKey.id, vendor_id: editingKey.vendor_id }
+          : {
+              vendor_id: (editingKey?.vendor_id || keyForm.vendor_id).trim(),
+              auth_values: authValues,
+              key_id: editingKey?.id,
+            };
+      const r = await testProvider(body);
+      if (r.success && r.data?.healthy) {
+        testResult = $_('vendor_keys.test_ok', {
+          values: {
+            ms: r.data.latency_ms,
+            text: (r.data.translated_text || '').slice(0, 80),
+          },
+        });
+        showToast('success', $_('vendor_keys.test_success'));
+      } else {
+        const msg = (r as any).error?.message || (r as any).error?.hint || $_('vendor_keys.test_failed');
+        testResult = msg;
+        showToast('error', $_('vendor_keys.test_failed'), msg);
+      }
+    } catch (e: any) {
+      testResult = e?.message || $_('vendor_keys.test_failed');
+      showToast('error', $_('vendor_keys.test_failed'), e?.message);
+    } finally {
+      testingKey = false;
+    }
+  }
+
+  async function testStoredKey(k: VendorKeyItem) {
+    const r = await testProvider({ key_id: k.id, vendor_id: k.vendor_id });
+    if (r.success && r.data?.healthy) {
+      showToast(
+        'success',
+        $_('vendor_keys.test_ok', {
+          values: { ms: r.data.latency_ms, text: (r.data.translated_text || '').slice(0, 40) },
+        })
+      );
+    } else {
+      showToast(
+        'error',
+        $_('vendor_keys.test_failed'),
+        (r as any).error?.message || (r as any).error?.hint
+      );
+    }
+  }
+
   onMount(() => {
     loadKeys();
   });
@@ -179,7 +249,7 @@
       {#if keysLoading}
         <tr><td colspan="9" class="px-4 py-8 text-center text-gray-400">{$_('common.loading')}</td></tr>
       {:else if vendorKeys.length === 0}
-        <tr><td colspan="9" class="px-4 py-8 text-center text-gray-400">{$_('vendor_keys.no_keys')}</td></tr>
+        <tr><td colspan="9" class="px-4 py-8 text-center text-gray-400" data-testid="apikeys-keys-empty">{$_('vendor_keys.no_keys')}</td></tr>
       {:else}
         {#each vendorKeys as k}
           <tr class="border-t border-gray-50 hover:bg-gray-50/50">
@@ -208,7 +278,14 @@
                 {k.enabled ? $_('common.enabled') : $_('common.disabled')}
               </span>
             </td>
-            <td class="px-4 py-3 text-right">
+            <td class="px-4 py-3 text-right whitespace-nowrap">
+              <button
+                type="button"
+                data-testid={`vendor-key-test-${k.id}`}
+                onclick={() => testStoredKey(k)}
+                class="text-xs text-indigo-600 hover:text-indigo-800 mr-2">
+                {$_('vendor_keys.test')}
+              </button>
               <button
                 onclick={() => openEditKey(k)}
                 class="text-xs text-gray-500 hover:text-gray-700 mr-2">
@@ -233,7 +310,12 @@
   {keyForm}
   {keyModalFieldId}
   {handleBackdropKeydown}
+  knownVendorIds={[...new Set(vendorKeys.map((k) => k.vendor_id))].sort()}
   onSave={saveKey}
+  onTest={testKeyFromModal}
+  testing={testingKey}
+  {testResult}
   onClose={() => {
     showKeyModal = false;
+    testResult = '';
   }} />

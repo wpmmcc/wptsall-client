@@ -12,7 +12,8 @@
     "types": ["svelte", "vite/client"],
     "paths": {
       "$lib/*": ["./src/lib/*"],
-      "$shared/*": ["../../client-wpplugin/source/frontend/src/lib/*"]
+      "$shared/*": ["../../client-wpplugin/source/frontend/src/lib/*"],
+      "@webui/*": ["../../client-wpplugin/source/frontend/src/*"]
     }
   },
   "include": ["src/**/*"],

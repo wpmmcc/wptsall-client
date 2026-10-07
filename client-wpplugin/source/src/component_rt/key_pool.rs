@@ -11,6 +11,26 @@ type KeyPoolBaseTuple = (String, KeyAuthValues, usize, u32);
 type KeyPoolExtTuple = (String, KeyAuthValues, usize, u32, usize, f64);
 type KeyPoolExtRpsTuple = (String, KeyAuthValues, usize, u32, usize, f64, f64);
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct KeyPoolSnapshot {
+    keys: Vec<KeySnapshot>,
+    strategy: KeySelectionStrategy,
+    min_interval_ms: u64,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeySnapshot {
+    id: String,
+    auth: KeyAuthValues,
+    max_concurrent: usize,
+    weight: u32,
+    max_input_chars: usize,
+    max_file_size_mb: f64,
+    min_interval_ms: u64,
+}
+
 #[derive(Debug)]
 pub struct KeyPool {
     keys: Vec<KeyEntry>,
@@ -73,6 +93,68 @@ fn min_interval_ms_from_rps(rps: f64) -> u64 {
 
 #[allow(dead_code)]
 impl KeyPool {
+    pub(crate) fn frozen_snapshot(&self) -> anyhow::Result<KeyPoolSnapshot> {
+        let mut saved = self.snapshot();
+        for key in &mut saved.keys {
+            for value in key.auth.values_mut() {
+                *value = crate::component_rt::runner::resolve_credential_reference(value)?;
+                anyhow::ensure!(
+                    !value.starts_with("env://") && !value.starts_with("file://"),
+                    "frozen credential is ambiguous; retained"
+                );
+            }
+        }
+        Ok(saved)
+    }
+
+    pub(crate) fn snapshot(&self) -> KeyPoolSnapshot {
+        KeyPoolSnapshot {
+            keys: self
+                .keys
+                .iter()
+                .map(|key| KeySnapshot {
+                    id: key.key_id.clone(),
+                    auth: key.auth_values.clone(),
+                    max_concurrent: key.max_concurrent,
+                    weight: key.weight,
+                    max_input_chars: key.max_input_chars,
+                    max_file_size_mb: key.max_file_size_mb,
+                    min_interval_ms: key.min_interval_ms,
+                })
+                .collect(),
+            strategy: self.strategy.clone(),
+            min_interval_ms: self.min_interval_ms,
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: KeyPoolSnapshot) -> Self {
+        let registry = GlobalKeyRegistry::process();
+        let mut pool = Self::new_ext_internal(
+            snapshot
+                .keys
+                .iter()
+                .map(|key| {
+                    (
+                        key.id.clone(),
+                        key.auth.clone(),
+                        key.max_concurrent,
+                        key.weight,
+                        key.max_input_chars,
+                        key.max_file_size_mb,
+                        0.0,
+                    )
+                })
+                .collect(),
+            snapshot.strategy,
+            snapshot.min_interval_ms,
+            Some(registry),
+        );
+        for (entry, saved) in pool.keys.iter_mut().zip(snapshot.keys) {
+            entry.min_interval_ms = saved.min_interval_ms;
+        }
+        pool
+    }
+
     /// Create a pool from `(key_id, auth_values, max_concurrent, weight)` tuples.
     pub fn new(keys: Vec<KeyPoolBaseTuple>, strategy: KeySelectionStrategy) -> Self {
         let keys_ext: Vec<_> = keys
@@ -152,8 +234,9 @@ impl KeyPool {
         min_interval_ms: u64,
         registry: Option<&GlobalKeyRegistry>,
     ) -> Self {
-        let notify = Arc::new(Notify::new());
-        let key_count = keys.len();
+        let notify = registry
+            .map(GlobalKeyRegistry::notify)
+            .unwrap_or_else(|| Arc::new(Notify::new()));
         let entries: Vec<KeyEntry> = keys
             .into_iter()
             .map(
@@ -183,7 +266,14 @@ impl KeyPool {
             .collect();
         // Initialize last_request_at to a past time so first request is not throttled
         let past = std::time::Instant::now() - std::time::Duration::from_secs(60);
-        let last_request_at = (0..key_count).map(|_| Arc::new(Mutex::new(past))).collect();
+        let last_request_at = entries
+            .iter()
+            .map(|entry| {
+                registry
+                    .map(|registry| registry.rate_clock(&entry.key_id))
+                    .unwrap_or_else(|| Arc::new(Mutex::new(past)))
+            })
+            .collect();
         Self {
             keys: entries,
             strategy,
@@ -224,6 +314,12 @@ impl KeyPool {
         self.keys.iter().any(|k| k.max_file_size_mb > 0.0)
     }
 
+    pub(crate) fn source_byte_budget(&self) -> anyhow::Result<u64> {
+        crate::component_rt::file_limits::pool_source_budget(
+            self.keys.iter().map(|key| key.max_file_size_mb),
+        )
+    }
+
     /// Returns true if at least one key can handle the given input size and file size.
     pub fn has_eligible_keys(&self, input_len: usize, file_size_mb: f64) -> bool {
         self.keys.iter().any(|k| {
@@ -240,13 +336,16 @@ impl KeyPool {
         }
 
         loop {
+            let released = self.notify.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             if let Some((idx, guard)) = self.try_select_with_index() {
                 // Enforce per-key/per-pool minimum interval between requests.
                 self.enforce_min_interval_for_index(idx).await;
                 return Ok(guard);
             }
             // All keys are at capacity, wait for one to be released
-            self.notify.notified().await;
+            released.await;
         }
     }
 
@@ -268,13 +367,16 @@ impl KeyPool {
             ));
         }
         loop {
+            let released = self.notify.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             if let Some((idx, guard)) = self.try_select_filtered_with_index(input_len, file_size_mb)
             {
                 self.enforce_min_interval_for_index(idx).await;
                 return Ok(guard);
             }
             // All eligible keys are at capacity, wait for one to be released
-            self.notify.notified().await;
+            released.await;
         }
     }
 
@@ -317,15 +419,15 @@ impl KeyPool {
 
     fn try_select_weighted_with_index(&self) -> Option<(usize, KeyGuard)> {
         use rand::Rng;
-        let total_weight: u32 = self.keys.iter().map(|k| k.weight).sum();
+        let total_weight: u128 = self.keys.iter().map(|k| u128::from(k.weight)).sum();
         if total_weight == 0 {
             return self.try_select_round_robin_with_index();
         }
         let mut rng = rand::thread_rng();
         let target = rng.gen_range(0..total_weight);
-        let mut cumulative = 0u32;
+        let mut cumulative = 0u128;
         for (idx, key) in self.keys.iter().enumerate() {
-            cumulative += key.weight;
+            cumulative += u128::from(key.weight);
             if target < cumulative {
                 if let Some(guard) = self.try_acquire(idx) {
                     return Some((idx, guard));
@@ -444,15 +546,15 @@ impl KeyPool {
         file_size_mb: f64,
     ) -> Option<(usize, KeyGuard)> {
         use rand::Rng;
-        let total_weight: u32 = self.keys.iter().map(|k| k.weight).sum();
+        let total_weight: u128 = self.keys.iter().map(|k| u128::from(k.weight)).sum();
         if total_weight == 0 {
             return self.try_select_round_robin_filtered(input_len, file_size_mb);
         }
         let mut rng = rand::thread_rng();
         let target = rng.gen_range(0..total_weight);
-        let mut cumulative = 0u32;
+        let mut cumulative = 0u128;
         for (idx, key) in self.keys.iter().enumerate() {
-            cumulative += key.weight;
+            cumulative += u128::from(key.weight);
             if target < cumulative {
                 if let Some(guard) = self.try_acquire_with_limits(idx, input_len, file_size_mb) {
                     return Some((idx, guard));
@@ -466,300 +568,5 @@ impl KeyPool {
             }
         }
         None
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_key(
-        id: &str,
-        max: usize,
-        weight: u32,
-    ) -> (String, HashMap<String, String>, usize, u32) {
-        let mut auth = HashMap::new();
-        auth.insert("api_key".to_string(), format!("key-{}", id));
-        (id.to_string(), auth, max, weight)
-    }
-
-    #[test]
-    fn key_pool_empty_is_empty() {
-        let pool = KeyPool::new(vec![], KeySelectionStrategy::RoundRobin);
-        assert!(pool.is_empty());
-    }
-
-    #[test]
-    fn key_pool_not_empty() {
-        let pool = KeyPool::new(vec![make_key("a", 5, 1)], KeySelectionStrategy::RoundRobin);
-        assert!(!pool.is_empty());
-    }
-
-    #[tokio::test]
-    async fn round_robin_selects_in_order() {
-        let pool = KeyPool::new(
-            vec![
-                make_key("a", 10, 1),
-                make_key("b", 10, 1),
-                make_key("c", 10, 1),
-            ],
-            KeySelectionStrategy::RoundRobin,
-        );
-        let g1 = pool.select_key().await.unwrap();
-        let g2 = pool.select_key().await.unwrap();
-        let g3 = pool.select_key().await.unwrap();
-        // Round robin should cycle through keys
-        assert_ne!(g1.key_id, g2.key_id);
-        assert_ne!(g2.key_id, g3.key_id);
-        // After all three are different, the 4th should wrap
-        let g4 = pool.select_key().await.unwrap();
-        assert_eq!(g1.key_id, g4.key_id);
-    }
-
-    #[tokio::test]
-    async fn key_guard_drop_releases_slot() {
-        let pool = KeyPool::new(vec![make_key("a", 1, 1)], KeySelectionStrategy::RoundRobin);
-        {
-            let _guard = pool.select_key().await.unwrap();
-            // While guard is held, try_select should fail
-            assert!(pool.try_select().is_none());
-        }
-        // After guard is dropped, should be available
-        assert!(pool.try_select().is_some());
-    }
-
-    #[tokio::test]
-    async fn random_strategy_works() {
-        let pool = KeyPool::new(
-            vec![make_key("a", 10, 1), make_key("b", 10, 1)],
-            KeySelectionStrategy::Random,
-        );
-        let guard = pool.select_key().await.unwrap();
-        assert!(guard.key_id == "a" || guard.key_id == "b");
-    }
-
-    #[tokio::test]
-    async fn weighted_strategy_works() {
-        let pool = KeyPool::new(
-            vec![make_key("a", 10, 100), make_key("b", 10, 1)],
-            KeySelectionStrategy::Weighted,
-        );
-        // With weight 100 vs 1, "a" should be selected most of the time
-        let mut a_count = 0;
-        for _ in 0..20 {
-            let guard = pool.select_key().await.unwrap();
-            if guard.key_id == "a" {
-                a_count += 1;
-            }
-        }
-        assert!(
-            a_count > 10,
-            "weighted key 'a' should be selected most often, got {}",
-            a_count
-        );
-    }
-
-    #[tokio::test]
-    async fn max_file_size_mb_propagated_to_guard() {
-        let mut auth = HashMap::new();
-        auth.insert("api_key".to_string(), "sk-test".to_string());
-        let pool = KeyPool::new_with_ext(
-            vec![("key-a".to_string(), auth, 5, 1, 0usize, 25.5f64)],
-            KeySelectionStrategy::RoundRobin,
-        );
-        let guard = pool.select_key().await.unwrap();
-        assert_eq!(guard.max_file_size_mb, 25.5);
-    }
-
-    #[tokio::test]
-    async fn zero_max_file_size_mb_on_legacy_new() {
-        // KeyPool::new (4-tuple) should default max_file_size_mb to 0.0
-        let pool = KeyPool::new(vec![make_key("a", 5, 1)], KeySelectionStrategy::RoundRobin);
-        let guard = pool.select_key().await.unwrap();
-        assert_eq!(guard.max_file_size_mb, 0.0);
-    }
-
-    fn make_key_ext(
-        id: &str,
-        max: usize,
-        weight: u32,
-        max_input_chars: usize,
-        max_file_size_mb: f64,
-    ) -> (String, HashMap<String, String>, usize, u32, usize, f64) {
-        let mut auth = HashMap::new();
-        auth.insert("api_key".to_string(), format!("key-{}", id));
-        (
-            id.to_string(),
-            auth,
-            max,
-            weight,
-            max_input_chars,
-            max_file_size_mb,
-        )
-    }
-
-    fn make_key_ext_with_rps(
-        id: &str,
-        max: usize,
-        weight: u32,
-        max_input_chars: usize,
-        max_file_size_mb: f64,
-        requests_per_second: f64,
-    ) -> (String, HashMap<String, String>, usize, u32, usize, f64, f64) {
-        let mut auth = HashMap::new();
-        auth.insert("api_key".to_string(), format!("key-{}", id));
-        (
-            id.to_string(),
-            auth,
-            max,
-            weight,
-            max_input_chars,
-            max_file_size_mb,
-            requests_per_second,
-        )
-    }
-
-    #[test]
-    fn test_has_eligible_keys_by_input_len() {
-        let pool = KeyPool::new_with_ext(
-            vec![make_key_ext("a", 5, 1, 10, 0.0)],
-            KeySelectionStrategy::RoundRobin,
-        );
-        assert!(
-            pool.has_eligible_keys(5, 0.0),
-            "input_len=5 should pass max_input_chars=10"
-        );
-        assert!(
-            !pool.has_eligible_keys(20, 0.0),
-            "input_len=20 should fail max_input_chars=10"
-        );
-    }
-
-    #[test]
-    fn test_has_eligible_keys_by_file_size() {
-        let pool = KeyPool::new_with_ext(
-            vec![make_key_ext("a", 5, 1, 0, 5.0)],
-            KeySelectionStrategy::RoundRobin,
-        );
-        assert!(
-            pool.has_eligible_keys(0, 2.0),
-            "file_size=2.0 should pass max_file_size_mb=5.0"
-        );
-        assert!(
-            !pool.has_eligible_keys(0, 10.0),
-            "file_size=10.0 should fail max_file_size_mb=5.0"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_select_with_limits_filters_by_input_len() {
-        let pool = KeyPool::new_with_ext(
-            vec![
-                make_key_ext("small", 5, 1, 5, 0.0),
-                make_key_ext("large", 5, 1, 0, 0.0), // 0 = unlimited
-            ],
-            KeySelectionStrategy::RoundRobin,
-        );
-        // input_len=100 should skip "small" (max_input_chars=5) and return "large"
-        let guard = pool.select_key_with_limits(100, 0.0).await.unwrap();
-        assert_eq!(guard.key_id, "large");
-    }
-
-    #[tokio::test]
-    async fn test_select_with_limits_no_eligible_fails_fast() {
-        let pool = KeyPool::new_with_ext(
-            vec![make_key_ext("small", 5, 1, 5, 0.0)],
-            KeySelectionStrategy::RoundRobin,
-        );
-        // input_len=100 exceeds max_input_chars=5, should fail immediately (not hang)
-        let result = pool.select_key_with_limits(100, 0.0).await;
-        assert!(result.is_err(), "should fail when no eligible key exists");
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("no eligible key"),
-            "expected 'no eligible key' error, got: {}",
-            err
-        );
-    }
-
-    #[tokio::test]
-    async fn test_select_with_limits_file_size_filter() {
-        let pool = KeyPool::new_with_ext(
-            vec![
-                make_key_ext("small", 5, 1, 0, 1.0),
-                make_key_ext("big", 5, 1, 0, 0.0), // 0.0 = unlimited
-            ],
-            KeySelectionStrategy::RoundRobin,
-        );
-        // file_size=5.0 MB should skip "small" (max_file_size_mb=1.0) and return "big"
-        let guard = pool.select_key_with_limits(0, 5.0).await.unwrap();
-        assert_eq!(guard.key_id, "big");
-    }
-
-    /// Verifies that dropping a guard via `notify_waiters()` unblocks all waiting tasks,
-    /// not just one. With `notify_one()` the second and third waiters could hang forever.
-    #[tokio::test]
-    async fn test_notify_waiters_unblocks_all() {
-        use std::sync::Arc;
-        use tokio::time::{timeout, Duration};
-
-        // Pool with a single key that allows only 1 concurrent acquisition.
-        let pool = Arc::new(KeyPool::new(
-            vec![make_key("only", 1, 1)],
-            KeySelectionStrategy::RoundRobin,
-        ));
-
-        // Acquire the sole slot so all spawned tasks will have to wait.
-        let first_guard = pool.select_key().await.unwrap();
-
-        // Spawn 3 tasks that each try to acquire a guard. They will all block because
-        // the key is already held by `first_guard`.
-        let mut handles = Vec::new();
-        for _ in 0..3 {
-            let pool_clone = Arc::clone(&pool);
-            handles.push(tokio::spawn(async move {
-                pool_clone.select_key().await.unwrap();
-                // Guard is acquired; drop it immediately.
-            }));
-        }
-
-        // Give the spawned tasks a moment to reach the `.notified().await` wait point.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-
-        // Dropping first_guard calls notify_waiters(), which wakes all 3 waiters at once.
-        drop(first_guard);
-
-        // All 3 tasks must complete within a generous timeout. If notify_one() were used
-        // instead, only one waiter would be woken per drop and the other two would hang.
-        for handle in handles {
-            timeout(Duration::from_secs(2), handle)
-                .await
-                .expect("task timed out — notify_waiters() did not wake all waiters")
-                .expect("task panicked");
-        }
-    }
-
-    #[tokio::test]
-    async fn key_specific_rps_rate_limit_is_enforced() {
-        use tokio::time::{Duration, Instant};
-
-        let pool = KeyPool::new_with_ext_with_rps(
-            vec![make_key_ext_with_rps("only", 1, 1, 0, 0.0, 4.0)], // 4 RPS -> 250ms
-            KeySelectionStrategy::RoundRobin,
-        );
-
-        let first = pool.select_key().await.unwrap();
-        drop(first);
-
-        let start = Instant::now();
-        let second = pool.select_key().await.unwrap();
-        let waited = start.elapsed();
-        drop(second);
-
-        assert!(
-            waited >= Duration::from_millis(200),
-            "expected key-level rate limit wait >=200ms, got {:?}",
-            waited
-        );
     }
 }

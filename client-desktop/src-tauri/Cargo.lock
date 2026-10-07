@@ -8423,6 +8423,7 @@ dependencies = [
  "hkdf",
  "hmac 0.12.1",
  "jsonwebtoken",
+ "libc",
  "md-5 0.10.6",
  "md5",
  "open",

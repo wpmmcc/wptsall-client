@@ -2,9 +2,11 @@
   import { onMount } from 'svelte';
   import {
     deleteRuleBinding,
+    deleteTaskTypeBinding,
     getRuleBindingDiscovery,
     listAllLocalComponents,
     upsertRuleBinding,
+    upsertTaskTypeBinding,
   } from '../api/components';
   import { status, fetchStatus } from '../stores/status';
   import { showToast } from '../stores/toast';
@@ -33,6 +35,7 @@
     RuleBinding,
     RuleSlotOption,
     ServerComp,
+    TaskTypeComponentBinding,
   } from './types';
 
   const RULE_SLOT_OPTIONS: RuleSlotOption[] = [
@@ -64,6 +67,22 @@
     rule: 'task_routing.scope_example.rule',
   };
 
+  // Task-type component bindings: business_line × task_type → component.
+  // The worker's component selector resolves these before per-rule slots
+  // (e.g. config_i18n:text is what content translation tasks query).
+  const TASK_TYPE_OPTIONS = ['text', 'image', 'video', 'audio', 'document', 'mixed'] as const;
+  const BUSINESS_LINE_OPTIONS = [
+    'post_content',
+    'taxonomy_content',
+    'plugin_i18n',
+    'config_i18n',
+    'theme_i18n',
+    'site_strings',
+    'menu_strings',
+    'widget_strings',
+    'custom_model',
+  ] as const;
+
   const SLOT_USAGE_HINTS: Record<string, string> = {
     plain_text: 'task_routing.slot_usage.plain_text',
     rich_html: 'task_routing.slot_usage.rich_html',
@@ -89,6 +108,14 @@
   });
 
   let ruleBindings = $derived(($status?.rule_component_bindings ?? []) as RuleBinding[]);
+  let taskTypeBindings = $derived(
+    (($status?.task_type_component_bindings ?? []) as TaskTypeComponentBinding[])
+  );
+  let taskTypeForm = $state({
+    business_line: 'config_i18n',
+    task_type: 'text',
+    component_id: '',
+  });
   let ruleScopePlaceholder = $derived(getRuleScopePlaceholder(ruleForm.scope));
   let selectedSlotHint = $derived(
     SLOT_USAGE_HINTS[ruleForm.slot_key] ?? 'task_routing.slot_usage.default'
@@ -174,11 +201,229 @@
     }
   }
 
+  async function saveTaskTypeBind() {
+    if (!taskTypeForm.component_id.trim()) {
+      showToast('error', $_('task_routing.fill_task_type_component'));
+      return;
+    }
+    const r = await upsertTaskTypeBinding(
+      taskTypeForm.task_type,
+      taskTypeForm.component_id.trim(),
+      taskTypeForm.business_line,
+    );
+    if (r.success) {
+      showToast('success', $_('task_routing.task_type_binding_saved'));
+      await fetchStatus();
+    } else {
+      showToast('error', $_('common.save_failed'), (r as any).error?.message);
+    }
+  }
+
+  async function deleteTaskTypeBind(item: TaskTypeComponentBinding) {
+    const r = await deleteTaskTypeBinding(item.task_type, item.business_line || undefined);
+    if (r.success) {
+      showToast('success', $_('task_routing.task_type_binding_deleted'));
+      await fetchStatus();
+    }
+  }
+
+  interface FieldMatrixRow {
+    id: string;
+    fieldKey: string;
+    titleKey: string;
+    descKey: string;
+    slotKey: string;
+    requiredKind: string;
+  }
+
+  const FIELD_MATRIX_ROWS: FieldMatrixRow[] = [
+    {
+      id: 'post_title',
+      fieldKey: 'title',
+      titleKey: 'task_routing.matrix_field_title',
+      descKey: 'task_routing.matrix_field_title_desc',
+      slotKey: 'plain_text',
+      requiredKind: 'text',
+    },
+    {
+      id: 'post_content',
+      fieldKey: 'content',
+      titleKey: 'task_routing.matrix_field_content',
+      descKey: 'task_routing.matrix_field_content_desc',
+      slotKey: 'rich_html',
+      requiredKind: 'text',
+    },
+    {
+      id: 'post_excerpt',
+      fieldKey: 'excerpt',
+      titleKey: 'task_routing.matrix_field_excerpt',
+      descKey: 'task_routing.matrix_field_excerpt_desc',
+      slotKey: 'plain_text',
+      requiredKind: 'text',
+    },
+    {
+      id: 'gutenberg_blocks',
+      fieldKey: 'blocks',
+      titleKey: 'task_routing.matrix_field_blocks',
+      descKey: 'task_routing.matrix_field_blocks_desc',
+      slotKey: 'json_structured',
+      requiredKind: 'text',
+    },
+    {
+      id: 'media_assets',
+      fieldKey: 'media',
+      titleKey: 'task_routing.matrix_field_media',
+      descKey: 'task_routing.matrix_field_media_desc',
+      slotKey: 'media_ref:image',
+      requiredKind: 'image',
+    },
+  ];
+
+  function getGlobalBoundComponent(slotKey: string): string | null {
+    const found = ruleBindings.find((b) => b.scope === 'global' && b.slot_key === slotKey);
+    return found?.component_id || null;
+  }
+
+  let matrixSelections = $state<Record<string, string>>({});
+
+  $effect(() => {
+    const next: Record<string, string> = {};
+    for (const row of FIELD_MATRIX_ROWS) {
+      next[row.slotKey] = getGlobalBoundComponent(row.slotKey) || '';
+    }
+    matrixSelections = next;
+  });
+
+  function getComponentsForSlot(slotKey: string): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    const candidates = [
+      ...localComps.map((c) => ({ id: c.id, kind: c.kind })),
+      ...((($status?.components ?? []) as ServerComp[]).map((c) => ({ id: c.id, kind: c.kind }))),
+    ];
+    for (const c of candidates) {
+      if (!c.id || seen.has(c.id)) continue;
+      if (!slotSupportsKind(slotKey, c.kind)) continue;
+      seen.add(c.id);
+      out.push(c.id);
+    }
+    return out.sort();
+  }
+
+  async function applyMatrixRow(slotKey: string, componentId: string) {
+    if (!componentId) return;
+    const r = await upsertRuleBinding('global', slotKey, componentId);
+    if (r.success) {
+      showToast('success', $_('task_routing.matrix_save_success'));
+      await fetchStatus();
+    } else {
+      showToast('error', $_('common.save_failed'), (r as any).error?.message);
+    }
+  }
+
+  async function clearMatrixRow(slotKey: string) {
+    const r = await deleteRuleBinding('global', slotKey);
+    if (r.success) {
+      showToast('success', $_('task_routing.matrix_clear_success'));
+      await fetchStatus();
+    } else {
+      showToast('error', $_('common.operation_failed'), (r as any).error?.message);
+    }
+  }
+
   onMount(() => {
     loadLocalComps();
     loadRuleDiscovery();
   });
 </script>
+
+<!-- WordPress Field-to-Provider Routing Matrix -->
+<div class="bg-white border border-gray-200 rounded-xl overflow-hidden mb-4 shadow-xs">
+  <div class="px-5 py-4 border-b border-gray-100 bg-gradient-to-r from-blue-50/50 to-indigo-50/30">
+    <h3 class="font-semibold text-gray-900 text-sm flex items-center gap-2">
+      <span class="inline-block w-2 h-2 rounded-full bg-blue-600"></span>
+      {$_('task_routing.matrix_title')}
+    </h3>
+    <p class="text-xs text-gray-500 mt-1">
+      {$_('task_routing.matrix_desc')}
+    </p>
+  </div>
+
+  <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="text-xs text-gray-500 bg-gray-50/75 border-b border-gray-200">
+          <th class="px-4 py-3 text-left font-medium">{$_('task_routing.matrix_field')}</th>
+          <th class="px-4 py-3 text-left font-medium">{$_('task_routing.matrix_slot')}</th>
+          <th class="px-4 py-3 text-left font-medium">{$_('task_routing.matrix_current')}</th>
+          <th class="px-4 py-3 text-left font-medium">{$_('task_routing.matrix_select')}</th>
+          <th class="px-4 py-3 text-right font-medium">{$_('task_routing.th_actions')}</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-100">
+        {#each FIELD_MATRIX_ROWS as row (row.id)}
+          {@const boundComp = getGlobalBoundComponent(row.slotKey)}
+          {@const availableComps = getComponentsForSlot(row.slotKey)}
+          <tr class="hover:bg-gray-50/60 transition-colors">
+            <td class="px-4 py-3.5">
+              <div class="font-medium text-gray-900 text-xs sm:text-sm">{$_(row.titleKey)}</div>
+              <div class="text-xs text-gray-400 mt-0.5">{$_(row.descKey)}</div>
+            </td>
+            <td class="px-4 py-3.5 whitespace-nowrap">
+              <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium bg-slate-100 text-slate-700">
+                {row.slotKey}
+              </span>
+            </td>
+            <td class="px-4 py-3.5 whitespace-nowrap">
+              {#if boundComp}
+                <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                  <span class="font-mono">{boundComp}</span>
+                </span>
+              {:else}
+                <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs text-gray-400 bg-gray-100">
+                  {$_('task_routing.matrix_unassigned')}
+                </span>
+              {/if}
+            </td>
+            <td class="px-4 py-3.5">
+              <select
+                bind:value={matrixSelections[row.slotKey]}
+                class="w-full max-w-xs text-xs border border-gray-200 rounded-lg px-2.5 py-1.5 bg-white focus:ring-1 focus:ring-blue-500 outline-none"
+              >
+                <option value="">{$_('task_routing.matrix_select_placeholder')}</option>
+                {#each availableComps as cid}
+                  <option value={cid}>{cid}</option>
+                {/each}
+              </select>
+            </td>
+            <td class="px-4 py-3.5 text-right whitespace-nowrap">
+              <div class="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onclick={() => applyMatrixRow(row.slotKey, matrixSelections[row.slotKey])}
+                  disabled={!matrixSelections[row.slotKey] || matrixSelections[row.slotKey] === boundComp}
+                  class="px-2.5 py-1 text-xs font-medium bg-blue-600 hover:bg-blue-700 disabled:bg-gray-100 disabled:text-gray-400 text-white rounded-lg transition-colors"
+                >
+                  {$_('task_routing.matrix_apply')}
+                </button>
+                {#if boundComp}
+                  <button
+                    type="button"
+                    onclick={() => clearMatrixRow(row.slotKey)}
+                    class="px-2 py-1 text-xs text-rose-600 hover:text-rose-800 hover:bg-rose-50 rounded-lg transition-colors"
+                  >
+                    {$_('task_routing.matrix_clear')}
+                  </button>
+                {/if}
+              </div>
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  </div>
+</div>
 
 <div class="bg-white border border-gray-200 rounded-xl overflow-hidden mb-4">
   <div class="px-5 py-3 border-b border-gray-100">
@@ -429,6 +674,107 @@
         {/each}
       {/if}
     </div>
+  </div>
+</div>
+
+<div class="bg-white border border-gray-200 rounded-xl overflow-hidden mb-4">
+  <div class="px-5 py-3 border-b border-gray-100">
+    <h3 class="font-medium text-gray-900 text-sm">{$_('task_routing.task_type_binding_title')}</h3>
+    <p class="text-xs text-gray-500 mt-1">
+      {$_('task_routing.task_type_binding_desc')}
+    </p>
+  </div>
+  <div class="p-4 flex flex-wrap gap-3 items-end">
+    <div>
+      <label for="task-type-bind-business-line" class="block text-xs text-gray-500 mb-1">{$_('task_routing.business_line')}</label>
+      <select
+        id="task-type-bind-business-line"
+        data-testid="task-type-bind-business-line"
+        bind:value={taskTypeForm.business_line}
+        class="border border-gray-200 rounded-lg px-3 py-2 text-sm w-52">
+        {#each BUSINESS_LINE_OPTIONS as line}
+          <option value={line}>{formatBusinessLineLabel(line)} · {line}</option>
+        {/each}
+      </select>
+    </div>
+    <div>
+      <label for="task-type-bind-task-type" class="block text-xs text-gray-500 mb-1">{$_('task_routing.task_type')}</label>
+      <select
+        id="task-type-bind-task-type"
+        data-testid="task-type-bind-task-type"
+        bind:value={taskTypeForm.task_type}
+        class="border border-gray-200 rounded-lg px-3 py-2 text-sm w-32">
+        {#each TASK_TYPE_OPTIONS as tt}
+          <option value={tt}>{tt}</option>
+        {/each}
+      </select>
+    </div>
+    <div>
+      <label for="task-type-bind-component-id" class="block text-xs text-gray-500 mb-1">{$_('task_routing.task_type_component_id')}</label>
+      <input
+        id="task-type-bind-component-id"
+        data-testid="task-type-bind-component-id"
+        bind:value={taskTypeForm.component_id}
+        placeholder={$_('task_routing.placeholder_component_id')}
+        class="border border-gray-200 rounded-lg px-3 py-2 text-sm w-56" />
+    </div>
+    <button
+      onclick={saveTaskTypeBind}
+      data-testid="task-type-bind-save"
+      class="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700">
+      {$_('task_routing.save_task_type_binding')}
+    </button>
+  </div>
+  <div class="px-4 pb-4">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="text-xs text-gray-500 bg-gray-50">
+          <th class="px-4 py-2.5 text-left font-medium">business_line</th>
+          <th class="px-4 py-2.5 text-left font-medium">task_type</th>
+          <th class="px-4 py-2.5 text-left font-medium">component_id</th>
+          <th class="px-4 py-2.5 text-right font-medium">{$_('task_routing.th_actions')}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {#if taskTypeBindings.length === 0}
+          <tr>
+            <td colspan="4" class="px-4 py-8 text-center text-gray-400">{$_('task_routing.no_task_type_bindings')}</td>
+          </tr>
+        {:else}
+          {#each taskTypeBindings as b}
+            <tr class="border-t border-gray-50 hover:bg-gray-50/50">
+              <td class="px-4 py-3 text-xs">
+                {#if b.business_line}
+                  <span class="font-mono text-blue-600">{b.business_line}</span>
+                  <span class="ml-1 text-gray-500">{formatBusinessLineLabel(b.business_line)}</span>
+                {:else}
+                  <span class="text-gray-400">{$_('task_routing.global_scope')}</span>
+                {/if}
+              </td>
+              <td class="px-4 py-3 text-xs font-mono">{b.task_type}</td>
+              <td class="px-4 py-3 text-xs font-mono text-gray-600">{b.component_id}</td>
+              <td class="px-4 py-3 text-right">
+                <button
+                  onclick={() => {
+                    taskTypeForm.business_line = b.business_line || 'config_i18n';
+                    taskTypeForm.task_type = b.task_type;
+                    taskTypeForm.component_id = b.component_id;
+                  }}
+                  class="text-xs text-gray-500 hover:text-gray-700 mr-2">
+                  {$_('task_routing.fill')}
+                </button>
+                <button
+                  onclick={() => deleteTaskTypeBind(b)}
+                  data-testid="task-type-bind-delete"
+                  class="text-xs text-red-500 hover:text-red-600">
+                  {$_('common.delete')}
+                </button>
+              </td>
+            </tr>
+          {/each}
+        {/if}
+      </tbody>
+    </table>
   </div>
 </div>
 

@@ -4,7 +4,28 @@ use reqwest::Client;
 use serde_json::Value;
 use url::Url;
 
-fn validate_translation_callback_ack(value: Value) -> anyhow::Result<Value> {
+
+
+/// AF-04 (opus5): the WP client API is secret-scoped — every client route
+/// lives under `/{secret}/client/...`, so the resolved URL must carry the
+/// `/client` segment. The submit paths used to accept a dead `route_secret`
+/// parameter and silently relied on that URL shape; a misconstructed base
+/// produced an obscure 404. The parameter is gone and the URL shape is now
+/// an explicit precondition: a base without the segment fails fast with a
+/// clear error instead of a silent 404.
+fn ensure_secret_client_base(wp_base: &str, endpoint: &str) -> anyhow::Result<()> {
+    if !wp_base.trim_end_matches('/').contains("/client") {
+        return Err(anyhow!(
+            "route secret missing: WP base `{}` carries no `/{{secret}}/client` segment — \
+             configure the binding route_secret before submitting {}",
+            wp_base,
+            endpoint
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_translation_callback_ack(value: Value) -> anyhow::Result<Value> {
     let success = value
         .get("success")
         .and_then(|v| v.as_bool())
@@ -30,52 +51,75 @@ fn validate_translation_callback_ack(value: Value) -> anyhow::Result<Value> {
             "translation callback ack queued=true but sync_task_id missing"
         ));
     }
-    if value.get("protocol").is_none() {
-        return Err(anyhow!("translation callback ack missing protocol"));
+    if value.get("protocol").and_then(Value::as_str) != Some("v2") {
+        return Err(anyhow!("translation callback ack missing protocol=v2"));
+    }
+    let result_status = value.get("result_status").and_then(Value::as_str);
+    if !matches!(
+        result_status,
+        Some("synced" | "completed" | "partial" | "cancelled")
+    ) {
+        return Err(anyhow!(
+            "translation callback ack missing durable terminal result_status; saved result retained"
+        ));
+    }
+    if let Some(sync_result) = value.get("sync_result") {
+        if sync_result.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(anyhow!(
+                "translation callback ack contradicts write-back success; saved result retained"
+            ));
+        }
+    }
+    for (flag, status) in [("partial", "partial"), ("skipped", "cancelled")] {
+        for evidence in [
+            value.get(flag),
+            value.get("sync_result").and_then(|result| result.get(flag)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if evidence.as_bool() != Some(result_status == Some(status)) {
+                return Err(anyhow!(
+                    "translation callback ack has inconsistent terminal flags"
+                ));
+            }
+        }
     }
     Ok(value)
 }
 
-fn validate_i18n_callback_ack(value: Value) -> anyhow::Result<Value> {
-    let success = value
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if !success {
-        return Err(anyhow!("i18n callback ack missing success=true"));
-    }
-
-    let queued = value
-        .get("queued")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let sync_task_id = value
-        .get("sync_task_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let result_id = value.get("result_id").and_then(|v| v.as_i64()).unwrap_or(0);
-    if result_id <= 0 {
-        return Err(anyhow!("i18n callback ack missing result_id"));
-    }
-    if queued && sync_task_id <= 0 {
+pub(crate) fn validate_i18n_callback_ack(
+    value: Value,
+    expected_entries: usize,
+) -> anyhow::Result<Value> {
+    let value = validate_translation_callback_ack(value)?;
+    if !matches!(
+        value.get("result_status").and_then(Value::as_str),
+        Some("synced" | "completed")
+    ) || expected_entries == 0
+        || value.get("entries_updated").and_then(Value::as_u64)
+            != u64::try_from(expected_entries).ok()
+        || value.get("entries_rejected").and_then(Value::as_u64) != Some(0)
+    {
         return Err(anyhow!(
-            "i18n callback ack queued=true but sync_task_id missing"
+            "i18n callback ack does not prove the complete original entry batch; saved result retained"
         ));
     }
     Ok(value)
 }
+
+
 use serde_json::json;
 
-use crate::auth::{
-    build_request_id, verify_wp_response_signature_for_plaintext,
-    wp_post_with_transport_and_headers,
-};
-use crate::component_rt::non_text::{
-    upload_file_to_wp as upload_file_chunked_to_wp, ChunkedUploadConfig,
-};
-use crate::config::REQUEST_ID_HEADER;
+use crate::auth::wp_post_with_transport_and_headers;
+use crate::component_rt::non_text::ChunkedUploadConfig;
 use crate::logging::log_event;
 use crate::types::*;
+
+mod upload_receipt;
+pub(crate) use upload_receipt::{
+    upload_pending_media_durable, upload_pending_media_with_optional_db,
+};
 
 fn parse_base64_data_url(data_url: &str) -> Option<(String, Vec<u8>)> {
     let s = data_url.trim();
@@ -195,11 +239,12 @@ pub(crate) async fn send_translation_callback(
     wp_base: &str,
     token: &str,
     worker_id: &str,
+    device_id: &str,
     idempotency_key: &str,
     payload: &crate::types::TranslationCallbackPayload,
-    _route_secret: Option<&str>,
 ) -> anyhow::Result<Value> {
     let callback_url = format!("{}/translation-callback", wp_base.trim_end_matches('/'));
+    ensure_secret_client_base(&callback_url, "translation-callback")?;
     let body = serde_json::to_value(payload)
         .with_context(|| "serialize translation callback payload failed")?;
     let headers: Vec<(&str, &str)> = vec![("Idempotency-Key", idempotency_key)];
@@ -208,6 +253,7 @@ pub(crate) async fn send_translation_callback(
         &callback_url,
         token,
         worker_id,
+        device_id,
         &body,
         &headers,
     )
@@ -231,11 +277,12 @@ pub(crate) async fn send_i18n_translation_callback(
     wp_base: &str,
     token: &str,
     worker_id: &str,
+    device_id: &str,
     idempotency_key: &str,
     payload: &crate::types::I18nCallbackPayload,
-    _route_secret: Option<&str>,
 ) -> anyhow::Result<Value> {
     let callback_url = format!("{}/translation-callback", wp_base.trim_end_matches('/'));
+    ensure_secret_client_base(&callback_url, "i18n translation-callback")?;
     let body =
         serde_json::to_value(payload).with_context(|| "serialize i18n callback payload failed")?;
     let headers: Vec<(&str, &str)> = vec![("Idempotency-Key", idempotency_key)];
@@ -244,6 +291,7 @@ pub(crate) async fn send_i18n_translation_callback(
         &callback_url,
         token,
         worker_id,
+        device_id,
         &body,
         &headers,
     )
@@ -256,24 +304,24 @@ pub(crate) async fn send_i18n_translation_callback(
         )
     })?;
 
-    validate_i18n_callback_ack(ack)
+    validate_i18n_callback_ack(ack, payload.entries.len())
 }
 
 /// Upload a media file binary to WP's media-upload endpoint.
 ///
 /// Returns the attachment_id on success.
 ///
-/// NOTE: Transport encryption (AES-GCM) is intentionally skipped for binary
-/// media uploads. The transport encryption layer wraps JSON payloads, which is
-/// incompatible with raw binary data. In production, HTTPS already encrypts the
-/// binary payload end-to-end. For HTTP (development only), the binary travels
-/// in cleartext — the same as any other media download over HTTP.
+/// Uses the same durable operation and transport policy as chunked uploads.
+/// AES-GCM wraps the original bytes when required, without changing their MIME
+/// type or plaintext signature. Production sites should use HTTPS because
+/// application-layer body encryption does not protect the token headers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn upload_media_to_wp(
     client: &Client,
     wp_base: &str,
     token: &str,
     worker_id: &str,
+    device_id: &str,
     task_id: i64,
     relation_id: u64,
     source_id: u64,
@@ -281,136 +329,26 @@ pub(crate) async fn upload_media_to_wp(
     content_type: &str,
     file_data: Vec<u8>,
     log_file: &str,
-    _route_secret: Option<&str>,
 ) -> anyhow::Result<u64> {
     let upload_url = format!("{}/media-upload", wp_base.trim_end_matches('/'));
-
-    let request_id = build_request_id("media-upload");
-    let is_plain_http = upload_url.trim().to_lowercase().starts_with("http://");
-    let task_id_str = task_id.to_string();
-    let relation_id_str = relation_id.to_string();
-    let source_id_str = source_id.to_string();
-    let signed_headers: Vec<(&str, &str)> = vec![
-        ("X-WPTSALL-Task-ID", task_id_str.as_str()),
-        ("X-WPTSALL-Relation-ID", relation_id_str.as_str()),
-        ("X-WPTSALL-Source-ID", source_id_str.as_str()),
-        ("X-WPTSALL-Filename", filename),
-    ];
-    let (timestamp, sig_nonce, signature) = crate::auth::sign_request_with_headers(
-        "POST",
-        &upload_url,
+    ensure_secret_client_base(&upload_url, "media-upload")?;
+    upload_media_via_best_path(
+        client,
+        wp_base,
         token,
-        &file_data,
-        &signed_headers,
-    );
-    if is_plain_http {
-        let _ = log_event(
-            log_file,
-            "warning",
-            "media.upload_plain_http",
-            json!({
-                "url": upload_url,
-                "reason": "Binary upload over plain HTTP without transport encryption"
-            }),
-        );
-    }
-
-    let request = client
-        .post(&upload_url)
-        .header("X-WPTSALL-Protocol-Version", "2")
-        .header("X-WPTSALL-Client-Token", token)
-        // Bind this authenticated upload to the same stable device identity
-        // as JSON discovery/callback requests.  Without this, a device token
-        // would work for callbacks but fail for media uploads.
-        .header(
-            "X-WPTSALL-Device-Id",
-            crate::config::env_or("WPTSALL_WP_DEVICE_ID", worker_id),
-        )
-        .header("X-WPTSALL-Worker-Id", worker_id)
-        .header("X-Client-Version", env!("CARGO_PKG_VERSION"))
-        .header("X-WPTSALL-Timestamp", timestamp)
-        .header("X-WPTSALL-Signature-Nonce", sig_nonce)
-        .header("X-WPTSALL-Signature", signature)
-        .header("X-WPTSALL-Task-ID", task_id_str)
-        .header("X-WPTSALL-Relation-ID", relation_id_str)
-        .header("X-WPTSALL-Source-ID", source_id_str)
-        .header("X-WPTSALL-Filename", filename)
-        .header("Content-Type", content_type)
-        .header(REQUEST_ID_HEADER, request_id);
-    let request = request.body(file_data);
-
-    let response = request.send().await.with_context(|| {
-        format!(
-            "media upload request failed (task_id={}, source_id={})",
-            task_id, source_id
-        )
-    })?;
-    let status = response.status();
-    let response_sig = response
-        .headers()
-        .get("X-WPTSALL-Response-Signature")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let body_text = response.text().await.with_context(|| {
-        format!(
-            "media upload response read failed (task_id={}, source_id={})",
-            task_id, source_id
-        )
-    })?;
-
-    if !status.is_success() {
-        anyhow::bail!("media upload failed: HTTP {} — {}", status, body_text);
-    }
-
-    verify_wp_response_signature_for_plaintext(
-        token,
-        body_text.as_bytes(),
-        response_sig.as_deref(),
-        &upload_url,
-        true,
-    )
-    .with_context(|| {
-        format!(
-            "media upload response signature verification failed (task_id={}, source_id={})",
-            task_id, source_id
-        )
-    })?;
-
-    #[derive(serde::Deserialize)]
-    struct MediaUploadResponse {
-        success: bool,
-        attachment_id: Option<u64>,
-        #[serde(default)]
-        error: String,
-        #[serde(default)]
-        message: String,
-    }
-
-    let resp: MediaUploadResponse = serde_json::from_str(&body_text)
-        .with_context(|| "failed to parse media upload response")?;
-
-    if !resp.success {
-        anyhow::bail!("media upload rejected: {} — {}", resp.error, resp.message);
-    }
-
-    let attachment_id = resp
-        .attachment_id
-        .ok_or_else(|| anyhow::anyhow!("media upload response missing attachment_id"))?;
-
-    let _ = log_event(
+        worker_id,
+        device_id,
+        task_id,
+        relation_id,
+        source_id,
+        filename,
+        content_type,
+        file_data,
         log_file,
-        "info",
-        "media.upload_ok",
-        json!({
-            "api_base_url": wp_base,
-            "task_id": task_id,
-            "source_id": source_id,
-            "filename": filename,
-            "attachment_id": attachment_id
-        }),
-    );
-
-    Ok(attachment_id)
+        None,
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -419,6 +357,7 @@ async fn upload_media_via_best_path(
     wp_base: &str,
     token: &str,
     worker_id: &str,
+    device_id: &str,
     task_id: i64,
     relation_id: u64,
     source_id: u64,
@@ -427,59 +366,32 @@ async fn upload_media_via_best_path(
     file_data: Vec<u8>,
     log_file: &str,
     route_secret: Option<&str>,
+    scope: Option<&str>,
 ) -> anyhow::Result<u64> {
-    const SINGLE_UPLOAD_LIMIT: usize = 50 * 1024 * 1024;
-    let use_chunked = file_data.len() >= SINGLE_UPLOAD_LIMIT
-        || content_type.starts_with("video/")
-        || content_type.starts_with("audio/")
-        || content_type == "application/pdf"
-        || content_type.starts_with("application/");
-
-    if !use_chunked {
-        return upload_media_to_wp(
-            client,
-            wp_base,
-            token,
-            worker_id,
-            task_id,
-            relation_id,
-            source_id,
-            filename,
-            content_type,
-            file_data,
-            log_file,
-            route_secret,
-        )
-        .await;
-    }
-
     let data_dir = std::env::var("WPTSALL_DATA_DIR")
         .unwrap_or_else(|_| crate::config::DEFAULT_DATA_DIR.to_string());
-    let temp_dir = format!("{}/tmp-media-upload", data_dir);
-    std::fs::create_dir_all(&temp_dir)
-        .with_context(|| format!("create temp media dir failed: {}", temp_dir))?;
-    let temp_path = format!("{}/{}-{}", temp_dir, source_id, filename);
-    std::fs::write(&temp_path, &file_data)
-        .with_context(|| format!("write temp media file failed: {}", temp_path))?;
+    let temp_path = stage_chunk_upload_bytes(&data_dir, source_id, filename, &file_data)?;
 
     let config = ChunkedUploadConfig {
         wp_base: wp_base.to_string(),
         token: token.to_string(),
         route_secret: route_secret.map(|s| s.to_string()),
         worker_id: worker_id.to_string(),
+        device_id: device_id.to_string(),
         chunk_size: 0,
     };
-    let result = upload_file_chunked_to_wp(
+    let result = crate::component_rt::non_text::recovery::upload(
         client,
         &config,
-        &temp_path,
+        temp_path.to_string_lossy().as_ref(),
         filename,
         content_type,
         i64::try_from(source_id).unwrap_or(0),
         task_id,
         i64::try_from(relation_id).unwrap_or(0),
+        scope,
     )
-    .await;
+    .await?;
     let _ = std::fs::remove_file(&temp_path);
 
     if result.success && result.attachment_id > 0 {
@@ -487,6 +399,19 @@ async fn upload_media_via_best_path(
     } else {
         Err(anyhow!("chunked media upload failed: {}", result.error))
     }
+}
+
+fn stage_chunk_upload_bytes(
+    data_dir: &str,
+    _source_id: u64,
+    _filename: &str,
+    bytes: &[u8],
+) -> anyhow::Result<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(data_dir).join("tmp-media-upload");
+    let dir = crate::retained_assets::directory(&dir)?;
+    let path = dir.join(format!("wpa1{}.bin", uuid::Uuid::new_v4().simple()));
+    crate::retained_assets::write_bytes(&path, bytes)?;
+    Ok(path)
 }
 
 /// Download translated media from component result URLs and upload binary data
@@ -501,11 +426,42 @@ pub(crate) async fn upload_pending_media(
     wp_base: &str,
     token: &str,
     worker_id: &str,
+    device_id: &str,
     task_id: i64,
     relation_id: u64,
     payload: &mut TranslationCallbackPayload,
     log_file: &str,
     route_secret: Option<&str>,
+) -> anyhow::Result<()> {
+    upload_pending_media_with_optional_db(
+        None,
+        client,
+        wp_base,
+        token,
+        worker_id,
+        device_id,
+        task_id,
+        relation_id,
+        payload,
+        log_file,
+        route_secret,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upload_pending_media_with_scope(
+    client: &Client,
+    wp_base: &str,
+    token: &str,
+    worker_id: &str,
+    device_id: &str,
+    task_id: i64,
+    relation_id: u64,
+    payload: &mut TranslationCallbackPayload,
+    log_file: &str,
+    route_secret: Option<&str>,
+    scope: Option<&str>,
 ) -> anyhow::Result<()> {
     for mapping in &mut payload.media_mappings {
         if mapping.translated_ref.is_empty() || mapping.attachment_id.is_some() {
@@ -529,6 +485,7 @@ pub(crate) async fn upload_pending_media(
                 wp_base,
                 token,
                 worker_id,
+                device_id,
                 task_id,
                 relation_id,
                 mapping.source_id,
@@ -537,6 +494,7 @@ pub(crate) async fn upload_pending_media(
                 bytes,
                 log_file,
                 route_secret,
+                scope,
             )
             .await
             {
@@ -571,6 +529,7 @@ pub(crate) async fn upload_pending_media(
                     wp_base,
                     token,
                     worker_id,
+                    device_id,
                     task_id,
                     relation_id,
                     mapping.source_id,
@@ -579,6 +538,7 @@ pub(crate) async fn upload_pending_media(
                     bytes,
                     log_file,
                     route_secret,
+                    scope,
                 )
                 .await
                 {
@@ -614,27 +574,26 @@ pub(crate) async fn upload_pending_media(
         if let Some(path_str) = local_path {
             let path = std::path::PathBuf::from(path_str);
             if path.exists() && path.is_file() {
-                let file_data = match std::fs::read(&path) {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        let _ = log_event(
-                            log_file,
-                            "warning",
-                            "media.local_read_failed",
-                            json!({
-                                "path": path.display().to_string(),
-                                "source_id": mapping.source_id,
-                                "error": format!("{:#}", err)
-                            }),
-                        );
-                        continue;
-                    }
-                };
+                let file_data =
+                    match crate::retained_assets::read_async(path_str, 512 * 1024 * 1024).await {
+                        Ok(bytes) => bytes,
+                        Err(err) => {
+                            let _ = log_event(
+                                log_file,
+                                "warning",
+                                "media.local_read_failed",
+                                json!({
+                                    "path": path.display().to_string(),
+                                    "source_id": mapping.source_id,
+                                    "error": format!("{:#}", err)
+                                }),
+                            );
+                            continue;
+                        }
+                    };
 
                 let (content_type, ext) = sniff_content_type_and_ext(&file_data);
-                let mut filename = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
+                let mut filename = crate::retained_assets::filename(&path)
                     .unwrap_or("")
                     .to_string();
                 if filename.trim().is_empty() {
@@ -648,6 +607,7 @@ pub(crate) async fn upload_pending_media(
                     wp_base,
                     token,
                     worker_id,
+                    device_id,
                     task_id,
                     relation_id,
                     mapping.source_id,
@@ -656,17 +616,15 @@ pub(crate) async fn upload_pending_media(
                     file_data,
                     log_file,
                     route_secret,
+                    scope,
                 )
                 .await
                 {
                     Ok(att_id) => {
-                        let should_cleanup = raw_ref.starts_with("file://");
                         mapping.attachment_id = Some(att_id);
                         mapping.translated_ref = String::new();
-                        // Best-effort cleanup for temp outputs.
-                        if should_cleanup {
-                            let _ = std::fs::remove_file(&path);
-                        }
+                        // Upload acceptance is not callback acknowledgement or
+                        // authorization to delete the retained paid result.
                     }
                     Err(err) => {
                         let _ = log_event(
@@ -799,6 +757,7 @@ pub(crate) async fn upload_pending_media(
             wp_base,
             token,
             worker_id,
+            device_id,
             task_id,
             relation_id,
             mapping.source_id,
@@ -807,6 +766,7 @@ pub(crate) async fn upload_pending_media(
             file_data,
             log_file,
             route_secret,
+            scope,
         )
         .await
         {
@@ -920,408 +880,22 @@ fn parse_retry_after_ms_from_error(err: &anyhow::Error) -> Option<u64> {
     None
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn attachment_source_copy_requires_configured_wordpress_origin() {
-        assert!(is_configured_wp_origin(
-            "http://127.0.0.1:9083/wp-json/wptsall/v2/test/client",
-            "http://127.0.0.1:9083/wp-content/uploads/2026/08/source.jpg"
-        ));
-        assert!(!is_configured_wp_origin(
-            "https://example.com/wp-json/wptsall/v2/test/client",
-            "https://attacker.example/wp-content/uploads/source.jpg"
-        ));
-        assert!(!is_configured_wp_origin(
-            "https://example.com/wp-json/wptsall/v2/test/client",
-            "https://user:pass@example.com/wp-content/uploads/source.jpg"
-        ));
-    }
-
-    // -----------------------------------------------------------------------
-    // is_retryable_error (m3 audit fix: tightened retry classification)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn retryable_timeout_errors() {
-        let cases = vec![
-            "operation timed out",
-            "request timeout while waiting for response",
-            "connection timed out after 30s",
-        ];
-        for msg in cases {
-            let err = anyhow::anyhow!("{}", msg);
-            assert!(is_retryable_error(&err), "expected retryable for: {}", msg);
-        }
-    }
-
-    #[test]
-    fn retryable_connection_errors() {
-        let cases = vec![
-            "connection refused",
-            "connection reset by peer",
-            "connection closed before response",
-            "connection aborted unexpectedly",
-        ];
-        for msg in cases {
-            let err = anyhow::anyhow!("{}", msg);
-            assert!(is_retryable_error(&err), "expected retryable for: {}", msg);
-        }
-    }
-
-    #[test]
-    fn retryable_server_errors() {
-        let cases = vec![
-            "HTTP status=429 Too Many Requests",
-            "HTTP status 500 Internal Server Error",
-            "server returned status=502",
-            "status 503 Service Unavailable",
-            "upstream status=504 Gateway Timeout",
-        ];
-        for msg in cases {
-            let err = anyhow::anyhow!("{}", msg);
-            assert!(is_retryable_error(&err), "expected retryable for: {}", msg);
-        }
-    }
-
-    #[test]
-    fn non_retryable_client_errors() {
-        let cases = vec![
-            "HTTP status=400 Bad Request",
-            "HTTP status=401 Unauthorized",
-            "HTTP status=403 Forbidden",
-            "HTTP status=404 Not Found",
-            "HTTP status=422 Unprocessable Entity",
-            "invalid JSON in response body",
-            "missing required field",
-        ];
-        for msg in cases {
-            let err = anyhow::anyhow!("{}", msg);
-            assert!(
-                !is_retryable_error(&err),
-                "expected NOT retryable for: {}",
-                msg
-            );
-        }
-    }
-
-    #[test]
-    fn non_retryable_generic_connection_word() {
-        // "connection" alone (without refused/reset/closed/aborted) should NOT be retryable
-        let err = anyhow::anyhow!("bad connection pool state");
-        assert!(
-            !is_retryable_error(&err),
-            "generic 'connection' should not be retryable"
-        );
-    }
-
-    #[test]
-    fn non_retryable_request_failed() {
-        // "request failed" alone should NOT be retryable (too broad)
-        let err = anyhow::anyhow!("request failed: invalid payload");
-        assert!(
-            !is_retryable_error(&err),
-            "'request failed' should not be retryable"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // compute_backoff_ms
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_backoff_cap_respected() {
-        // When base_ms > max_ms, the result must still be <= max_ms (the cap).
-        // Previously `.min(max_ms.max(base_ms))` would use base_ms as the cap
-        // when base_ms > max_ms, causing the cap to be silently raised.
-        let result = compute_backoff_ms(0, 6000, 5000);
-        assert!(
-            result <= 5000,
-            "backoff exceeded max_ms cap: got {result}, expected <= 5000"
-        );
-
-        // Verify cap is never exceeded for any attempt count.
-        for attempt in 0..=20 {
-            let ms = compute_backoff_ms(attempt, 6000, 5000);
-            assert!(
-                ms <= 5000,
-                "attempt={attempt}: backoff {ms} exceeded max_ms cap of 5000"
-            );
-        }
-
-        // Normal case: base_ms < max_ms — cap still applies at max_ms.
-        for attempt in 0..=20 {
-            let ms = compute_backoff_ms(attempt, 400, 5000);
-            assert!(
-                ms <= 5000,
-                "attempt={attempt}: backoff {ms} exceeded max_ms cap of 5000"
-            );
-        }
-    }
-
-    #[test]
-    fn parse_retry_after_ms_from_error_works() {
-        let e1 = anyhow::anyhow!("wp transport non-2xx status=429 retry_after=30");
-        assert_eq!(parse_retry_after_ms_from_error(&e1), Some(30_000));
-
-        let e2 = anyhow::anyhow!("component api non-2xx status=429 retry_after_ms=1800");
-        assert_eq!(parse_retry_after_ms_from_error(&e2), Some(1800));
-
-        let e3 = anyhow::anyhow!("status=503");
-        assert_eq!(parse_retry_after_ms_from_error(&e3), None);
-    }
-
-    // -----------------------------------------------------------------------
-    // L3 fault injection through the real component + retry path (plan §7
-    // TEST-NETWORK-RESILIENCE-001; failure-modes FM-HTTP-429 / FM-HTTP-403 /
-    // FM-RETRY-EXHAUSTION). A counting mock provider answers every request
-    // with a fixed status; retry_with_backoff drives
-    // translate_text_via_component, so attempt counts and backoff waits are
-    // observed end-to-end, not inferred from the classifier alone.
-    // -----------------------------------------------------------------------
-
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-    use std::time::Instant;
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpListener;
-
-    /// Counting mock provider: every request gets `status_line` + optional
-    /// `extra_headers` + a plain-text `body`. Returns (port, request count).
-    async fn start_status_counting_server(
-        status_line: &'static str,
-        extra_headers: &'static str,
-        body: &'static str,
-    ) -> (u16, Arc<AtomicUsize>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let count = Arc::new(AtomicUsize::new(0));
-        let counter = count.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((socket, _)) = listener.accept().await else {
-                    break;
-                };
-                let counter = counter.clone();
-                tokio::spawn(async move {
-                    let mut reader = BufReader::new(socket);
-                    let mut content_length: usize = 0;
-                    loop {
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
-                            return;
-                        }
-                        if line == "\r\n" {
-                            break;
-                        }
-                        let lower = line.to_lowercase();
-                        if lower.starts_with("content-length:") {
-                            content_length =
-                                lower["content-length:".len()..].trim().parse().unwrap_or(0);
-                        }
-                    }
-                    let mut body_buf = vec![0u8; content_length];
-                    if content_length > 0 {
-                        let _ = reader.read_exact(&mut body_buf).await;
-                    }
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    let resp = format!(
-                        "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        status_line,
-                        extra_headers,
-                        body.len(),
-                        body
-                    );
-                    let _ = reader.get_mut().write_all(resp.as_bytes()).await;
-                });
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        (port, count)
-    }
-
-    fn retry_worker_config(retry_max: u32, retry_base_ms: u64, retry_max_ms: u64) -> WorkerConfig {
-        WorkerConfig {
-            worker_id: "test-worker".to_string(),
-            task_pull_statuses: vec![],
-            task_concurrency: 1,
-            retry_max,
-            retry_base_ms,
-            retry_max_ms,
-            component_fallback_enabled: false,
-            default_max_input_chars: 10_000,
-            default_split_strategy: "paragraph".to_string(),
-            discovery_mode: false,
-            review_mode: false,
-        }
-    }
-
-    fn status_runtime(port: u16) -> ComponentRuntime {
-        use crate::types::{ComponentRequest, ComponentResponse, ComponentTemplate};
-        let template = ComponentTemplate {
-            id: "status-fault-injection".to_string(),
-            name: "Status Fixture".to_string(),
-            version: "1.0.0".to_string(),
-            kind: "text_translation".to_string(),
-            client_contract: None,
-            default_values: None,
-            auth: None,
-            prepare: None,
-            request: ComponentRequest {
-                method: "POST".to_string(),
-                url: format!("http://127.0.0.1:{}", port),
-                headers: None,
-                body: Some(json!({"text": "{{input.text}}"})),
-                body_type: Some("json".to_string()),
-                response_type: None,
-            },
-            response: ComponentResponse {
-                translated_text_path: Some("data.translated".to_string()),
-                error_path: Some("error.message".to_string()),
-                translated_ref_path: None,
-                translated_media_ref_path: None,
-                translated_image_ref_path: None,
-                translated_video_ref_path: None,
-                translated_audio_ref_path: None,
-                translated_document_ref_path: None,
-            },
-            async_poll: None,
-            source_upload: None,
-            sign: None,
-            constraints: None,
-            editable_params: vec![],
-            translation_modes: vec![],
-        };
-        ComponentRuntime {
-            template,
-            auth_values: std::collections::HashMap::new(),
-            supported_business_lines: vec![],
-            language_map: std::collections::HashMap::new(),
-            supported_content_formats: vec![],
-            supported_formats: vec![],
-            key_pool: None,
-            oauth_pool: None,
-            oauth_manager: None,
-            runtime_max_concurrent_requests: 0,
-            runtime_min_interval_ms: 0,
-            runtime_concurrency_sem: None,
-            runtime_last_request_at: None,
-            proxy_profile_id: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn retry_429_honors_retry_after_and_bounds_attempts() {
-        // FM-HTTP-429 L3: the rate-limited provider is retried exactly
-        // max_attempts times, the wait honors Retry-After (1000ms dominates
-        // the 10ms base), and the final 429 error surfaces.
-        let (port, count) =
-            start_status_counting_server("429 Too Many Requests", "Retry-After: 1\r\n", "rate limited").await;
-        let client = reqwest::Client::new();
-        let comp = status_runtime(port);
-        let wc = retry_worker_config(2, 10, 20);
-        let started = Instant::now();
-
-        let result = retry_with_backoff("fm-429", 1, "/dev/null", &wc, |_| {
-            crate::component_rt::runner::translate_text_via_component(
-                &client,
-                &comp,
-                "Hello",
-                "en",
-                "zh",
-            )
-        })
-        .await;
-
-        let err = result.expect_err("429 provider must end in an error");
-        assert!(
-            err.to_string().contains("status=429"),
-            "final error should carry the 429 status, got: {err}"
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            3,
-            "retry_max=2 must cap attempts at 3"
-        );
-        assert!(
-            started.elapsed().as_millis() >= 1000,
-            "Retry-After (1s) must dominate the 10ms base backoff; elapsed {}ms",
-            started.elapsed().as_millis()
-        );
-    }
-
-    #[tokio::test]
-    async fn retry_403_is_not_retried() {
-        // FM-HTTP-403 L3: a forbidden provider answer is terminal — exactly
-        // one request, no retry storm against the rate-limiting endpoint.
-        let (port, count) =
-            start_status_counting_server("403 Forbidden", "", "forbidden").await;
-        let client = reqwest::Client::new();
-        let comp = status_runtime(port);
-        let wc = retry_worker_config(5, 10, 20);
-
-        let result = retry_with_backoff("fm-403", 2, "/dev/null", &wc, |_| {
-            crate::component_rt::runner::translate_text_via_component(
-                &client,
-                &comp,
-                "Hello",
-                "en",
-                "zh",
-            )
-        })
-        .await;
-
-        let err = result.expect_err("403 provider must end in an error");
-        assert!(
-            err.to_string().contains("status=403"),
-            "final error should carry the 403 status, got: {err}"
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            1,
-            "403 is not retryable: exactly one attempt expected"
-        );
-    }
-
-    #[tokio::test]
-    async fn retry_exhaustion_bounds_attempts_and_preserves_last_error() {
-        // FM-RETRY-EXHAUSTION L3: a persistently failing 5xx provider is
-        // attempted exactly max_attempts times, and the returned error is
-        // the LAST failure (preserved, no zombie success/panic).
-        let (port, count) =
-            start_status_counting_server("500 Internal Server Error", "", "boom").await;
-        let client = reqwest::Client::new();
-        let comp = status_runtime(port);
-        let wc = retry_worker_config(2, 5, 10);
-
-        let result = retry_with_backoff("fm-exhaustion", 3, "/dev/null", &wc, |_| {
-            crate::component_rt::runner::translate_text_via_component(
-                &client,
-                &comp,
-                "Hello",
-                "en",
-                "zh",
-            )
-        })
-        .await;
-
-        let err = result.expect_err("persistent 500 must end in an error");
-        assert!(
-            err.to_string().contains("status=500"),
-            "the LAST error must be preserved, got: {err}"
-        );
-        assert_eq!(
-            count.load(Ordering::SeqCst),
-            3,
-            "retry_max=2 must cap attempts at 3"
-        );
-    }
-}
 
 fn is_retryable_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_lowercase();
+    // FL-17: classify on the FULL error chain, not the outermost context.
+    // WP-transport failures are context-wrapped on their way out (e.g.
+    // "i18n translation callback failed (relation_id=N)") with the
+    // retryable status ("status=500 …") living in a CAUSE. anyhow's plain
+    // Display shows only the outermost context, so every callback 5xx was
+    // classified permanent and the retry_max budget never engaged — the
+    // submission was single-shot despite the retry_with_backoff wrap.
+    err.chain()
+        .any(|cause| error_message_is_retryable(&cause.to_string()))
+}
+
+fn error_message_is_retryable(message: &str) -> bool {
+    let msg = message.to_lowercase();
     // Network transient errors
     msg.contains("timeout")
         || msg.contains("timed out")

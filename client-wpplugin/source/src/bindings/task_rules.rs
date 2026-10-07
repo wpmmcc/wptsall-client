@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::types::*;
 
-use super::{default_bindings_version, encrypt_for_save, load_encrypted_or_plain};
+use super::{default_bindings_version, save_encrypted_file, load_encrypted_or_plain};
 
 pub(crate) fn parse_task_type_binding_key(raw: &str) -> Option<String> {
     let lower = raw.trim().to_lowercase();
@@ -310,20 +310,14 @@ pub(crate) fn load_task_type_component_bindings(
     path: &str,
 ) -> anyhow::Result<TaskTypeComponentBindingsDoc> {
     let file_path = Path::new(path);
-    if let Some(parent) = file_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create bindings dir failed: {}", parent.display()))?;
-        }
-    }
-
-    if !file_path.exists() {
+    if matches!(fs::symlink_metadata(file_path), Err(ref error)
+        if error.kind() == std::io::ErrorKind::NotFound)
+    {
         let doc = TaskTypeComponentBindingsDoc {
             version: default_bindings_version(),
             task_types: HashMap::new(),
             business_line_task_types: HashMap::new(),
         };
-        save_task_type_component_bindings(path, &doc)?;
         return Ok(doc);
     }
 
@@ -409,14 +403,7 @@ pub(crate) fn save_task_type_component_bindings(
 
     let encoded = serde_json::to_string_pretty(&normalized)
         .with_context(|| "encode task type component bindings json failed".to_string())?;
-    let output = encrypt_for_save(&encoded)?;
-    fs::write(file_path, output).with_context(|| {
-        format!(
-            "write task type component bindings file failed: {}",
-            file_path.display()
-        )
-    })?;
-    Ok(())
+    save_encrypted_file(file_path, &encoded)
 }
 
 pub(crate) fn task_type_component_binding_status_items(
@@ -528,14 +515,9 @@ pub(crate) fn rule_component_binding_status_items(
 
 pub(crate) fn load_rule_component_bindings(path: &str) -> anyhow::Result<RuleComponentBindingsDoc> {
     let file_path = Path::new(path);
-    if let Some(parent) = file_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create bindings dir failed: {}", parent.display()))?;
-        }
-    }
-
-    if !file_path.exists() {
+    if matches!(fs::symlink_metadata(file_path), Err(ref error)
+        if error.kind() == std::io::ErrorKind::NotFound)
+    {
         let doc = RuleComponentBindingsDoc {
             version: default_bindings_version(),
             global_defaults: HashMap::new(),
@@ -545,7 +527,6 @@ pub(crate) fn load_rule_component_bindings(path: &str) -> anyhow::Result<RuleCom
             site_bindings: HashMap::new(),
             migration_issues: Vec::new(),
         };
-        save_rule_component_bindings(path, &doc)?;
         return Ok(doc);
     }
 
@@ -590,14 +571,7 @@ pub(crate) fn save_rule_component_bindings(
     let normalized = normalize_rule_component_bindings_doc(doc);
     let encoded = serde_json::to_string_pretty(&normalized)
         .with_context(|| "encode rule component bindings json failed".to_string())?;
-    let output = encrypt_for_save(&encoded)?;
-    fs::write(file_path, output).with_context(|| {
-        format!(
-            "write rule component bindings file failed: {}",
-            file_path.display()
-        )
-    })?;
-    Ok(())
+    save_encrypted_file(file_path, &encoded)
 }
 
 pub(crate) fn resolve_component_id_from_rule_bindings<'a>(

@@ -308,7 +308,7 @@
       {#if oauthLoading}
         <tr><td colspan="10" class="px-4 py-8 text-center text-gray-400">{$_('common.loading')}</td></tr>
       {:else if oauthList.length === 0}
-        <tr><td colspan="10" class="px-4 py-8 text-center text-gray-400">{$_('oauth.no_configs')}</td></tr>
+        <tr><td colspan="10" class="px-4 py-8 text-center text-gray-400" data-testid="apikeys-oauth-empty">{$_('oauth.no_configs')}</td></tr>
       {:else}
         {#each oauthList as o}
           <tr class="border-t border-gray-50 hover:bg-gray-50/50">

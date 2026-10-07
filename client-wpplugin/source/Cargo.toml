@@ -44,14 +44,12 @@ tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.8"
 extism = "1"
+libc = "0.2"
 open = "5"
 wptsall-i18n = { path = "../../libs/i18n-rs" }
 client-runtime-core = { path = "../../libs/client-runtime-core" }
 wptsall-client-security = { path = "../../libs/wptsall-client-security" }
 
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 opt-level = 3
@@ -83,36 +81,4 @@ assets = [
   ["target/release/wptsall-client", "usr/bin/", "755"],
   ["deploy/wptsall-client-webui.package.service", "lib/systemd/user/wptsall-client-webui.service", "644"],
 ]
-
-[[test]]
-name = "component_template_mock_task_flow"
-path = "../../tests/modules/client-wpplugin/unit/component_template_mock_task_flow.rs"
-
-[[test]]
-name = "sign_e2e"
-path = "../../tests/modules/client-wpplugin/unit/sign_e2e.rs"
-
-[[test]]
-name = "wp_core_source_component_flow"
-path = "../../tests/modules/client-wpplugin/unit/wp_core_source_component_flow.rs"
-
-[[test]]
-name = "wp_translation_providers_roundtrip"
-path = "../../tests/modules/client-wpplugin/unit/wp_translation_providers_roundtrip.rs"
-
-[[test]]
-name = "idempotency_callback"
-path = "../../tests/modules/client-wpplugin/unit/idempotency_callback.rs"
-
-[[test]]
-name = "worker_loop"
-path = "../../tests/modules/client-wpplugin/unit/worker_loop.rs"
-
-[[test]]
-name = "discoverer_endpoints"
-path = "../../tests/modules/client-wpplugin/unit/discoverer_endpoints.rs"
-
-[[test]]
-name = "webui_route_matrix"
-path = "../../tests/modules/client-wpplugin/unit/webui_route_matrix.rs"
 

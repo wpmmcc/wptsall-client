@@ -11,6 +11,24 @@ use crate::web_ui::AccessControl;
 use super::errors::write_error_response;
 use super::http::write_http_response;
 
+/// 12号批 H 小项① (2026-09-23): audit detail for
+/// settings.access_control_updated. The count alone cannot answer the audit
+/// question "WHICH IPs were granted access?"; the allowlist itself is the
+/// audit fact (operator-entered addresses, no credential material). Kept as
+/// a pure function so the event shape is unit-pinnable — log_event_global
+/// is a no-op when the process-wide log path was never registered (unit
+/// tests), so the handler cannot be asserted on directly.
+pub(super) fn access_control_audit_detail(
+    external_access: bool,
+    ips: &[String],
+) -> serde_json::Value {
+    json!({
+        "external_access": external_access,
+        "allowed_ips_count": ips.len(),
+        "allowed_ips": ips,
+    })
+}
+
 pub(super) async fn handle_log_settings_get(
     socket: &mut TcpStream,
     _state: &Arc<Mutex<WebUiState>>,
@@ -80,6 +98,11 @@ pub(super) async fn handle_log_settings_update(
         g.log_enabled = get_log_enabled();
         g.log_min_level = get_log_min_level_str().to_string();
     }
+    crate::logging::log_event_global(
+        "info",
+        "settings.log_settings_updated",
+        json!({ "enabled": get_log_enabled(), "level": get_log_min_level_str() }),
+    );
 
     let payload = json!({
         "success": true,
@@ -101,6 +124,24 @@ pub(super) async fn handle_log_settings_update(
 // Access Control API
 // ---------------------------------------------------------------------------
 
+/// S2 (07 号 audit, 12 批 A2): get-or-create the WebUI access token — 32
+/// hex chars of OS entropy (uuid v4) persisted in DB system config. Created
+/// on first use; returned once by the access-control update that enables
+/// external mode, and always readable via GET /api/access-control (local
+/// mode, or loopback peers in external mode — the recovery lane).
+pub(crate) async fn webui_access_token(state: &Arc<Mutex<WebUiState>>) -> anyhow::Result<String> {
+    let guard = state.lock().await;
+    let db = guard.db.lock().await;
+    if let Some(existing) = crate::db::system::get_system_config(&db, "web_ui_access_token") {
+        if !existing.trim().is_empty() {
+            return Ok(existing);
+        }
+    }
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    crate::db::system::set_system_config(&db, "web_ui_access_token", &token)?;
+    Ok(token)
+}
+
 pub(super) async fn handle_access_control_get(
     socket: &mut TcpStream,
     state: &Arc<Mutex<WebUiState>>,
@@ -116,12 +157,22 @@ pub(super) async fn handle_access_control_get(
             .unwrap_or(false);
         if ext { "0.0.0.0" } else { "127.0.0.1" }.to_string()
     };
+    // Token display: every caller of this endpoint is either local mode
+    // (loopback-only bind), a loopback peer (recovery lane), or an
+    // external peer already presenting the token — so echoing it here
+    // leaks nothing the caller does not already hold or already trust.
+    let access_token = webui_access_token(state).await.ok();
     let payload = json!({
         "success": true,
         "data": {
             "external_access": external_access,
             "allowed_ips": allowed_ips,
-            "current_bind": current_bind
+            "current_bind": current_bind,
+            // Actual listen port (env override → bind-addr parse → default).
+            // The UI renders this verbatim; before this field existed it
+            // hard-coded `:8977` and misreported any custom-port deployment.
+            "current_port": crate::web_ui::web_ui_effective_port(),
+            "access_token": access_token
         }
     });
     write_http_response(
@@ -167,9 +218,30 @@ pub(super) async fn handle_access_control_update(
         }
     }
 
-    // If enabling external access, require at least one non-loopback IP
+    // If enabling external access, require at least one non-loopback IP.
+    // A6 / N-4 (08 号回归集, 12 批 A6): a comment claimed this before but
+    // nothing enforced it — `external_access=true` with a loopback-only or
+    // empty whitelist was persisted as-is, flipping the listener open with
+    // no usable remote allowlist.
     let (current_external, _) = access_control.get_settings().await;
     let external_access = new_external.unwrap_or(current_external);
+    let has_non_loopback = parsed_ips.iter().any(|ip| !ip.is_loopback());
+    if external_access && !has_non_loopback {
+        return write_error_response(
+            socket,
+            "EXTERNAL_REQUIRES_IP",
+            "enabling external access requires at least one non-loopback allowed IP",
+        )
+        .await;
+    }
+
+    // Provision the access token BEFORE persisting external=true so
+    // external mode can never activate without a token to enforce (S2).
+    let access_token = if external_access {
+        Some(webui_access_token(state).await?)
+    } else {
+        None
+    };
 
     // Persist to DB
     let db_arc = {
@@ -198,12 +270,20 @@ pub(super) async fn handle_access_control_update(
     let bind_changed = external_access != current_external;
 
     let (_, updated_ips) = access_control.get_settings().await;
+    crate::logging::log_event_global(
+        "warn",
+        "settings.access_control_updated",
+        access_control_audit_detail(external_access, &updated_ips),
+    );
     let payload = json!({
         "success": true,
         "data": {
             "external_access": external_access,
             "allowed_ips": updated_ips,
-            "restart_required": bind_changed
+            "restart_required": bind_changed,
+            // One-time token display for the operator enabling external
+            // mode (this request itself arrived before the gate armed).
+            "access_token": access_token
         }
     });
     write_http_response(

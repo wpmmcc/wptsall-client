@@ -1,20 +1,22 @@
 {
   "shell": {
     "subtitle": "翻译客户端 · 桌面版",
-    "version_runtime": "v2.1.0 · 内嵌运行时",
-    "runtime_note": "通过 Tauri 命令共享 WebUI 运行时。"
+    "version_runtime": "v2.1.4",
+    "runtime_note": "安全、高效的多站点内容翻译与同步工作台。"
   },
   "nav": {
     "overview": "总览",
     "sites": "站点",
-    "credentials": "凭据",
-    "tasks": "任务",
     "components": "组件",
-    "providers": "翻译商",
-    "integration_pack": "集成包",
-    "history": "历史",
+    "api_keys": "API 密钥",
+    "apikeys": "API 密钥",
+    "tasks": "任务",
     "logs": "日志",
-    "settings": "设置"
+    "history": "历史",
+    "settings": "设置",
+    "credentials": "API 密钥",
+    "providers": "API 密钥",
+    "integration_pack": "API 密钥"
   },
   "lang": {
     "en": "English",
@@ -49,11 +51,12 @@
     "label": "标签",
     "model": "模型",
     "host": "主机",
-    "port": "端口"
+    "port": "端口",
+    "unverified": "未验证"
   },
   "overview": {
     "sites_card": "站点",
-    "sites_hint": "设备令牌绑定存储在本地 SQLite。",
+    "sites_hint": "在本地安全管理已授权连接的 WordPress 站点。",
     "worker_card": "工作器",
     "device_id": "设备 ID",
     "device_id_hint": "在 WordPress 中使用此 ID 签发站点连接包。",
@@ -63,7 +66,7 @@
     "stop_worker": "停止工作器",
     "bootstrap_discovery": "启动探测任务",
     "import_pack": "导入站点连接包",
-    "pack_paste_hint": "粘贴 WordPress 生成的 JSON：wp wptsall security issue-pairing-pack --device-id=<本客户端设备 ID>",
+    "pack_paste_hint": "粘贴在 WordPress 插件管理面板生成的站点连接包 JSON。",
     "add_site_manually": "手动添加 WordPress 站点",
     "connected_sites": "已连接站点",
     "no_sites": "尚未配置站点。"
@@ -85,7 +88,7 @@
     "port": "端口",
     "focus_relation": "聚焦关系 ID（可选）",
     "component_id": "组件 ID",
-    "mock_api_base": "Mock API 地址",
+    "mock_api_base": "自定义 API 地址",
     "api_key": "API 密钥",
     "key_id": "密钥 ID",
     "request_url": "request.url（任意 http(s)）",
@@ -100,7 +103,7 @@
   },
   "creds": {
     "vendor_keys": "翻译商 API 密钥",
-    "vendor_keys_hint": "通过内嵌 WebUI 运行时在本地保存翻译商凭据（与 WebUI API 密钥一致）。",
+    "vendor_keys_hint": "在本地安全保存各翻译服务商的 API Key 凭据。",
     "loading_keys": "正在加载密钥…",
     "no_keys": "暂无翻译商密钥。",
     "vendor_oauth": "翻译商 OAuth（翻译服务商）",
@@ -108,7 +111,7 @@
     "loading_oauth": "正在加载 OAuth 配置…",
     "no_oauth": "暂无翻译商 OAuth 配置。",
     "proxies": "代理配置",
-    "proxies_hint": "翻译商调用的可选本地 HTTP(S) 代理（内嵌 WebUI 运行时）。",
+    "proxies_hint": "调用外部翻译服务商时可选的 HTTP(S) 出网代理配置。",
     "loading_proxies": "正在加载代理…",
     "no_proxies": "暂无代理配置。"
   },
@@ -125,14 +128,16 @@
     "retranslate": "重新翻译"
   },
   "components": {
-    "mock_config": "配置本地 mock 组件",
-    "local_components": "本地运行时组件",
+    "mock_config": "配置本地自定义组件",
+    "local_components": "已安装组件",
     "no_components": "尚未配置本地组件。",
     "catalog": "本地翻译商目录",
-    "catalog_hint": "Postman 风格模板：安装 → 密钥 → 快测 → 启用 → 路由。优先 mock-verified + mock-api（:9090）。",
+    "catalog_hint": "官方与社区模板：安装 → 密钥 → 快测 → 启用 → 路由。",
     "install_continue": "安装并继续",
     "save_key_continue": "保存密钥并继续",
     "run_quick_test": "运行快测",
+    "wizard_test_source_lang": "测试源语言",
+    "wizard_test_target_lang": "测试目标语言",
     "enable": "启用组件",
     "bind_route": "绑定全局路由",
     "done_hint": "完成。review_mode 开启时请在“任务”页审校；否则工作器直接回调 WordPress。",
@@ -142,7 +147,7 @@
   },
   "integration": {
     "title": "集成包",
-    "desc": "在客户端之间迁移本地站点、组件、绑定、工作流与翻译商配置。",
+    "desc": "在不同设备或环境之间安全导出与导入配置备份。",
     "export": "导出集成包",
     "export_mode": "导出模式",
     "public": "公开脱敏导出",
@@ -158,7 +163,7 @@
   },
   "history": {
     "title": "翻译历史",
-    "source_note": "本地 SQLite 记录，经 `GET /api/translations`（不经官网控制面）。",
+    "source_note": "所有翻译作业记录均在本地持久化。",
     "success": "成功",
     "failed": "失败",
     "batch_retry": "批量重试",
@@ -168,7 +173,7 @@
   },
   "logs": {
     "title": "最近日志",
-    "source_note": "代理自内嵌 WebUI 的 `POST /api/logs/recent`。",
+    "source_note": "实时呈现客户端后台运行日志。",
     "no_lines": "暂无日志行。"
   },
   "settings": {
@@ -185,7 +190,8 @@
     "passphrase_min": "口令至少需要 8 个字符",
     "relation_positive": "关系 ID 必须为正整数",
     "invalid_pack_json": "集成包 JSON 无效：{error}",
-    "invalid_conn_pack": "连接包 JSON 无效：{error}"
+    "invalid_conn_pack": "连接包 JSON 无效：{error}",
+    "device_mismatch": "设备配对冲突：配对码已被其他设备使用或已绑定，请在 WordPress 重新生成配对码。"
   },
   "msg": {
     "pack_exported": "集成包已导出",

@@ -1,13 +1,28 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { listDiscoveryTasks, updateDiscoveryTask, type DiscoveryTask } from '../lib/api/tasks';
-  import { getJob, listAllJobs, listJobs, listJobItems, type TranslationJob, type TranslationItem } from '../lib/api/jobs';
+  import {
+    bootstrapDiscoveryTasks,
+    listDiscoveryTasks,
+    updateDiscoveryTask,
+    type DiscoveryTask,
+  } from '../lib/api/tasks';
+  import { getJob, listJobs, listJobItems, type TranslationJob, type TranslationItem } from '../lib/api/jobs';
   import { listAllLocalComponents } from '../lib/api/components';
-  import { batchApproveItems } from '../lib/api/items';
+  import {
+    batchApproveItems,
+    batchRejectItems,
+    listPendingReviewItems,
+    rejectItem,
+    type BatchApproveResult,
+  } from '../lib/api/items';
   import { summarizeBatchApproveFailures, summarizeBatchApproveSkipped } from '../lib/errors/wpClientApi';
   import { showToast } from '../lib/stores/toast';
   import type { LocalComponent } from '../lib/api/types';
+  import SyncPairsTab from '../lib/components-page/SyncPairsTab.svelte';
+  import MediaRecoveryTab from '../lib/components-page/MediaRecoveryTab.svelte';
+  import ProviderRecoveryTab from '../lib/components-page/ProviderRecoveryTab.svelte';
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../lib/modal-a11y';
 
   // --- Discovery Tasks ---
   let tasks = $state<DiscoveryTask[]>([]);
@@ -28,7 +43,14 @@
   let jobItems = $state<TranslationItem[]>([]);
   let jobItemsLoading = $state(false);
 
-  let { onReviewItem }: { onReviewItem: (id: number) => void } = $props();
+  type TasksTab = 'jobs' | 'discovery' | 'pending_review' | 'sync_pairs' | 'media_recovery' | 'provider_recovery';
+  let {
+    onReviewItem,
+    initialTab = 'jobs',
+  }: {
+    onReviewItem: (id: number) => void;
+    initialTab?: TasksTab;
+  } = $props();
 
   // --- Pending Review ---
   let pendingItems = $state<TranslationItem[]>([]);
@@ -36,13 +58,39 @@
   let pendingError = $state('');
   let selectedPendingIds = $state<Set<number>>(new Set());
   let batchApproving = $state(false);
+  let batchRejecting = $state(false);
 
-  // Active tab
-  type TasksTab = 'jobs' | 'discovery' | 'pending_review';
+  // Active tab — synced from parent (Overview CTA → pending_review)
   let activeTab = $state<TasksTab>('jobs');
+  $effect(() => {
+    activeTab = initialTab;
+  });
+
+  let pendingWithWritebackError = $derived(
+    pendingItems.filter((it) => !!(it.error_message && String(it.error_message).trim())).length
+  );
 
   function discoveryFieldId(taskId: number, field: string): string {
     return `discovery-${taskId}-${field}`;
+  }
+
+  let bootstrapLoading = $state(false);
+
+  async function handleBootstrapDiscovery() {
+    bootstrapLoading = true;
+    try {
+      const res = await bootstrapDiscoveryTasks();
+      if (res.success) {
+        showToast('success', $_('tasks.bootstrap_ok'));
+        await loadTasks();
+      } else {
+        showToast('error', $_('tasks.bootstrap_failed'), (res as any).error?.message);
+      }
+    } catch (e: any) {
+      showToast('error', $_('tasks.bootstrap_failed'), e?.message);
+    } finally {
+      bootstrapLoading = false;
+    }
   }
 
   async function loadTasks() {
@@ -112,24 +160,9 @@
     pendingLoading = true;
     pendingError = '';
     try {
-      const res = await listAllJobs({ pageSize: 200 });
+      const res = await listPendingReviewItems({ limit: 500 });
       if (res.success) {
-        // Collect all items with pending_review status across jobs
-        const allPending: TranslationItem[] = [];
-        const candidateJobs = res.data.items.filter(
-          (job) => job.progress == null || (job.progress.pending_review ?? 0) > 0
-        );
-        for (const job of candidateJobs) {
-          const itemsRes = await listJobItems(job.id, 'pending_review');
-          if (itemsRes.success) {
-            for (const it of itemsRes.data.items) {
-              if (it.status === 'pending_review') allPending.push(it);
-            }
-          } else {
-            pendingError = (itemsRes as any).error?.message || $_('tasks.batch_failed');
-          }
-        }
-        pendingItems = allPending;
+        pendingItems = res.data.items ?? [];
       } else {
         pendingError = (res as any).error?.message || $_('common.load_failed');
       }
@@ -154,25 +187,52 @@
     }
   }
 
+  // The server caps batch operations at 100 items per request (TOO_MANY).
+  // Select-all on a large pending queue used to send the whole selection in
+  // one request and fail the entire batch; chunk the ids instead so every
+  // group within the cap is delivered.
+  const BATCH_CHUNK_SIZE = 100;
+
+  function chunkIds(ids: number[]): number[][] {
+    const chunks: number[][] = [];
+    for (let i = 0; i < ids.length; i += BATCH_CHUNK_SIZE) {
+      chunks.push(ids.slice(i, i + BATCH_CHUNK_SIZE));
+    }
+    return chunks;
+  }
+
   async function handleBatchApprove() {
     if (selectedPendingIds.size === 0) return;
     batchApproving = true;
     try {
-      const res = await batchApproveItems([...selectedPendingIds]);
-      if (res.success) {
-        const d = res.data;
-        const failedDetail = summarizeBatchApproveFailures(d.failed);
-        const skippedDetail = summarizeBatchApproveSkipped(d.skipped as any);
-        const detail = [failedDetail, skippedDetail].filter(Boolean).join('；') || undefined;
-        if ((d.failed.length > 0 || d.skipped.length > 0) && d.approved.length === 0) {
+      const approved: number[] = [];
+      const failed: BatchApproveResult['failed'] = [];
+      const skipped: BatchApproveResult['skipped'] = [];
+      let batchError: string | undefined;
+      for (const chunk of chunkIds([...selectedPendingIds])) {
+        const res = await batchApproveItems(chunk);
+        if (res.success) {
+          approved.push(...res.data.approved);
+          failed.push(...res.data.failed);
+          skipped.push(...res.data.skipped);
+        } else {
+          batchError = (res as any).error?.message;
+          break;
+        }
+      }
+      if (approved.length > 0 || failed.length > 0 || skipped.length > 0) {
+        const failedDetail = summarizeBatchApproveFailures(failed);
+        const skippedDetail = summarizeBatchApproveSkipped(skipped);
+        const detail = [failedDetail, skippedDetail, batchError].filter(Boolean).join('；') || undefined;
+        if (approved.length === 0) {
           showToast('error', $_('tasks.batch_no_success'), detail);
         } else {
-          showToast('success', $_('tasks.approved_count', { values: { count: d.approved.length } }), detail);
+          showToast('success', $_('tasks.approved_count', { values: { count: approved.length } }), detail);
         }
         selectedPendingIds = new Set();
         await loadPendingReview();
       } else {
-        showToast('error', $_('tasks.batch_failed'), (res as any).error?.message);
+        showToast('error', $_('tasks.batch_failed'), batchError);
       }
     } catch (e: any) {
       showToast('error', $_('login.network_error'), e.message);
@@ -181,10 +241,90 @@
     }
   }
 
+  let showRejectModal = $state(false);
+  let rejectTargetItemId = $state<number | null>(null);
+  let rejectBatchMode = $state(false);
+  let rejectReason = $state('');
+  let rejecting = $state(false);
+
+  function openReject(itemId: number) {
+    rejectTargetItemId = itemId;
+    rejectBatchMode = false;
+    rejectReason = '';
+    showRejectModal = true;
+  }
+
+  function openBatchReject() {
+    if (selectedPendingIds.size === 0) return;
+    rejectTargetItemId = null;
+    rejectBatchMode = true;
+    rejectReason = '';
+    showRejectModal = true;
+  }
+
+  async function handleConfirmReject() {
+    rejecting = true;
+    try {
+      if (rejectBatchMode) {
+        const rejected: number[] = [];
+        let batchError: string | undefined;
+        for (const chunk of chunkIds([...selectedPendingIds])) {
+          const res = await batchRejectItems(chunk, rejectReason.trim() || undefined);
+          if (res.success) {
+            rejected.push(...res.data.rejected);
+          } else {
+            batchError = (res as any).error?.message;
+            break;
+          }
+        }
+        if (rejected.length > 0 || batchError) {
+          showRejectModal = false;
+          rejectBatchMode = false;
+          rejectReason = '';
+          selectedPendingIds = new Set();
+          if (rejected.length === 0) {
+            showToast('error', $_('tasks.batch_reject_no_success'), batchError);
+          } else {
+            showToast(
+              'success',
+              $_('tasks.rejected_count', { values: { count: rejected.length } }),
+              batchError
+            );
+          }
+          await loadPendingReview();
+        } else {
+          showToast('error', $_('tasks.batch_reject_failed'));
+        }
+      } else {
+        if (!rejectTargetItemId) return;
+        const res = await rejectItem(rejectTargetItemId, rejectReason.trim() || undefined);
+        if (res.success) {
+          showRejectModal = false;
+          rejectTargetItemId = null;
+          rejectReason = '';
+          showToast('success', $_('review.rejected'));
+          await loadPendingReview();
+        } else {
+          showToast('error', $_('review.reject_failed'), (res as any).error?.message);
+        }
+      }
+    } catch (e: any) {
+      showToast(
+        'error',
+        rejectBatchMode ? $_('tasks.batch_reject_failed') : $_('review.reject_failed'),
+        e.message
+      );
+    } finally {
+      rejecting = false;
+      batchRejecting = false;
+    }
+  }
+
   onMount(() => {
     loadTasks();
     loadJobs();
     loadLocalTaskComponents();
+    if (initialTab === 'pending_review') loadPendingReview();
   });
 
   // Discovery editing helpers
@@ -341,7 +481,7 @@
   </div>
 
   <!-- Tab switcher -->
-  <div class="flex gap-1 mb-5 bg-gray-100 p-1 rounded-lg w-fit">
+  <div class="flex flex-wrap gap-1 mb-5 bg-gray-100 p-1 rounded-lg w-fit">
     <button
       onclick={() => activeTab = 'jobs'}
       class="px-4 py-1.5 text-sm rounded-md transition-colors {activeTab === 'jobs'
@@ -365,6 +505,30 @@
         : 'text-gray-500 hover:text-gray-700'}"
     >
       {$_('tasks.tab_pending')}
+    </button>
+    <button
+      onclick={() => activeTab = 'sync_pairs'}
+      class="px-4 py-1.5 text-sm rounded-md transition-colors {activeTab === 'sync_pairs'
+        ? 'bg-white shadow-sm text-gray-900 font-medium'
+        : 'text-gray-500 hover:text-gray-700'}"
+    >
+      {$_('tasks.tab_sync_pairs')}
+    </button>
+    <button
+      onclick={() => activeTab = 'media_recovery'}
+      class="px-4 py-1.5 text-sm rounded-md transition-colors {activeTab === 'media_recovery'
+        ? 'bg-white shadow-sm text-gray-900 font-medium'
+        : 'text-gray-500 hover:text-gray-700'}"
+    >
+      {$_('tasks.tab_media_recovery')}
+    </button>
+    <button
+      onclick={() => activeTab = 'provider_recovery'}
+      class="px-4 py-1.5 text-sm rounded-md transition-colors {activeTab === 'provider_recovery'
+        ? 'bg-white shadow-sm text-gray-900 font-medium'
+        : 'text-gray-500 hover:text-gray-700'}"
+    >
+      {$_('tasks.tab_provider_recovery')}
     </button>
   </div>
 
@@ -546,15 +710,32 @@
         <span class="text-xs text-gray-400 mt-1 block">{$_('tasks.no_pending_hint')}</span>
       </div>
     {:else}
-      <div class="flex items-center justify-between mb-3">
-        <p class="text-sm text-gray-500">{$_('tasks.pending_count', { values: { count: pendingItems.length } })}</p>
-        <div class="flex gap-2">
+      <div class="flex items-center justify-between mb-3 gap-3 flex-wrap">
+        <div>
+          <p class="text-sm text-gray-500">{$_('tasks.pending_count', { values: { count: pendingItems.length } })}</p>
+          {#if pendingWithWritebackError > 0}
+            <p class="text-xs text-rose-600 mt-0.5" data-testid="pending-writeback-errors">
+              {$_('tasks.writeback_error_count', { values: { count: pendingWithWritebackError } })}
+            </p>
+          {/if}
+        </div>
+        <div class="flex gap-2 flex-wrap">
           <button onclick={toggleSelectAll}
+            data-testid="pending-select-all"
             class="text-xs px-3 py-1.5 border border-gray-200 rounded-lg hover:bg-gray-50 text-gray-600">
             {selectedPendingIds.size === pendingItems.length ? $_('tasks.deselect_all') : $_('tasks.select_all')}
           </button>
+          <button
+            type="button"
+            data-testid="batch-reject"
+            onclick={openBatchReject}
+            disabled={selectedPendingIds.size === 0 || batchRejecting || batchApproving}
+            class="text-xs px-3 py-1.5 border border-rose-200 text-rose-700 rounded-lg hover:bg-rose-50 disabled:opacity-40 transition-colors">
+            {$_('tasks.batch_reject', { values: { count: selectedPendingIds.size } })}
+          </button>
           <button onclick={handleBatchApprove}
-            disabled={selectedPendingIds.size === 0 || batchApproving}
+            data-testid="batch-approve"
+            disabled={selectedPendingIds.size === 0 || batchApproving || batchRejecting}
             class="text-xs px-3 py-1.5 bg-amber-600 text-white rounded-lg hover:bg-amber-700 disabled:bg-amber-300 transition-colors">
             {batchApproving ? $_('tasks.submitting') : $_('tasks.batch_approve', { values: { count: selectedPendingIds.size } })}
           </button>
@@ -579,7 +760,8 @@
           </thead>
           <tbody>
             {#each pendingItems as item (item.id)}
-              <tr class="border-b border-gray-50 hover:bg-gray-50/50">
+              {@const hasWritebackErr = !!(item.error_message && String(item.error_message).trim())}
+              <tr class="border-b border-gray-50 hover:bg-gray-50/50 {hasWritebackErr ? 'bg-rose-50/70' : ''}">
                 <td class="px-3 py-2.5 text-center">
                   <input type="checkbox" checked={selectedPendingIds.has(item.id)}
                     onchange={() => togglePendingSelect(item.id)} class="rounded border-gray-300" />
@@ -589,13 +771,28 @@
                 <td class="px-4 py-2.5 text-gray-500 text-xs">{item.object_type}{item.wp_object_subtype ? `/${item.wp_object_subtype}` : ''}</td>
                 <td class="px-4 py-2.5 text-gray-500 text-xs">{item.task_type}</td>
                 <td class="px-4 py-2.5 text-gray-400 text-xs">{formatTs(item.translated_at)}</td>
-                <td class="px-4 py-2.5">
+                <td class="px-4 py-2.5 flex items-center gap-2">
                   {#if item.raw_path}
                     <button onclick={() => onReviewItem(item.id)}
+                      data-testid={`pending-review-${item.id}`}
                       class="text-xs text-blue-600 hover:text-blue-800 hover:underline">{$_('tasks.review')}</button>
                   {/if}
+                  <button
+                    onclick={() => openReject(item.id)}
+                    class="text-xs text-rose-600 hover:text-rose-800 hover:underline"
+                  >
+                    {$_('review.reject')}
+                  </button>
                 </td>
               </tr>
+              {#if hasWritebackErr}
+                <tr class="border-b border-rose-100 bg-rose-50/50" data-testid={`pending-writeback-err-${item.id}`}>
+                  <td colspan="7" class="px-4 pb-2 pt-0 text-xs text-rose-700">
+                    <span class="font-medium">{$_('tasks.writeback_failed')}:</span>
+                    {item.error_message}
+                  </td>
+                </tr>
+              {/if}
             {/each}
           </tbody>
         </table>
@@ -603,9 +800,18 @@
     {/if}
 
   <!-- ======================== DISCOVERY TAB ======================== -->
-  {:else}
-    <div class="flex items-center justify-between mb-4">
+  {:else if activeTab === 'discovery'}
+    <div class="flex items-center justify-between mb-4 gap-3">
       <p class="text-sm text-gray-500">{$_('tasks.discovery_desc')}</p>
+      <button
+        type="button"
+        data-testid="tasks-bootstrap-discovery"
+        onclick={handleBootstrapDiscovery}
+        disabled={bootstrapLoading || tasksLoading}
+        class="shrink-0 px-3 py-1.5 text-sm rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+      >
+        {bootstrapLoading ? $_('tasks.bootstrapping') : $_('tasks.bootstrap_scan')}
+      </button>
     </div>
 
     {#if tasksError}
@@ -739,6 +945,7 @@
                 </td>
                 <td class="px-3 py-3 text-center">
                   <button
+                    data-testid={`discovery-toggle-enabled-${task.id}`}
                     onclick={() => toggleEnabled(task)}
                     class="px-2 py-0.5 rounded text-xs font-medium {task.enabled
                       ? 'bg-green-100 text-green-700 hover:bg-green-200'
@@ -788,5 +995,79 @@
         {$_('tasks.discovery_footer', { values: { count: tasks.length } })}
       </p>
     {/if}
+  {:else if activeTab === 'sync_pairs'}
+    <SyncPairsTab />
+  {:else if activeTab === 'media_recovery'}
+    <MediaRecoveryTab />
+  {:else if activeTab === 'provider_recovery'}
+    <ProviderRecoveryTab />
+  {/if}
+
+  {#if showRejectModal}
+    <div
+      class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4"
+      role="dialog"
+      aria-modal="true"
+      tabindex="0"
+      aria-label={$_('review.reject_title')}
+      use:modalA11y={{ onClose: () => { showRejectModal = false; } }}
+      onclick={(e) => {
+        if (e.target === e.currentTarget) showRejectModal = false;
+      }}
+      onkeydown={(e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          showRejectModal = false;
+        }
+      }}
+    >
+      <div
+        class="bg-white rounded-xl shadow-xl max-w-md w-full p-6 space-y-4"
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-labelledby="task-reject-modal-title"
+      >
+        <h3 id="task-reject-modal-title" class="text-base font-semibold text-gray-900">
+          {rejectBatchMode
+            ? $_('tasks.batch_reject_title', { values: { count: selectedPendingIds.size } })
+            : $_('review.reject_title')}
+        </h3>
+        <p class="text-xs text-gray-500">
+          {$_('review.reject_hint')}
+        </p>
+        <textarea
+          class="w-full text-xs font-mono border border-gray-300 rounded-lg p-3 h-24 focus:ring-2 focus:ring-rose-500 focus:border-rose-500 outline-none"
+          placeholder={$_('review.reject_reason_placeholder')}
+          bind:value={rejectReason}
+        ></textarea>
+        <div class="flex justify-end gap-2 pt-2">
+          <button
+            type="button"
+            class="px-3 py-1.5 text-xs text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+            onclick={() => (showRejectModal = false)}
+          >
+            {$_('common.cancel')}
+          </button>
+          <button
+            type="button"
+            data-testid="task-confirm-reject-btn"
+            disabled={rejecting}
+            class="px-3 py-1.5 text-xs bg-rose-600 hover:bg-rose-700 disabled:bg-rose-300 text-white font-medium rounded-lg transition-colors flex items-center gap-1"
+            onclick={handleConfirmReject}
+          >
+            {#if rejecting}
+              <svg class="animate-spin w-3 h-3" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+              </svg>
+              {$_('review.rejecting')}
+            {:else}
+              {$_('review.confirm_reject')}
+            {/if}
+          </button>
+        </div>
+      </div>
+    </div>
   {/if}
 </div>

@@ -4,17 +4,40 @@ use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-/// Run all anti-tamper checks. Fails closed when `strict-antitamper` feature enabled.
+/// S8 (07 audit, batch G): anti-tamper used to fail closed ONLY under the
+/// opt-in `strict-antitamper` build feature — the default build silently
+/// discarded every check result (not even a warning). Default is now
+/// ENFORCE: detected indicators fail the bootstrap. The documented downgrade
+/// is `WPTSALL_ANTITAMPER_WARN_ONLY=1` (warn + continue) for environments
+/// that legitimately set LD_PRELOAD-class tooling; the `strict-antitamper`
+/// feature remains declared but is a no-op now (kept so existing build
+/// matrices/invocations keep working).
+pub fn antitamper_warn_only() -> bool {
+    client_runtime_core::env_helpers::env_bool("WPTSALL_ANTITAMPER_WARN_ONLY", false)
+}
+
+/// S8 decision core: pure map from (violation, warn_only) to the bootstrap
+/// outcome — enforce (Err) by default, warn (log + Ok) only via the env
+/// downgrade.
+fn enforce_or_warn(violation: &str, warn_only: bool) -> Result<()> {
+    if warn_only {
+        eprintln!("[security] antitamper warning (warn-only mode): {violation}");
+        return Ok(());
+    }
+    Err(anyhow!("{violation}"))
+}
+
+/// Run all anti-tamper checks. Fails closed by default (S8, batch G);
+/// `WPTSALL_ANTITAMPER_WARN_ONLY=1` downgrades failures to warnings.
 pub fn run_startup_checks(current_binary: Option<&Path>) -> Result<()> {
+    let warn_only = antitamper_warn_only();
     if debugger_present()? {
-        #[cfg(feature = "strict-antitamper")]
-        return Err(anyhow!("debugger detected"));
+        enforce_or_warn("debugger detected", warn_only)?;
     }
 
     if let Some(path) = current_binary {
         if !self_integrity_ok(path)? {
-            #[cfg(feature = "strict-antitamper")]
-            return Err(anyhow!("binary integrity check failed"));
+            enforce_or_warn("binary integrity check failed", warn_only)?;
         }
     }
 
@@ -84,14 +107,4 @@ pub fn injection_indicators_present() -> bool {
         }
     }
     false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn injection_check_runs() {
-        let _ = injection_indicators_present();
-    }
 }

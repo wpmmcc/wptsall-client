@@ -14,7 +14,7 @@ use crate::security;
 
 static UPDATE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct PerformUpdateResult {
     pub message: String,
     pub update_kind: String,
@@ -29,7 +29,8 @@ fn server_base() -> String {
 }
 
 fn skip_security_allowed() -> bool {
-    client_runtime_core::env_helpers::env_bool("WPTSALL_SKIP_SECURITY", false)
+    // S11 (batch G): debug-only valve per guide 16.
+    wptsall_client_security::bypass::debug_only_valve("WPTSALL_SKIP_SECURITY")
 }
 
 #[tauri::command]
@@ -40,8 +41,11 @@ pub async fn check_for_update() -> Result<UpdateCheckResult, String> {
         .map_err(|e| format!("{e:#}"))
 }
 
+// Runtime-generic so the headless test suite (tests/ota_commands.rs) can
+// drive the command with tauri::test's MockRuntime; the UI-only path below
+// never touches the handle (only the binary swap path calls app.exit).
 #[tauri::command]
-pub async fn perform_update(app: tauri::AppHandle) -> Result<PerformUpdateResult, String> {
+pub async fn perform_update<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<PerformUpdateResult, String> {
     if UPDATE_IN_PROGRESS.swap(true, Ordering::Relaxed) {
         return Err("an update is already in progress".into());
     }

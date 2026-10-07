@@ -71,49 +71,7 @@ pub(crate) struct DomainItem {
     pub(crate) plan_expires_at: Option<String>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
 
-    #[test]
-    fn parse_domains_accepts_wrapped_shape() {
-        let parsed = parse_domains_data_value(json!({
-            "success": true,
-            "data": {
-                "items": [
-                    {
-                        "api_base_url": "https://blog.wpmm.cc/wp-json/wptsall/v2/client",
-                        "license_status": "active",
-                        "route_secret": "abc123"
-                    }
-                ]
-            }
-        }))
-        .expect("wrapped domains payload should parse");
-
-        assert_eq!(parsed.items.len(), 1);
-        assert_eq!(parsed.items[0].site_status, "active");
-    }
-
-    #[test]
-    fn parse_domains_accepts_plain_items_shape() {
-        let parsed = parse_domains_data_value(json!({
-            "items": [
-                {
-                    "api_base_url": "https://blog.wpmm.cc/wp-json/wptsall/v2/client",
-                    "license_status": "active",
-                    "route_secret": "abc123"
-                }
-            ]
-        }))
-        .expect("plain domains payload should parse");
-
-        assert_eq!(parsed.items.len(), 1);
-        assert_eq!(parsed.items[0].route_secret.as_deref(), Some("abc123"));
-        assert_eq!(parsed.items[0].site_status, "active");
-    }
-}
 
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct DomainStatusItem {

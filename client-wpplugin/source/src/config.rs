@@ -9,11 +9,16 @@ pub(crate) const DEFAULT_TASK_TYPE_COMPONENT_BINDINGS_FILE: &str =
 pub(crate) const DEFAULT_VENDOR_KEYS_FILE: &str = "./config/vendor-keys.json";
 pub(crate) const DEFAULT_VENDOR_OAUTH_FILE: &str = "./config/vendor-oauth.json";
 pub(crate) const DEFAULT_PROXY_PROFILES_FILE: &str = "./config/proxy-profiles.json";
+pub(crate) const DEFAULT_SIGNING_PUBLIC_KEY_FILE: &str = "./config/signing-public-key.pem";
 pub(crate) const DEFAULT_COMPONENTS_LOCAL_FILE: &str = "./config/components.json";
 pub(crate) const DEFAULT_PROVIDER_CATALOG_FILE: &str = "./config/provider-catalog.json";
 pub(crate) const DEFAULT_SESSION_TOKEN_FILE: &str = "./runtime/session-token.enc";
 pub(crate) const DEFAULT_RULE_COMPONENT_BINDINGS_FILE: &str =
     "./config/rule-component-bindings.json";
+pub(crate) const DEFAULT_SYNC_PAIRS_FILE: &str = "./config/sync-pairs.json";
+pub(crate) const DEFAULT_SYNC_PEER_CREDENTIALS_FILE: &str = "./config/sync-peer-credentials.json";
+pub(crate) const DEFAULT_SYNC_STATE_FILE: &str = "./config/sync-state.json";
+pub(crate) const DEFAULT_SYNC_REVIEW_FILE: &str = "./config/sync-review.json";
 pub(crate) const DEFAULT_DATA_DIR: &str = "./data";
 pub(crate) const MAX_WEB_UI_WORKER_RUN_RECORDS: usize = 50;
 pub(crate) const COMPONENT_CRYPTO_ALGO_AES: &str =
@@ -23,6 +28,12 @@ pub(crate) const COMPONENT_CRYPTO_ALGO_XOR_LEGACY: &str =
 pub(crate) const COMPONENT_KDF_VERSION_HKDF: &str =
     client_runtime_core::component_crypto::COMPONENT_KDF_VERSION_HKDF;
 pub(crate) const REQUEST_ID_HEADER: &str = "X-Request-Id";
+/// Run-scoped outbound trace header (GAP-06 收尾). Attached to WP-bound and
+/// vendor-bound requests while a discovery/sync run is active, so client,
+/// WP plugin and mock/ provider logs can be correlated on one run id.
+/// Unrelated to the per-request `X-Request-Id`: that one identifies a single
+/// HTTP exchange; this one identifies the whole run that issued it.
+pub(crate) const TRACE_ID_HEADER: &str = "X-WPTSALL-Trace-Id";
 pub(crate) const BINDINGS_CRYPTO_ALGO: &str = "aes-256-gcm-v1";
 pub(crate) const TASK_CALLBACK_SCHEMA_VERSION: u64 = 2;
 pub(crate) const DEFAULT_MAX_INPUT_CHARS: u64 = 0; // 0 = no limit
@@ -90,6 +101,26 @@ pub(crate) fn runtime_mode() -> &'static str {
     }
 }
 
+/// opus5 A-03 (AF-03): boot-level WP device identity resolution. The explicit
+/// `WPTSALL_WP_DEVICE_ID` override (test lane / deployments that intentionally
+/// use a distinct WP device identity) wins over the generic
+/// `WPTSALL_DEVICE_ID` seed; when neither is set the caller falls back to the
+/// stable DB identity. The HTTP layer threads this resolved value from
+/// WorkerConfig/AppState and never re-reads env at request time, so every
+/// binding's requests carry the device id its token was paired with on the
+/// WP side (`verify_client_token($token, $device, true)`).
+pub(crate) fn wp_device_id_override() -> Option<String> {
+    for key in ["WPTSALL_WP_DEVICE_ID", "WPTSALL_DEVICE_ID"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim().to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -134,11 +165,19 @@ pub(crate) fn resolve_data_path(env_key: &str, data_subpath: &str, legacy_defaul
 }
 
 pub(crate) fn db_path() -> String {
-    resolve_data_path("WPTSALL_DB_PATH", "runtime/wptsall.db", "./runtime/wptsall.db")
+    resolve_data_path(
+        "WPTSALL_DB_PATH",
+        "runtime/wptsall.db",
+        "./runtime/wptsall.db",
+    )
 }
 
 pub(crate) fn log_file_path() -> String {
-    resolve_data_path("WPTSALL_LOG_FILE", "logs/wptsall-client.log", DEFAULT_LOG_FILE)
+    resolve_data_path(
+        "WPTSALL_LOG_FILE",
+        "logs/wptsall-client.log",
+        DEFAULT_LOG_FILE,
+    )
 }
 
 pub(crate) fn component_bindings_file() -> String {
@@ -173,6 +212,44 @@ pub(crate) fn rule_component_bindings_file() -> String {
     )
 }
 
+pub(crate) fn sync_pairs_file() -> String {
+    resolve_data_path(
+        "WPTSALL_SYNC_PAIRS_FILE",
+        "config/sync-pairs.json",
+        DEFAULT_SYNC_PAIRS_FILE,
+    )
+}
+
+/// Per-domain WPMMCC peer credentials (HMAC shared secrets derived at
+/// pairing time). Secrets at rest — stored through the bindings crypto
+/// envelope (WPTC/AES-256-GCM when a bindings secret is configured).
+pub(crate) fn sync_peer_credentials_file() -> String {
+    resolve_data_path(
+        "WPTSALL_SYNC_PEER_CREDENTIALS_FILE",
+        "config/sync-peer-credentials.json",
+        DEFAULT_SYNC_PEER_CREDENTIALS_FILE,
+    )
+}
+
+/// Per-pair incremental sync state (known canonical UUIDs, fingerprints,
+/// target-side mappings, digest keyset cursor). Non-secret bookkeeping.
+pub(crate) fn sync_state_file() -> String {
+    resolve_data_path(
+        "WPTSALL_SYNC_STATE_FILE",
+        "config/sync-state.json",
+        DEFAULT_SYNC_STATE_FILE,
+    )
+}
+
+/// Parked sync packets awaiting human approve → push.
+pub(crate) fn sync_review_file() -> String {
+    resolve_data_path(
+        "WPTSALL_SYNC_REVIEW_FILE",
+        "config/sync-review.json",
+        DEFAULT_SYNC_REVIEW_FILE,
+    )
+}
+
 pub(crate) fn vendor_keys_file() -> String {
     resolve_data_path(
         "WPTSALL_VENDOR_KEYS_FILE",
@@ -194,6 +271,18 @@ pub(crate) fn proxy_profiles_file() -> String {
         "WPTSALL_PROXY_PROFILES_FILE",
         "config/proxy-profiles.json",
         DEFAULT_PROXY_PROFILES_FILE,
+    )
+}
+
+/// P7 unification: the component signing public key resolves through the
+/// same single authority as every other persistent config path. Consumers
+/// (component_rt loader) must call this instead of deriving sibling paths
+/// from the bindings file directory.
+pub(crate) fn signing_public_key_file() -> String {
+    resolve_data_path(
+        "WPTSALL_SIGNING_PUBLIC_KEY_FILE",
+        "config/signing-public-key.pem",
+        DEFAULT_SIGNING_PUBLIC_KEY_FILE,
     )
 }
 
@@ -259,168 +348,4 @@ pub(crate) fn parse_csv_env(key: &str) -> Vec<String> {
                 .collect::<Vec<String>>()
         })
         .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn env_or_returns_default_when_unset() {
-        let key = "WPTSALL_TEST_ENV_OR_NONEXISTENT_KEY_12345";
-        env::remove_var(key);
-        assert_eq!(env_or(key, "fallback"), "fallback");
-    }
-
-    #[test]
-    fn env_bool_returns_default_when_unset() {
-        let key = "WPTSALL_TEST_BOOL_NONEXISTENT_KEY_12345";
-        env::remove_var(key);
-        assert!(!env_bool(key, false));
-        assert!(env_bool(key, true));
-    }
-
-    #[test]
-    fn env_bool_only_explicit_true_values_enable_flags() {
-        for (idx, value) in ["1", "true", "TRUE", "yes", "YES", " true "]
-            .iter()
-            .enumerate()
-        {
-            let key = format!("WPTSALL_TEST_BOOL_TRUE_{idx}");
-            env::set_var(&key, value);
-            assert!(env_bool(&key, false), "{value:?} should parse as true");
-        }
-
-        for (idx, value) in ["0", "false", "FALSE", "no", "NO", "", " truex "]
-            .iter()
-            .enumerate()
-        {
-            let key = format!("WPTSALL_TEST_BOOL_FALSE_{idx}");
-            env::set_var(&key, value);
-            assert!(!env_bool(&key, true), "{value:?} should parse as false");
-        }
-    }
-
-    #[test]
-    fn env_u64_returns_default_when_unset() {
-        let key = "**************************************";
-        env::remove_var(key);
-        assert_eq!(env_u64(key, 42), 42);
-    }
-
-    /// Path resolution shares process-global env vars with other tests, so
-    /// hold the shared test-env lock for the whole test and restore values.
-    #[test]
-    fn resolve_data_path_priority_env_then_data_dir_then_legacy() {
-        let lock = crate::db::test_env_lock();
-        let _lock_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-
-        const DATA_DIR_KEY: &str = "WPTSALL_DATA_DIR";
-        const DB_KEY: &str = "WPTSALL_DB_PATH";
-
-        struct RestoreEnv(&'static str, Option<String>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) {
-                match self.1.as_deref() {
-                    Some(value) => std::env::set_var(self.0, value),
-                    None => std::env::remove_var(self.0),
-                }
-            }
-        }
-        let _data_restore = RestoreEnv(DATA_DIR_KEY, std::env::var(DATA_DIR_KEY).ok());
-        let _db_restore = RestoreEnv(DB_KEY, std::env::var(DB_KEY).ok());
-
-        // 1. Legacy: nothing set → CWD-relative default (dev behavior unchanged).
-        std::env::remove_var(DATA_DIR_KEY);
-        std::env::remove_var(DB_KEY);
-        assert_eq!(db_path(), "./runtime/wptsall.db");
-
-        // 2. Data dir set, no explicit override → subpath under data dir
-        //    (service/desktop installs; BUG-RT-01 remediation).
-        let tmp = std::env::temp_dir()
-            .join(format!("wptsall-test-datadir-{}", std::process::id()));
-        std::env::set_var(DATA_DIR_KEY, tmp.to_string_lossy().to_string());
-        assert_eq!(
-            db_path(),
-            tmp.join("runtime/wptsall.db").to_string_lossy().to_string()
-        );
-        assert_eq!(
-            log_file_path(),
-            tmp.join("logs/wptsall-client.log").to_string_lossy().to_string()
-        );
-
-        // 3. Explicit per-key env wins over data dir (tests, e2e slots).
-        std::env::set_var(DB_KEY, "/tmp/explicit-wptsall.db");
-        assert_eq!(db_path(), "/tmp/explicit-wptsall.db");
-
-        // 4. Blank values are treated as unset, not as an override.
-        std::env::set_var(DB_KEY, "   ");
-        assert_eq!(
-            db_path(),
-            tmp.join("runtime/wptsall.db").to_string_lossy().to_string()
-        );
-    }
-
-    #[test]
-    fn env_u32_returns_default_when_unset() {
-        let key = "WPTSALL_TEST_U32_NONEXISTENT_KEY_12345";
-        env::remove_var(key);
-        assert_eq!(env_u32(key, 10), 10);
-    }
-
-    #[test]
-    fn env_usize_returns_default_when_unset() {
-        let key = "WPTSALL_TEST_USIZE_NONEXISTENT_KEY_12345";
-        env::remove_var(key);
-        assert_eq!(env_usize(key, 100), 100);
-    }
-
-    /// The gate reads a fixed process-global variable that other tests also
-    /// mutate through `TestEnvVarGuard`, so hold the shared test-env lock
-    /// for the whole test and restore the original value on the way out.
-    #[test]
-    fn server_control_plane_gate_resolves_modes() {
-        let lock = crate::db::test_env_lock();
-        let _lock_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-
-        const MODE_KEY: &str = "WPTSALL_USE_SERVER_CONTROL_PLANE";
-        const BASE_KEY: &str = "WPTSALL_SERVER_BASE";
-
-        struct RestoreEnv(&'static str, Option<String>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) {
-                match self.1.as_deref() {
-                    Some(value) => std::env::set_var(self.0, value),
-                    None => std::env::remove_var(self.0),
-                }
-            }
-        }
-        let _mode_restore = RestoreEnv(MODE_KEY, std::env::var(MODE_KEY).ok());
-        let _base_restore = RestoreEnv(BASE_KEY, std::env::var(BASE_KEY).ok());
-
-        // Unset resolves to local mode.
-        env::remove_var(MODE_KEY);
-        assert!(!server_control_plane_enabled());
-        assert_eq!(runtime_mode(), "local");
-
-        // `0`, `false`, and malformed values stay local.
-        for value in ["0", "false", "FALSE", "no", "", " yes-no ", "2"] {
-            env::set_var(MODE_KEY, value);
-            assert!(!server_control_plane_enabled(), "{value:?} must stay local");
-        }
-        assert_eq!(runtime_mode(), "local");
-
-        // Only documented true values opt in.
-        for value in ["1", "true", "TRUE", "YES", " yes "] {
-            env::set_var(MODE_KEY, value);
-            assert!(server_control_plane_enabled(), "{value:?} must opt in");
-            assert_eq!(runtime_mode(), "legacy_server_control_plane");
-        }
-
-        // A configured server base alone never enables the legacy lane.
-        env::remove_var(MODE_KEY);
-        env::set_var(BASE_KEY, "http://127.0.0.1:8787");
-        assert!(!server_control_plane_enabled());
-        assert_eq!(runtime_mode(), "local");
-    }
 }

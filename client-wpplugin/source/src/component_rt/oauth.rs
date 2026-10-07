@@ -6,12 +6,115 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::types::{KeySelectionStrategy, OAuthConfig};
 
+mod recovery;
+
+pub(crate) trait OAuthProjection: Sync {
+    fn check_projection(
+        &self,
+        conn: &rusqlite::Connection,
+        id: &str,
+        saved: &OAuthConfig,
+    ) -> anyhow::Result<()>;
+
+    fn projection_credit(
+        &self,
+        conn: &rusqlite::Connection,
+        id: &str,
+        saved: &OAuthConfig,
+    ) -> anyhow::Result<Option<crate::storage_capacity::StorageCredit>> {
+        self.check_projection(conn, id, saved)?;
+        match conn.path().filter(|path| !path.is_empty()) {
+            Some(path) => crate::storage_capacity::database_recovery_credit(
+                std::path::Path::new(path),
+                false,
+            ),
+            None => Ok(None),
+        }
+    }
+}
+
+impl OAuthProjection for recovery::TokenExecution {
+    fn check_projection(
+        &self,
+        conn: &rusqlite::Connection,
+        id: &str,
+        saved: &OAuthConfig,
+    ) -> anyhow::Result<()> {
+        recovery::TokenExecution::check_projection(self, conn, id, saved)
+    }
+}
+
+/// Token transports cannot be constructed from an opaque provider/WP client.
+#[derive(Debug, Clone)]
+pub(crate) struct OAuthHttpClient {
+    client: reqwest::Client,
+    proxy_profile_id: Option<String>,
+}
+
+impl OAuthHttpClient {
+    fn builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(15))
+            .connect_timeout(std::time::Duration::from_secs(10))
+    }
+
+    pub(crate) fn direct() -> anyhow::Result<Self> {
+        Ok(Self {
+            client: Self::builder()
+                .build()
+                .context("build OAuth transport failed")?,
+            proxy_profile_id: None,
+        })
+    }
+
+    pub(in crate::component_rt) fn proxied(
+        profile_id: &str,
+        proxy: reqwest::Proxy,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!profile_id.is_empty(), "OAuth proxy identity is missing");
+        Ok(Self {
+            client: Self::builder()
+                .proxy(proxy)
+                .build()
+                .context("build proxied OAuth transport failed")?,
+            proxy_profile_id: Some(profile_id.to_string()),
+        })
+    }
+}
+
 #[derive(Debug)]
+pub(crate) enum OAuthTokenResponseFault {
+    Rejected(u16),
+    MissingToken,
+}
+
+impl std::fmt::Display for OAuthTokenResponseFault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(status) => write!(
+                formatter,
+                "OAuth token request failed (status={status}); retained"
+            ),
+            Self::MissingToken => write!(
+                formatter,
+                "OAuth response has no usable access_token; retained"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OAuthTokenResponseFault {}
+
+#[derive(Debug, Clone)]
 pub(crate) struct OAuthTokenManager {
     configs: Arc<Mutex<HashMap<String, OAuthConfig>>>,
-    http_client: reqwest::Client,
+    http_client: OAuthHttpClient,
     config_path: String,
     db_path: Option<String>,
+    recovery_db: Option<Arc<tokio::sync::Mutex<rusqlite::Connection>>>,
+    frozen: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +143,13 @@ pub(crate) struct OAuthPool {
     notify: Arc<Notify>,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OAuthPoolSnapshot {
+    entries: Vec<(String, String, usize, usize, f64, u32)>,
+    strategy: KeySelectionStrategy,
+}
+
 /// RAII guard that releases the concurrency slot when dropped.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -62,6 +172,67 @@ impl Drop for OAuthGuard {
 }
 
 impl OAuthPool {
+    pub(crate) fn snapshot(&self) -> OAuthPoolSnapshot {
+        OAuthPoolSnapshot {
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.config_id.clone(),
+                        entry.token_field.clone(),
+                        entry.max_concurrent,
+                        entry.max_input_chars,
+                        entry.max_file_size_mb,
+                        entry.weight,
+                    )
+                })
+                .collect(),
+            strategy: self.strategy.clone(),
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: OAuthPoolSnapshot) -> Self {
+        Self::new_with_registry(
+            snapshot
+                .entries
+                .into_iter()
+                .map(
+                    |(
+                        config_id,
+                        token_field,
+                        max_concurrent,
+                        max_input_chars,
+                        max_file_size_mb,
+                        weight,
+                    )| OAuthPoolEntry {
+                        config_id,
+                        token_field,
+                        max_concurrent,
+                        max_input_chars,
+                        max_file_size_mb,
+                        weight,
+                        active_count: Arc::new(AtomicUsize::new(0)),
+                    },
+                )
+                .collect(),
+            snapshot.strategy,
+        )
+    }
+
+    pub(crate) fn new_with_registry(
+        mut entries: Vec<OAuthPoolEntry>,
+        strategy: KeySelectionStrategy,
+    ) -> Self {
+        let registry = crate::component_rt::key_registry::GlobalKeyRegistry::process();
+        for entry in &mut entries {
+            entry.active_count = registry.get_or_create(&format!("oauth:{}", entry.config_id));
+        }
+        let mut pool = Self::new(entries, strategy);
+        pool.notify = registry.notify();
+        pool
+    }
+
     pub(crate) fn new(entries: Vec<OAuthPoolEntry>, strategy: KeySelectionStrategy) -> Self {
         Self {
             entries,
@@ -79,6 +250,12 @@ impl OAuthPool {
     /// Returns true if any entry in the pool has a non-zero `max_file_size_mb` limit.
     pub(crate) fn has_file_size_limits(&self) -> bool {
         self.entries.iter().any(|e| e.max_file_size_mb > 0.0)
+    }
+
+    pub(crate) fn source_byte_budget(&self) -> anyhow::Result<u64> {
+        crate::component_rt::file_limits::pool_source_budget(
+            self.entries.iter().map(|entry| entry.max_file_size_mb),
+        )
     }
 
     /// Returns true if at least one entry can handle the given input size and file size.
@@ -111,18 +288,23 @@ impl OAuthPool {
             ));
         }
         loop {
+            let released = self.notify.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
             if let Some(guard) = self.try_acquire(input_len, file_size_mb) {
-                // Fetch token for the selected config_id
-                let token = manager.get_token(&guard.config_id_tmp).await?;
-                return Ok(OAuthGuard {
-                    access_token: token,
+                let config_id = guard.config_id_tmp;
+                // Hold the RAII slot before the fallible/cancellable token lookup.
+                let mut guard = OAuthGuard {
+                    access_token: String::new(),
                     token_field: guard.token_field_tmp,
                     max_file_size_mb: guard.max_file_size_mb_tmp,
                     active_count: guard.active_count,
                     notify: guard.notify,
-                });
+                };
+                guard.access_token = manager.get_token(&config_id).await?;
+                return Ok(guard);
             }
-            self.notify.notified().await;
+            released.await;
         }
     }
 
@@ -208,15 +390,15 @@ impl OAuthPool {
         file_size_mb: f64,
     ) -> Option<OAuthAcquireTemp> {
         use rand::Rng;
-        let total_weight: u32 = self.entries.iter().map(|e| e.weight).sum();
+        let total_weight: u128 = self.entries.iter().map(|e| u128::from(e.weight)).sum();
         if total_weight == 0 {
             return self.try_acquire_round_robin(input_len, file_size_mb);
         }
         let mut rng = rand::thread_rng();
         let target = rng.gen_range(0..total_weight);
-        let mut cumulative = 0u32;
+        let mut cumulative = 0u128;
         for (idx, entry) in self.entries.iter().enumerate() {
-            cumulative += entry.weight;
+            cumulative += u128::from(entry.weight);
             if target < cumulative {
                 if let Some(g) = self.try_acquire_for_idx(idx, input_len, file_size_mb) {
                     return Some(g);
@@ -243,25 +425,81 @@ struct OAuthAcquireTemp {
 }
 
 impl OAuthTokenManager {
-    fn resolve_default_db_path() -> Option<String> {
-        #[cfg(test)]
-        {
-            None
+    pub(crate) async fn snapshot(&self) -> HashMap<String, OAuthConfig> {
+        let mut configs = self.configs.lock().await.clone();
+        for config in configs.values_mut() {
+            if config.cached_token.as_deref() == Some("") {
+                config.cached_token = None;
+            }
         }
+        configs
+    }
 
-        #[cfg(not(test))]
+    pub(crate) async fn frozen_snapshot(&self) -> anyhow::Result<HashMap<String, OAuthConfig>> {
+        let mut saved = self.snapshot().await;
+        if self.frozen {
+            return Ok(saved);
+        }
+        for config in saved.values_mut() {
+            Self::resolve_config(config)?;
+        }
+        Ok(saved)
+    }
+
+    fn resolve_config(config: &mut OAuthConfig) -> anyhow::Result<()> {
+        config.client_id =
+            crate::component_rt::runner::resolve_credential_reference(&config.client_id)?;
+        config.client_secret =
+            crate::component_rt::runner::resolve_credential_reference(&config.client_secret)?;
+        config.refresh_token = config
+            .refresh_token
+            .as_deref()
+            .map(crate::component_rt::runner::resolve_credential_reference)
+            .transpose()?;
+        for value in config
+            .extra_params
+            .values_mut()
+            .chain(config.auth_extra_params.values_mut())
         {
-            let path = std::env::var("WPTSALL_DB_PATH")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "./runtime/wptsall.db".to_string());
-            Some(path)
+            *value = crate::component_rt::runner::resolve_credential_reference(value)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_snapshot(
+        configs: HashMap<String, OAuthConfig>,
+        http_client: OAuthHttpClient,
+    ) -> Self {
+        Self {
+            configs: Arc::new(Mutex::new(configs)),
+            http_client,
+            config_path: String::new(),
+            db_path: None,
+            recovery_db: None,
+            frozen: true,
+        }
+    }
+
+    pub(crate) fn with_recovery_db(
+        mut self,
+        db: Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+    ) -> Self {
+        self.recovery_db = Some(db);
+        self
+    }
+
+    fn resolve_default_db_path() -> Option<String> {
+
+
+
+        {
+            Some(crate::config::db_path())
         }
     }
 
     pub(crate) fn new(
         configs: HashMap<String, OAuthConfig>,
-        http_client: reqwest::Client,
+        http_client: OAuthHttpClient,
         config_path: String,
     ) -> Self {
         Self {
@@ -269,118 +507,493 @@ impl OAuthTokenManager {
             http_client,
             config_path,
             db_path: Self::resolve_default_db_path(),
+            recovery_db: None,
+            frozen: false,
         }
     }
 
     pub(crate) async fn get_token(&self, config_id: &str) -> anyhow::Result<String> {
-        // Double-checked locking to prevent token-refresh thundering herd.
-        //
-        // Sentinel convention: cached_token == Some("") means a refresh is
-        // already in-flight.  Any concurrent caller that sees the sentinel
-        // sleeps 100 ms and retries instead of issuing its own refresh request.
-        loop {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-
-            // --- Phase 1: check cache / sentinel under the lock ---
-            let config_snapshot = {
-                let mut configs = self.configs.lock().await;
-                let config = configs
-                    .get(config_id)
-                    .ok_or_else(|| anyhow!("oauth config not found: {}", config_id))?;
-
-                // Valid cached token — return immediately.
-                if let Some(ref token) = config.cached_token {
-                    if !token.is_empty() && config.cached_token_expires_at - 60 > now {
-                        return Ok(token.clone());
-                    }
-                    // Sentinel: another task is refreshing — back off and retry.
-                    if token.is_empty() {
-                        drop(configs); // release lock before sleeping
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                        continue;
-                    }
-                }
-
-                // Token is expired (or None) and no in-flight refresh yet.
-                // Set sentinel to claim ownership of the refresh.
-                let snapshot = config.clone();
-                if let Some(entry) = configs.get_mut(config_id) {
-                    entry.cached_token = Some(String::new()); // sentinel
-                }
-                snapshot
-                // lock released here
-            };
-
-            // --- Phase 2: perform the HTTP fetch WITHOUT holding the lock ---
-            let fetch_result: anyhow::Result<(String, i64, Option<String>)> =
-                match config_snapshot.grant_type.as_str() {
-                    "client_credentials" => self
-                        .fetch_client_credentials_token(&config_snapshot)
-                        .await
-                        .map(|(t, e)| (t, e, None)),
-                    "jwt_bearer" => self
-                        .fetch_jwt_bearer_token(&config_snapshot)
-                        .await
-                        .map(|(t, e)| (t, e, None)),
-                    "authorization_code" => {
-                        let refresh_token = config_snapshot
-                            .refresh_token
-                            .as_deref()
-                            .map(crate::component_rt::runner::resolve_credential_reference)
-                            .transpose()?
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "authorization_code config '{}' has no refresh_token; \
-                                     please re-authorize via the Web UI",
-                                    config_id
-                                )
-                            })?;
-                        self.fetch_refresh_token(&config_snapshot, &refresh_token)
-                            .await
-                    }
-                    other => Err(anyhow!(
-                        "unsupported oauth grant_type: {} (config: {})",
-                        other,
-                        config_id
-                    )),
-                };
-
-            // --- Phase 3: update cache / clear sentinel under the lock ---
-            match fetch_result {
-                Ok((token, expires_in, new_refresh)) => {
-                    let doc = {
-                        let mut configs = self.configs.lock().await;
-                        if let Some(entry) = configs.get_mut(config_id) {
-                            entry.cached_token = Some(token.clone());
-                            entry.cached_token_expires_at = now + expires_in;
-                            // Persist rotated refresh_token for authorization_code flow.
-                            if let Some(rt) = new_refresh {
-                                entry.refresh_token = Some(rt);
-                            }
-                        }
-                        crate::types::VendorOAuthDoc {
-                            version: 1,
-                            configs: configs.clone(),
-                        }
-                    };
-                    self.persist_doc(&doc).await;
-                    return Ok(token);
-                }
-                Err(e) => {
-                    // Clear sentinel so subsequent callers can retry.
-                    let mut configs = self.configs.lock().await;
-                    if let Some(entry) = configs.get_mut(config_id) {
-                        if entry.cached_token.as_deref() == Some("") {
-                            entry.cached_token = None;
-                        }
-                    }
-                    return Err(e);
-                }
+        let now = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        )?;
+        let mut config = self
+            .configs
+            .lock()
+            .await
+            .get(config_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("oauth config not found: {config_id}"))?;
+        let original = config.clone();
+        let projection = self.projection_plan(config_id, &original, None).await?;
+        if !self.frozen {
+            Self::resolve_config(&mut config)?;
+        }
+        if let Some(token) = config.cached_token.as_ref().filter(|token| {
+            !token.is_empty() && config.cached_token_expires_at.saturating_sub(60) > now
+        }) {
+            if !recovery::TokenExecution::has_checkpoint(self, config_id, &config).await? {
+                self.projection_plan(config_id, &original, Some(&config))
+                    .await?;
+                return Ok(token.clone());
             }
         }
+        match config.grant_type.as_str() {
+            "client_credentials"|"jwt_bearer" => {},
+            "authorization_code" => anyhow::ensure!(config.refresh_token.as_ref().is_some_and(|token| !token.trim().is_empty()),
+                "authorization_code config '{config_id}' has no refresh_token; please re-authorize via the Web UI"),
+            other => anyhow::bail!("unsupported oauth grant_type: {other} (config: {config_id})"),
+        }
+        let mut execution = recovery::TokenExecution::acquire(self, config_id, &config).await?;
+        execution.restore(&mut config);
+        self.projection_plan(config_id, &original, Some(&config))
+            .await?;
+        if let Some(token) = config.cached_token.as_ref().filter(|token| {
+            !token.is_empty() && config.cached_token_expires_at.saturating_sub(60) > now
+        }) {
+            let token = token.clone();
+            self.project_token(config_id, &original, &config, projection, Some(&execution))
+                .await?;
+            self.cache_token(config_id, &config).await?;
+            return Ok(token);
+        }
+        Self::validate_token_request(&config)?;
+        execution.intent().await?;
+        let (token, expires_in, refresh) = match config.grant_type.as_str() {
+            "client_credentials" => self
+                .fetch_client_credentials_token(&config)
+                .await
+                .map(|(token, ttl)| (token, ttl, None))?,
+            "jwt_bearer" => self
+                .fetch_jwt_bearer_token(&config)
+                .await
+                .map(|(token, ttl)| (token, ttl, None))?,
+            "authorization_code" => {
+                self.fetch_refresh_token(
+                    &config,
+                    config
+                        .refresh_token
+                        .as_deref()
+                        .context("refresh token missing")?,
+                )
+                .await?
+            }
+            _ => unreachable!(),
+        };
+        anyhow::ensure!(
+            expires_in > 0,
+            "OAuth returned an invalid token lifetime; retained"
+        );
+        let expires_at = now
+            .checked_add(expires_in)
+            .context("OAuth token lifetime overflow")?;
+        execution.finish(&token, expires_at, refresh).await?;
+        execution.restore(&mut config);
+        self.project_token(config_id, &original, &config, projection, Some(&execution))
+            .await?;
+        self.cache_token(config_id, &config).await?;
+        Ok(token)
+    }
+
+    pub(crate) fn for_http_client(&self, client: &OAuthHttpClient) -> Self {
+        let mut manager = self.clone();
+        manager.http_client = client.clone();
+        manager
+    }
+
+    pub(crate) fn assert_proxy_profile(&self, profile_id: Option<&str>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.http_client.proxy_profile_id.as_deref() == profile_id,
+            "OAuth selected proxy transport differs; direct fallback refused"
+        );
+        Ok(())
+    }
+
+    async fn cache_token(&self, id: &str, saved: &OAuthConfig) -> anyhow::Result<()> {
+        let mut configs = self.configs.lock().await;
+        let current = configs
+            .get_mut(id)
+            .context("OAuth configuration disappeared; retained")?;
+        current.cached_token = saved.cached_token.clone();
+        current.cached_token_expires_at = saved.cached_token_expires_at;
+        current.refresh_token = saved.refresh_token.clone();
+        Ok(())
+    }
+
+    async fn projection_plan(
+        &self,
+        id: &str,
+        original: &OAuthConfig,
+        restored: Option<&OAuthConfig>,
+    ) -> anyhow::Result<(bool, bool)> {
+        if self.frozen {
+            return Ok((false, false));
+        }
+        let db_absent = if let Some(db) = &self.recovery_db {
+            Self::projection_db_plan(&*db.lock().await, id, original, restored)?
+        } else if let Some(path) = self.db_path.as_deref() {
+            let conn = crate::db::open_db(path)?;
+            Self::projection_db_plan(&conn, id, original, restored)?
+        } else {
+            false
+        };
+        let file_absent = if self.config_path.is_empty() {
+            false
+        } else {
+            let path = std::path::Path::new(&self.config_path);
+            match path.symlink_metadata() {
+                Ok(_) => {
+                    let doc =
+                        serde_json::from_str(&crate::bindings::load_encrypted_or_plain(path)?)?;
+                    Self::verify_profile(&doc, id, original, restored)?;
+                    false
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        Ok((db_absent, file_absent))
+    }
+
+    fn projection_db_plan(
+        conn: &rusqlite::Connection,
+        id: &str,
+        original: &OAuthConfig,
+        restored: Option<&OAuthConfig>,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            crate::db::system::get_system_config_checked(
+                conn,
+                "integration-save-v1:vendor_oauth_doc",
+            )?
+            .is_none(),
+            "OAuth operator configuration save is unresolved; original checkpoint retained"
+        );
+        match crate::db::system::get_system_config_checked(conn, "vendor_oauth_doc")? {
+            Some(raw) => {
+                let doc = serde_json::from_str(&crate::db::system::decrypt_config_value(&raw)?)?;
+                Self::verify_profile(&doc, id, original, restored)?;
+                Ok(false)
+            }
+            None => Ok(true),
+        }
+    }
+
+    pub(crate) fn credential_fingerprint(config: &OAuthConfig) -> anyhow::Result<String> {
+        crate::db::system::private_json_digest(&serde_json::json!({
+            "vendor":config.vendor_id,"grant":config.grant_type,"url":config.token_url,
+            "auth_url":config.auth_url,"client_id":config.client_id,"client_secret":config.client_secret,
+            "scopes":config.scopes,"extra":config.extra_params,"auth_extra":config.auth_extra_params,
+        }))
+    }
+
+    fn verify_profile(
+        doc: &crate::types::VendorOAuthDoc,
+        id: &str,
+        original: &OAuthConfig,
+        restored: Option<&OAuthConfig>,
+    ) -> anyhow::Result<()> {
+        let current = doc
+            .configs
+            .get(id)
+            .context("OAuth operator profile was deleted or is absent; retained")?;
+        anyhow::ensure!(
+            Self::credential_fingerprint(current)? == Self::credential_fingerprint(original)?,
+            "OAuth operator credentials changed; retained"
+        );
+        if let Some(restored) = restored {
+            anyhow::ensure!(
+                current.refresh_token == original.refresh_token
+                    || current.refresh_token == restored.refresh_token,
+                "OAuth operator refresh credential changed; retained"
+            );
+        }
+        Ok(())
+    }
+
+    fn merge_token(
+        doc: &mut crate::types::VendorOAuthDoc,
+        id: &str,
+        original: &OAuthConfig,
+        saved: &OAuthConfig,
+        may_initialize: bool,
+    ) -> anyhow::Result<bool> {
+        if let Some(current) = doc.configs.get(id) {
+            anyhow::ensure!(Self::credential_fingerprint(current)? == Self::credential_fingerprint(original)?,
+                "OAuth operator credentials changed during refresh; durable token retained without replacement");
+            if current.cached_token == saved.cached_token
+                && current.cached_token_expires_at == saved.cached_token_expires_at
+                && current.refresh_token == saved.refresh_token
+            {
+                return Ok(false);
+            }
+            anyhow::ensure!(current.refresh_token == original.refresh_token,
+                "OAuth operator refresh credential changed; durable token retained without replacement");
+        } else {
+            anyhow::ensure!(may_initialize && doc.configs.is_empty(),
+                "OAuth operator profile was deleted or is absent; durable token retained without restoration");
+            doc.configs.insert(id.into(), original.clone());
+        }
+        let current = doc
+            .configs
+            .get_mut(id)
+            .context("OAuth projection profile missing")?;
+        current.cached_token = saved.cached_token.clone();
+        current.cached_token_expires_at = saved.cached_token_expires_at;
+        current.refresh_token = saved.refresh_token.clone();
+        Ok(true)
+    }
+
+    async fn project_token(
+        &self,
+        id: &str,
+        original: &OAuthConfig,
+        saved: &OAuthConfig,
+        projection: (bool, bool),
+        execution: Option<&dyn OAuthProjection>,
+    ) -> anyhow::Result<()> {
+        if self.frozen {
+            return Ok(());
+        }
+        if let Some(db) = &self.recovery_db {
+            Self::project_token_db(
+                &mut *db.lock().await,
+                id,
+                original,
+                saved,
+                projection.0,
+                execution,
+            )?;
+        } else if let Some(path) = self.db_path.as_deref() {
+            let mut conn = crate::db::open_db(path)?;
+            Self::project_token_db(&mut conn, id, original, saved, projection.0, execution)?;
+        }
+        if !self.config_path.is_empty() {
+            crate::bindings::mutate_vendor_oauth_if_changed(&self.config_path, |doc| {
+                let missing = !std::path::Path::new(&self.config_path).exists();
+                let changed = Self::merge_token(doc, id, original, saved, projection.1 && missing)?;
+                Ok(((), changed))
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn project_authorization(
+        &self,
+        id: &str,
+        original: &OAuthConfig,
+        saved: &OAuthConfig,
+        authority: &dyn OAuthProjection,
+        completed: bool,
+    ) -> anyhow::Result<()> {
+        let projection = self.projection_plan(id, original, Some(saved)).await?;
+        if completed {
+            anyhow::ensure!(
+                !projection.0 && !projection.1,
+                "completed OAuth authorization projection is absent; retained"
+            );
+            if let Some(db) = &self.recovery_db {
+                let conn = db.lock().await;
+                authority.check_projection(&conn, id, saved)?;
+                let raw = crate::db::system::get_system_config_checked(&conn, "vendor_oauth_doc")?
+                    .context("completed OAuth database projection is absent; retained")?;
+                let mut doc = serde_json::from_str(&crate::db::system::decrypt_config_value(&raw)?)?;
+                anyhow::ensure!(
+                    !Self::merge_token(&mut doc, id, original, saved, false)?,
+                    "completed OAuth database projection changed; retained"
+                );
+            }
+            if !self.config_path.is_empty() {
+                let mut doc = crate::bindings::read_vendor_oauth(&self.config_path)?;
+                anyhow::ensure!(
+                    !Self::merge_token(&mut doc, id, original, saved, false)?,
+                    "completed OAuth file projection changed; retained"
+                );
+            }
+            return Ok(());
+        }
+        self.project_token(id, original, saved, projection, Some(authority))
+            .await
+    }
+
+    fn project_token_db(
+        conn: &mut rusqlite::Connection,
+        id: &str,
+        original: &OAuthConfig,
+        saved: &OAuthConfig,
+        may_initialize: bool,
+        execution: Option<&dyn OAuthProjection>,
+    ) -> anyhow::Result<()> {
+        let credit = execution
+            .map(|execution| execution.projection_credit(conn, id, saved))
+            .transpose()?
+            .flatten();
+        crate::storage_capacity::with_database_credit(credit, || -> anyhow::Result<()> {
+            let tx = conn.savepoint()?;
+            anyhow::ensure!(
+                crate::db::system::get_system_config_checked(
+                    &tx,
+                    "integration-save-v1:vendor_oauth_doc",
+                )?
+                .is_none(),
+                "OAuth operator configuration save is unresolved; original checkpoint retained"
+            );
+            if let Some(execution) = execution {
+                execution.check_projection(&tx, id, saved)?;
+            }
+            let prior = crate::db::system::get_system_config_checked(&tx, "vendor_oauth_doc")?;
+            let mut doc = match &prior {
+                Some(raw) => serde_json::from_str(&crate::db::system::decrypt_config_value(raw)?)
+                    .context("damaged OAuth operator configuration; retained")?,
+                None => crate::types::VendorOAuthDoc::default(),
+            };
+            if !Self::merge_token(
+                &mut doc,
+                id,
+                original,
+                saved,
+                may_initialize && prior.is_none(),
+            )? {
+                tx.commit()?;
+                return Ok(());
+            }
+            let next = crate::db::system::encrypt_config_value(&serde_json::to_string(&doc)?)?;
+            let changed = match &prior {
+                Some(raw) => tx.execute(
+                    "UPDATE system_config SET value=?1 WHERE key='vendor_oauth_doc' AND value=?2",
+                    rusqlite::params![next, raw],
+                )?,
+                None => tx.execute(
+                    "INSERT INTO system_config(key,value) VALUES ('vendor_oauth_doc',?1)",
+                    [&next],
+                )?,
+            };
+            anyhow::ensure!(
+                changed == 1
+                    && crate::db::system::get_system_config_checked(&tx, "vendor_oauth_doc")?
+                        .as_deref()
+                        == Some(next.as_str()),
+                "OAuth token projection was not committed; retained"
+            );
+            if let Some(execution) = execution {
+                execution.check_projection(&tx, id, saved)?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn validate_token_request(config: &OAuthConfig) -> anyhow::Result<url::Url> {
+        let endpoint = url::Url::parse(&config.token_url)
+            .map_err(|_| anyhow!("OAuth token endpoint is invalid; no request sent"))?;
+        anyhow::ensure!(
+            matches!(endpoint.scheme(), "http" | "https")
+                && endpoint.host_str().is_some()
+                && endpoint.username().is_empty()
+                && endpoint.password().is_none()
+                && endpoint.fragment().is_none(),
+            "OAuth token endpoint scope is invalid; no request sent"
+        );
+        crate::component_rt::runner::assert_provider_url_allowed(endpoint.as_str()).map_err(
+            |_| anyhow!("OAuth token endpoint is blocked by egress policy; no request sent"),
+        )?;
+        let reserved = [
+            "grant_type",
+            "client_id",
+            "client_secret",
+            "scope",
+            "refresh_token",
+            "code",
+            "code_verifier",
+            "redirect_uri",
+            "assertion",
+        ];
+        anyhow::ensure!(
+            !config
+                .extra_params
+                .keys()
+                .any(|key| reserved.contains(&key.to_ascii_lowercase().as_str()))
+                && !endpoint
+                    .query_pairs()
+                    .any(|(key, _)| { reserved.contains(&key.to_ascii_lowercase().as_str()) }),
+            "OAuth token parameters override credential identity; no request sent"
+        );
+        Ok(endpoint)
+    }
+
+    pub(crate) async fn request_token(
+        &self,
+        config: &OAuthConfig,
+        mut form: HashMap<&str, String>,
+    ) -> anyhow::Result<(String, i64, Option<String>)> {
+        let endpoint = Self::validate_token_request(config)?;
+        for (key, value) in &config.extra_params {
+            form.insert(key.as_str(), value.clone());
+        }
+        let mut response = self
+            .http_client
+            .client
+            .post(endpoint)
+            .timeout(std::time::Duration::from_secs(15))
+            .form(&form)
+            .send()
+            .await
+            .map_err(|_| anyhow!("OAuth token request failed; outcome unknown and retained"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(OAuthTokenResponseFault::Rejected(status.as_u16()).into());
+        }
+        const MAX_TOKEN_RESPONSE_BYTES: usize = 1024 * 1024;
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|length| length <= MAX_TOKEN_RESPONSE_BYTES as u64),
+            "OAuth token response exceeds 1 MiB; retained"
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| anyhow!("OAuth token response was interrupted; retained"))?
+        {
+            anyhow::ensure!(
+                bytes
+                    .len()
+                    .checked_add(chunk.len())
+                    .is_some_and(|length| length <= MAX_TOKEN_RESPONSE_BYTES),
+                "OAuth token response exceeds 1 MiB; retained"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        let body: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|_| anyhow!("OAuth token response is invalid JSON; retained"))?;
+        let access_token = body
+            .get("access_token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| {
+                !token.trim().is_empty() && reqwest::header::HeaderValue::from_str(token).is_ok()
+            })
+            .ok_or(OAuthTokenResponseFault::MissingToken)?
+            .to_string();
+        let expires_in = match body.get("expires_in") {
+            None => 3600,
+            Some(value) => value
+                .as_i64()
+                .filter(|lifetime| *lifetime > 0)
+                .context("OAuth token lifetime is invalid; retained")?,
+        };
+        let refresh_token = match body.get("refresh_token") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|token| !token.trim().is_empty())
+                    .context("OAuth refresh rotation is invalid; retained")?
+                    .to_string(),
+            ),
+        };
+        Ok((access_token, expires_in, refresh_token))
     }
 
     async fn fetch_client_credentials_token(
@@ -390,56 +1003,16 @@ impl OAuthTokenManager {
         let mut form = HashMap::new();
         form.insert("grant_type", "client_credentials".to_string());
         form.insert("client_id", config.client_id.clone());
-        let client_secret =
-            crate::component_rt::runner::resolve_credential_reference(&config.client_secret)?;
+        let client_secret = config.client_secret.clone();
         if !client_secret.is_empty() {
             form.insert("client_secret", client_secret);
         }
         if !config.scopes.is_empty() {
             form.insert("scope", config.scopes.clone());
         }
-        for (k, v) in &config.extra_params {
-            form.insert(k.as_str(), v.clone());
-        }
-
-        let resp = self
-            .http_client
-            .post(&config.token_url)
-            .form(&form)
-            .send()
+        self.request_token(config, form)
             .await
-            .with_context(|| format!("oauth token request failed: {}", config.token_url))?;
-
-        let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .with_context(|| "parse oauth token response failed")?;
-
-        if !status.is_success() {
-            let error = body
-                .get("error_description")
-                .or_else(|| body.get("error"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            return Err(anyhow!(
-                "oauth token request failed (status={}): {}",
-                status,
-                error
-            ));
-        }
-
-        let access_token = body
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing access_token in oauth response"))?
-            .to_string();
-        let expires_in = body
-            .get("expires_in")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(3600);
-
-        Ok((access_token, expires_in))
+            .map(|(token, lifetime, _)| (token, lifetime))
     }
 
     async fn fetch_jwt_bearer_token(&self, config: &OAuthConfig) -> anyhow::Result<(String, i64)> {
@@ -450,8 +1023,7 @@ impl OAuthTokenManager {
             "grant_type",
             "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
         );
-        let assertion =
-            crate::component_rt::runner::resolve_credential_reference(&config.client_secret)?;
+        let assertion = config.client_secret.clone();
         if !assertion.is_empty() {
             form.insert("assertion", assertion);
         }
@@ -459,53 +1031,9 @@ impl OAuthTokenManager {
         if !config.scopes.is_empty() {
             form.insert("scope", config.scopes.clone());
         }
-        for (k, v) in &config.extra_params {
-            form.insert(k.as_str(), v.clone());
-        }
-
-        let resp = self
-            .http_client
-            .post(&config.token_url)
-            .form(&form)
-            .send()
+        self.request_token(config, form)
             .await
-            .with_context(|| {
-                format!(
-                    "oauth jwt_bearer token request failed: {}",
-                    config.token_url
-                )
-            })?;
-
-        let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .with_context(|| "parse oauth jwt_bearer response failed")?;
-
-        if !status.is_success() {
-            let error = body
-                .get("error_description")
-                .or_else(|| body.get("error"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            return Err(anyhow!(
-                "oauth jwt_bearer request failed (status={}): {}",
-                status,
-                error
-            ));
-        }
-
-        let access_token = body
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing access_token in oauth jwt_bearer response"))?
-            .to_string();
-        let expires_in = body
-            .get("expires_in")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(3600);
-
-        Ok((access_token, expires_in))
+            .map(|(token, lifetime, _)| (token, lifetime))
     }
 
     /// Exchange a refresh_token for a new access_token.
@@ -519,8 +1047,7 @@ impl OAuthTokenManager {
         form.insert("grant_type", "refresh_token".to_string());
         form.insert("refresh_token", refresh_token.to_string());
         form.insert("client_id", config.client_id.clone());
-        let client_secret =
-            crate::component_rt::runner::resolve_credential_reference(&config.client_secret)?;
+        let client_secret = config.client_secret.clone();
         if !client_secret.is_empty() {
             form.insert("client_secret", client_secret);
         }
@@ -528,61 +1055,20 @@ impl OAuthTokenManager {
             form.insert("scope", config.scopes.clone());
         }
 
-        let resp = self
-            .http_client
-            .post(&config.token_url)
-            .form(&form)
-            .send()
-            .await
-            .with_context(|| format!("oauth refresh_token request failed: {}", config.token_url))?;
-
-        let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .with_context(|| "parse oauth refresh_token response failed")?;
-
-        if !status.is_success() {
-            let error = body
-                .get("error_description")
-                .or_else(|| body.get("error"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown error");
-            return Err(anyhow!(
-                "oauth refresh_token request failed (status={}): {}",
-                status,
-                error
-            ));
-        }
-
-        let access_token = body
-            .get("access_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("missing access_token in refresh_token response"))?
-            .to_string();
-        let expires_in = body
-            .get("expires_in")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(3600);
-        // Some providers rotate the refresh_token on each use
-        let new_refresh = body
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        Ok((access_token, expires_in, new_refresh))
+        self.request_token(config, form).await
     }
 
-    async fn persist_doc(&self, doc: &crate::types::VendorOAuthDoc) {
-        let _ = crate::bindings::save_vendor_oauth(&self.config_path, doc);
-        if let Some(ref db_path) = self.db_path {
-            if let Ok(conn) = crate::db::open_db(db_path) {
-                let _ = crate::db::migrate_from_json_if_needed(&conn);
-                let _ = crate::db::vendor::save_vendor_oauth_doc(&conn, doc);
-            }
+    async fn persist_doc(&self, doc: &crate::types::VendorOAuthDoc) -> anyhow::Result<()> {
+        if self.frozen {
+            return Ok(());
         }
+        if !self.config_path.is_empty() {
+            crate::bindings::save_vendor_oauth(&self.config_path, doc)?;
+        }
+        if let Some(ref db_path) = self.db_path {
+            let conn = crate::db::open_db(db_path)?;
+            crate::db::vendor::save_vendor_oauth_doc(&conn, doc)?;
+        }
+        Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests;

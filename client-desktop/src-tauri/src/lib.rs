@@ -1,7 +1,6 @@
 pub mod commands;
 pub mod security;
 
-use client_runtime_core::env_helpers::env_bool;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -17,6 +16,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.unminimize();
                 let _ = w.set_focus();
             }
         }))
@@ -24,6 +25,12 @@ pub fn run() {
         // Persist window size/position across restarts (per the tauri
         // window-state plugin; state file lives in the app data dir).
         .plugin(tauri_plugin_window_state::Builder::default().build())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             // Pin the brand icon for taskbars/status areas.
             //
@@ -36,9 +43,9 @@ pub fn run() {
             pin_window_icon(app);
 
             // Phase 5: security bootstrap for desktop client.
-            // Only an explicit true value skips security; `WPTSALL_SKIP_SECURITY=0`
-            // must keep the production verification gate active.
-            if !env_bool("WPTSALL_SKIP_SECURITY", false) {
+            // S11 (batch G): SKIP_SECURITY is a debug-only valve (guide 16);
+            // release builds ignore the attempt with a loud log.
+            if !wptsall_client_security::bypass::debug_only_valve("WPTSALL_SKIP_SECURITY") {
                 if let Err(e) = security::init_desktop() {
                     tracing::warn!("security bootstrap: {e:#}");
                 }
@@ -51,6 +58,12 @@ pub fn run() {
                     tracing::error!("Agent failed to start: {e}");
                 }
             });
+
+            // Set up system tray menu and interaction events
+            if let Err(e) = setup_tray(app) {
+                tracing::warn!("system tray setup: {e:#}");
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -119,11 +132,13 @@ pub fn run() {
             commands::review::approve_item,
             commands::review::resubmit_item,
             commands::review::retranslate_item,
+            commands::review::reject_item,
             commands::logs::get_logs,
             commands::logs::get_recent_logs,
             commands::platform::get_platform_info,
             commands::update::check_for_update,
             commands::update::perform_update,
+            commands::webui_proxy::proxy_webui_request,
         ])
         .run(tauri::generate_context!())
         .expect("error while running application");
@@ -159,11 +174,17 @@ fn pin_window_icon(app: &tauri::App) {
         use gtk::gdk_pixbuf::Pixbuf;
         use gtk::prelude::{GtkWindowExt, WidgetExt};
 
+        // Align X11 WM_CLASS and Wayland app_id to match wptsall-client.desktop
+        gtk::glib::set_prgname(Some("wptsall-client"));
+        gtk::glib::set_application_name("WPTSALL Client");
+        gtk::Window::set_default_icon_name("wptsall-client");
+
         let png: &[u8] = include_bytes!("../icons/128x128.png");
         let (Ok(gtk_window), Ok(pixbuf)) = (main.gtk_window(), Pixbuf::from_read(png)) else {
             tracing::warn!("brand icon: gtk window or pixbuf unavailable");
             return;
         };
+        gtk::Window::set_default_icon(&pixbuf);
         gtk_window.set_icon(Some(&pixbuf));
         match gtk_window.window() {
             Some(gdk_window) => gdk_window.set_icon_list(&[pixbuf]),
@@ -177,4 +198,94 @@ fn pin_window_icon(app: &tauri::App) {
             }
         }
     }
+}
+
+/// Localized tray menu labels (X-6): the tray is native and previously
+/// hard-coded Chinese — EN systems rendered a mixed-locale menu. The labels
+/// now resolve through the SAME flat catalog the client core uses
+/// (`client-wpplugin/source/locales/{en,zh-CN}.json`, keys `tray.*`),
+/// with the core's env-based locale detection (WPTSALL_LOCALE → LANG) and
+/// English fallback for unknown locales.
+pub struct TrayLabels {
+    pub show: String,
+    pub run_once: String,
+    pub quit: String,
+}
+
+pub fn tray_menu_labels(lang: &str) -> TrayLabels {
+    use wptsall_client::i18n::t;
+    TrayLabels {
+        show: t("tray.show", lang),
+        run_once: t("tray.run_once", lang),
+        quit: t("tray.quit", lang),
+    }
+}
+
+fn tray_locale() -> String {
+    wptsall_client::i18n::detect_cli_locale()
+}
+
+/// Configure the system tray icon, context menu, and click events.
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder};
+    use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+
+    let labels = tray_menu_labels(&tray_locale());
+    let show_item = MenuItemBuilder::with_id("show", labels.show).build(app)?;
+    let run_once_item = MenuItemBuilder::with_id("run_once", labels.run_once).build(app)?;
+    let quit_item = MenuItemBuilder::with_id("quit", labels.quit).build(app)?;
+
+    let menu = MenuBuilder::new(app)
+        .item(&show_item)
+        .item(&run_once_item)
+        .separator()
+        .item(&quit_item)
+        .build()?;
+
+    if let Some(tray) = app.tray_by_id("default") {
+        tray.set_menu(Some(menu))?;
+        tray.on_menu_event(|app, event| match event.id.as_ref() {
+            "show" => {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }
+            "run_once" => {
+                tauri::async_runtime::spawn(async move {
+                    let req = commands::worker::WorkerRunOnceRequest {
+                        max_iterations: 4,
+                        max_elapsed_secs: 180,
+                        max_items_per_run: 64,
+                    };
+                    let _ = commands::worker::run_worker_once(req).await;
+                });
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
+        });
+        tray.on_tray_icon_event(|tray, event| match event {
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
+            | TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => {
+                let app = tray.app_handle();
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.show();
+                    let _ = w.unminimize();
+                    let _ = w.set_focus();
+                }
+            }
+            _ => {}
+        });
+    }
+    Ok(())
 }

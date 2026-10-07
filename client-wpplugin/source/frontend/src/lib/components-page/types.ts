@@ -98,6 +98,12 @@ export interface RuleBinding {
   component_id: string;
 }
 
+export interface TaskTypeComponentBinding {
+  business_line: string;
+  task_type: string;
+  component_id: string;
+}
+
 export interface RuleSlotOption {
   key: string;
   label: string;

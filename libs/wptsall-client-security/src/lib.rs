@@ -12,6 +12,7 @@
 //! 9. Commercial packer hooks documented in install-client/security/
 
 pub mod antitamper;
+pub mod bypass;
 pub mod device;
 pub mod gate;
 pub mod manifest;

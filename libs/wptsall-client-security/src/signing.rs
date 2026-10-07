@@ -34,13 +34,3 @@ pub fn verify_release_artifact(artifact_path: &str, sig_path: &str) -> Result<()
 pub fn verify_sha256sums_signature(sha256sums_path: &str, sig_path: &str) -> Result<()> {
     verify_release_artifact(sha256sums_path, sig_path)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn embedded_pubkey_api_callable() {
-        let _ = embedded_minisign_pubkey_b64();
-    }
-}

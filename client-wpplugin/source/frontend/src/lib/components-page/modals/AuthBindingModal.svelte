@@ -6,6 +6,7 @@
     VendorKeyItem,
   } from '../types';
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../../modal-a11y';
 
   export let open = false;
   export let component: LocalComp | null = null;
@@ -15,6 +16,7 @@
   export let overrideRequestUrl = '';
   export let overrideRequestHeadersJson = '';
   export let overrideRequestBodyJson = '';
+  export let languageMapText = '';
   export let overrideMaxInputChars = '';
   export let overrideRateLimitQps = '';
   export let overrideMaxConcurrentRequests = '';
@@ -47,12 +49,14 @@
 {#if open && component}
   <div
     class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-    role="button"
+    role="dialog"
+    aria-modal="true"
     tabindex="0"
     aria-label={$_('auth_modal.close_modal')}
     onclick={(e) => {
       if (e.target === e.currentTarget) onClose();
     }}
+    use:modalA11y={{ onClose }}
     onkeydown={(e) => handleBackdropKeydown(e, onClose)}>
     <div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-lg max-h-[90vh] flex flex-col overflow-y-auto">
       <h4 class="font-semibold text-gray-900 mb-4">{$_('auth_modal.title')} — {component.name}</h4>
@@ -293,6 +297,18 @@
             </div>
           </div>
         {/if}
+      </div>
+
+      <div class="border border-gray-200 rounded-lg p-3 mb-4 space-y-2">
+        <div class="text-sm font-medium text-gray-700">{$_('auth_modal.language_map')}</div>
+        <p class="text-xs text-gray-500">{$_('auth_modal.language_map_hint')}</p>
+        <textarea
+          id={component ? authModalFieldId(component.id, 'language-map') : 'binding-language-map'}
+          bind:value={languageMapText}
+          rows="3"
+          data-testid="binding-language-map"
+          placeholder="en_US=EN"
+          class="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm font-mono"></textarea>
       </div>
 
       {#if editableParamPaths.length > 0}

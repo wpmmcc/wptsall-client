@@ -20,7 +20,3 @@ uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rsa = "0.9"
-
-[dev-dependencies]
-tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

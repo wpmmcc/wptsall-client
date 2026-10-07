@@ -94,6 +94,8 @@ export interface DomainTokenBindingStatusItem {
   token_prefix: string;
   token_len: number;
   route_secret_set?: boolean;
+  plugin_identity?: string | null;
+  identity_verified_at?: string | null;
 }
 
 export interface TaskTypeComponentBindingStatusItem {
@@ -152,6 +154,10 @@ export interface WorkerRunRecord {
 }
 
 export interface WebUiStatus {
+  /** Capacity-only status omits unavailable database inventories, never empty-success substitutes. */
+  storage_paused?: boolean;
+  database_available?: boolean;
+  restart_required?: boolean;
   /** P0-LF-04: "local" (default) or "legacy_server_control_plane" (§5.1 projection). */
   runtime_mode?: string;
   server_base: string;
@@ -178,6 +184,8 @@ export interface WebUiStatus {
   last_error: string;
   last_event: string;
   updated_at: number;
+  /** S12: true when WPTSALL_ALLOW_INSECURE_TLS is enabled — the App renders a warning banner. */
+  allow_insecure_tls?: boolean;
 }
 
 // ===================== 组件模板 =====================
@@ -205,6 +213,20 @@ export interface ComponentVersion {
   created_at: string;
 }
 
+export type ComponentHttpPhase =
+  | 'request'
+  | 'prepare.request'
+  | 'async_poll.request'
+  | 'async_poll.result_request'
+  | 'async_poll.result_download'
+  | 'async_poll.reconcile.request'
+  | 'source_upload';
+
+export interface ComponentHttpLimits {
+  max_response_bytes?: number;
+  timeout_ms?: number;
+}
+
 export interface LocalComponent {
   id: string;
   name: string;
@@ -224,6 +246,7 @@ export interface LocalComponent {
     constraints_override?: ComponentBindingEntry['constraints_override'];
     request_overrides?: ComponentBindingEntry['request_overrides'];
     default_values_override?: Record<string, unknown>;
+    http_limits_overrides?: Partial<Record<ComponentHttpPhase, ComponentHttpLimits>>;
   } | null;
   versions: Record<string, ComponentVersion>;
   template_json?: Record<string, unknown> | null;

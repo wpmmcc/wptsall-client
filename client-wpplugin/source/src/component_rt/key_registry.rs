@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Global per-key concurrency counter shared across all `KeyPool` instances.
 ///
@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Default)]
 pub(crate) struct GlobalKeyRegistry {
     inner: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
+    notify: Arc<tokio::sync::Notify>,
+    clocks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<std::time::Instant>>>>>,
 }
 
 impl GlobalKeyRegistry {
@@ -28,63 +30,35 @@ impl GlobalKeyRegistry {
         Self::default()
     }
 
+    pub(crate) fn process() -> &'static Self {
+        static REGISTRY: OnceLock<GlobalKeyRegistry> = OnceLock::new();
+        REGISTRY.get_or_init(Self::new)
+    }
+
+    pub(crate) fn notify(&self) -> Arc<tokio::sync::Notify> {
+        self.notify.clone()
+    }
+
+    pub(crate) fn rate_clock(&self, key_id: &str) -> Arc<tokio::sync::Mutex<std::time::Instant>> {
+        let mut clocks = self
+            .clocks
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        clocks
+            .entry(key_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Mutex::new(
+                    std::time::Instant::now() - std::time::Duration::from_secs(60),
+                ))
+            })
+            .clone()
+    }
+
     /// Return (or create) the shared counter for `key_id`.
     pub(crate) fn get_or_create(&self, key_id: &str) -> Arc<AtomicUsize> {
         let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(key_id.to_string())
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    // catalog: WEBUI-MOD-component-rt-key-registry-rs
-    // oracle: L1
-    use super::*;
-
-    #[test]
-    fn same_key_shares_one_counter_across_lookups() {
-        let registry = GlobalKeyRegistry::new();
-        let a = registry.get_or_create("key-a");
-        let b = registry.get_or_create("key-a");
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "the same key_id must resolve to one shared counter"
-        );
-
-        a.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            b.load(std::sync::atomic::Ordering::Relaxed),
-            1,
-            "increments through one handle must be visible through the other"
-        );
-    }
-
-    #[test]
-    fn different_keys_get_independent_counters() {
-        let registry = GlobalKeyRegistry::new();
-        let a = registry.get_or_create("key-a");
-        let b = registry.get_or_create("key-b");
-        assert!(!Arc::ptr_eq(&a, &b));
-
-        a.fetch_add(3, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            b.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "per-key limits must not bleed across key ids"
-        );
-    }
-
-    #[test]
-    fn cloned_registries_share_the_underlying_counters() {
-        let registry = GlobalKeyRegistry::new();
-        let clone = registry.clone();
-        let a = registry.get_or_create("key-a");
-        let b = clone.get_or_create("key-a");
-        assert!(
-            Arc::ptr_eq(&a, &b),
-            "registry clones (one per KeyPool instance) must see the same counters"
-        );
     }
 }

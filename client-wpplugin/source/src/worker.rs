@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,16 +10,20 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod startup;
+
 use crate::auth::{
     build_request_id, is_auth_error_message, is_wp_token_rotation_error, parse_api_error_response,
     request_json_encrypted,
 };
 use crate::bindings::{
-    build_wp_base_url, domain_token_binding_local_sites, has_any_domain_token_bindings,
+    build_verify_base_url, build_wp_base_url, classify_verify_outcome,
+    domain_token_binding_local_sites, format_rfc3339_utc, gate, has_any_domain_token_bindings,
     load_component_bindings, load_components_local, load_domain_token_bindings,
     load_proxy_profiles, load_rule_component_bindings, load_task_type_component_bindings,
-    normalize_api_base_url_key, normalize_domain_base, resolve_local_dev_binding,
-    resolve_route_secret_for_domain, resolve_wp_client_token_for_domain,
+    normalize_api_base_url_key, normalize_domain_base, now_unix, resolve_entry_for_domain,
+    resolve_local_dev_binding, resolve_route_secret_for_domain, resolve_wp_client_token_for_domain,
+    save_domain_token_bindings, verify_identity, GateVerdict, VerifyOutcome,
 };
 use crate::component_rt::loader::{
     collect_configured_runtime_component_ids, load_component_runtimes,
@@ -28,7 +31,7 @@ use crate::component_rt::loader::{
 use crate::component_rt::proxy::ProxyClientPool;
 use crate::component_rt::sign_plugin;
 use crate::config::*;
-use crate::logging::{init_log_file, log_event, maybe_export_log, snippet};
+use crate::logging::{init_runtime_log_file, log_event, maybe_export_log, snippet};
 
 /// Apply persisted log settings (Settings page state in SQLite) plus the
 /// `WPTSALL_LOG_ENABLED` env override to the global logging atomics.
@@ -37,6 +40,10 @@ use crate::logging::{init_log_file, log_event, maybe_export_log, snippet};
 /// logging DISABLED, an explicit DB `true` enables it, and the env var
 /// overrides both when set.
 fn apply_log_settings_from_db(db_path: &str) {
+    // Register the process-wide log path first: engine modules without a
+    // threaded log_file parameter (sync credentials, job bookkeeping) emit
+    // their audit events through log_event_global.
+    crate::logging::set_log_file_path(crate::config::log_file_path());
     let (db_enabled, db_level) = match crate::db::open_db(db_path) {
         Ok(conn) => (
             crate::db::system::get_system_config(&conn, "log_enabled"),
@@ -64,13 +71,15 @@ fn is_fatal_control_plane_error(err_text: &str) -> bool {
     is_auth_error_message(err_text) || err_text.contains("RATE_LIMITED")
 }
 
-pub fn build_worker_config(default_worker_id: &str) -> WorkerConfig {
+pub fn build_worker_config(device_id: &str) -> WorkerConfig {
     let mut task_pull_statuses = parse_csv_env("WPTSALL_TASK_PULL_STATUSES");
     if task_pull_statuses.is_empty() {
         task_pull_statuses = vec!["pending".to_string(), "retry".to_string()];
     }
     WorkerConfig {
-        worker_id: env_or("WPTSALL_WORKER_ID", default_worker_id),
+        worker_id: env_or("WPTSALL_WORKER_ID", device_id),
+        device_id: device_id.to_string(),
+        discovery_max_items_per_run: env_usize("WPTSALL_DISCOVERY_MAX_ITEMS_PER_RUN", 100),
         task_pull_statuses,
         task_concurrency: env_usize("WPTSALL_TASK_CONCURRENCY", 3).max(1),
         retry_max: env_u32("WPTSALL_RETRY_MAX", 2),
@@ -106,18 +115,23 @@ pub async fn run_worker_cli(shutdown_token: CancellationToken) -> anyhow::Result
 
 async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<()> {
     let db_path = crate::config::db_path();
-    let device_id = if let Ok(id) = std::env::var("WPTSALL_DEVICE_ID") {
-        id
-    } else {
-        match crate::db::open_db(&db_path) {
-            Ok(conn) => {
-                crate::db::migrate_from_json_if_needed(&conn).ok();
-                crate::db::system::load_or_create_device_id(&conn)
-                    .unwrap_or_else(|_| Uuid::new_v4().to_string())
-            }
-            Err(_) => Uuid::new_v4().to_string(),
-        }
-    };
+    let runtime_lease = crate::db::runtime::RuntimeLease::acquire(&db_path)?;
+    let bootstrap_db = crate::db::open_db(&db_path)?;
+    let device_id = crate::db::with_recovery_credit(&bootstrap_db, || {
+        crate::db::system::migrate_device_id_from_file(&bootstrap_db)?;
+        let device_id = match crate::config::wp_device_id_override() {
+            Some(id) => id,
+            None => crate::db::system::load_or_create_device_id(&bootstrap_db)?,
+        };
+        // S3/SEC-02 (07 audit, 12 批 A5): the resolved identity is the default
+        // at-rest encryption source (see bindings::crypto::set_default_device_id).
+        crate::bindings::set_default_device_id(&device_id);
+        crate::db::migrate_from_json_if_needed(&bootstrap_db)?;
+        crate::db::runtime::recover_interrupted_work(&bootstrap_db, &runtime_lease)
+            .context("Failed to recover interrupted client work")?;
+        Ok(device_id)
+    })?;
+    let db = Arc::new(tokio::sync::Mutex::new(bootstrap_db));
     let domain_token_bindings_path = crate::config::domain_token_bindings_file();
     let poll_seconds = env_u64("WPTSALL_POLL_SECONDS", 20).max(1);
     let one_shot = env_bool("WPTSALL_ONESHOT", false);
@@ -132,57 +146,66 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
     let log_file = crate::config::log_file_path();
     let log_export_path = env_or("WPTSALL_LOG_EXPORT_PATH", "");
     apply_log_settings_from_db(&db_path);
-    init_log_file(&log_file)?;
-
-    let proxy_pool = {
-        let config_dir = Path::new(&component_bindings_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_string_lossy()
-            .to_string();
-        let proxy_profiles_path = Path::new(&config_dir)
-            .join("proxy-profiles.json")
-            .to_string_lossy()
-            .to_string();
-        match load_proxy_profiles(&proxy_profiles_path)
-            .and_then(|doc| ProxyClientPool::new(&doc.profiles))
-        {
-            Ok(pool) => Some(Arc::new(pool)),
+    init_runtime_log_file(&log_file)?;
+    // Boot observes durable async jobs without age-deleting saved work.
+    if let Ok(conn) = crate::db::open_db(&db_path) {
+        match crate::db::async_jobs::async_jobs_inventory(&conn) {
+            Ok((failed, polling)) => {
+                if failed > 0 || polling > 0 {
+                    let _ = log_event(
+                        &log_file,
+                        "info",
+                        "worker.async_jobs_recovery_inventory",
+                        json!({
+                            "failed_kept": failed,
+                            "polling_resumable": polling,
+                        }),
+                    );
+                }
+            }
             Err(err) => {
-                let _ = log_event(
-                    &log_file,
-                    "warning",
-                    "worker.proxy_pool_failed",
-                    json!({
-                        "path": proxy_profiles_path,
-                        "error": format!("{:#}", err)
-                    }),
-                );
-                None
+                eprintln!("warning: async jobs boot sweep failed: {err}");
             }
         }
+        // Inventory is read-only; unresolved relay snapshots never expire.
+        match crate::db::sync_inflight::sync_inflight_inventory(&conn) {
+            Ok(shipping) => {
+                if shipping > 0 {
+                    let _ = log_event(
+                        &log_file,
+                        "info",
+                        "worker.sync_inflight_recovery_inventory",
+                        json!({
+                            "shipping_resumable": shipping,
+                        }),
+                    );
+                }
+            }
+            Err(err) => {
+                return Err(err.context("sync inflight recovery inventory failed"));
+            }
+        }
+    }
+
+    let proxy_pool = {
+        // P7 unification: proxy profiles resolve through the config.rs
+        // single authority, never derived from the bindings file directory.
+        let proxy_profiles_path = crate::config::proxy_profiles_file();
+        let profiles = crate::bindings::read_proxy_profiles(&proxy_profiles_path)
+            .map_err(|_| crate::component_rt::loader::RuntimeConfigurationFault::error("proxy profiles"))?;
+        Some(Arc::new(ProxyClientPool::new(&profiles.profiles)
+            .map_err(|_| crate::component_rt::loader::RuntimeConfigurationFault::error("proxy profiles"))?))
     };
     let pending_callback_store = Arc::new(Mutex::new(PendingCallbackStore::open(&db_path)?));
 
-    let mut domain_token_bindings = match load_domain_token_bindings(&domain_token_bindings_path) {
-        Ok(doc) => doc,
-        Err(err) => {
-            let _ = log_event(
-                &log_file,
-                "warning",
-                "worker.domain_tokens_load_failed",
-                json!({
-                    "path": domain_token_bindings_path,
-                    "error": format!("{:#}", err)
-                }),
-            );
-            DomainTokenBindingsDoc::default()
-        }
-    };
+    let mut domain_token_bindings = load_domain_token_bindings(&domain_token_bindings_path)
+        .context("worker site binding authority is unreadable; startup refused")?;
     let mut task_type_component_bindings =
-        load_task_type_component_bindings(&task_type_component_bindings_path).unwrap_or_default();
+        load_task_type_component_bindings(&task_type_component_bindings_path)
+            .context("worker task binding authority is unreadable; startup refused")?;
     let mut rule_component_bindings =
-        load_rule_component_bindings(&rule_component_bindings_path).unwrap_or_default();
+        load_rule_component_bindings(&rule_component_bindings_path)
+            .context("worker rule binding authority is unreadable; startup refused")?;
 
     let _ = log_event(
         &log_file,
@@ -222,16 +245,39 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
         return Ok(());
     }
 
-    let client = Client::builder()
-        .no_proxy()
+    let client = crate::auth::wp_http_client_builder()
         .timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(10)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .connect_timeout(Duration::from_secs(10))
         .build()?;
 
-    let mut component_bindings = load_component_bindings(&component_bindings_path)?;
-    let local_components_doc = load_components_local(&components_local_path).unwrap_or_default();
+    // 批 Q (事件驱动 wake): long-poll waiter per bound site — ready events
+    // break the poll sleep below immediately. Polling stays the fallback
+    // (waiter error/404/禁用 all degrade to the plain poll cadence);
+    // one-shot runs never spawn a waiter.
+    let event_wait_cfg = crate::task_engine::event_waiter::EventWaitConfig::from_env();
+    let event_wake = Arc::new(tokio::sync::Notify::new());
+    let mut event_waiter_handle: Option<tokio::task::JoinHandle<()>> = None;
+    if event_wait_cfg.enabled && !one_shot {
+        event_waiter_handle = Some(tokio::spawn(
+            crate::task_engine::event_waiter::run_event_waiter(
+                event_wait_cfg.clone(),
+                worker_config.worker_id.clone(),
+                device_id.clone(),
+                log_file.clone(),
+                Arc::clone(&event_wake),
+                shutdown_token.clone(),
+            ),
+        ));
+    }
+
+    let (mut component_bindings, local_components_doc) = {
+        let conn = db.lock().await;
+        startup::load_component_documents(
+            &conn,
+            &domain_token_bindings,
+            &component_bindings_path,
+            &components_local_path,
+        )?
+    };
     let target_component_ids = collect_configured_runtime_component_ids(
         &local_components_doc,
         Some(&task_type_component_bindings),
@@ -252,6 +298,9 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
         .await
         {
             Ok(registry) => Some(Arc::new(registry)),
+            Err(err) if err.is::<crate::component_rt::loader::RuntimeConfigurationFault>() => {
+                return Err(err)
+            }
             Err(err) => {
                 let _ = log_event(
                     &log_file,
@@ -272,15 +321,12 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
             break;
         }
 
-        if let Ok(doc) = load_domain_token_bindings(&domain_token_bindings_path) {
-            domain_token_bindings = doc;
-        }
-        if let Ok(doc) = load_task_type_component_bindings(&task_type_component_bindings_path) {
-            task_type_component_bindings = doc;
-        }
-        if let Ok(doc) = load_rule_component_bindings(&rule_component_bindings_path) {
-            rule_component_bindings = doc;
-        }
+        domain_token_bindings = load_domain_token_bindings(&domain_token_bindings_path)
+            .context("worker site binding authority changed or became unreadable")?;
+        task_type_component_bindings = load_task_type_component_bindings(&task_type_component_bindings_path)
+            .context("worker task binding authority changed or became unreadable")?;
+        rule_component_bindings = load_rule_component_bindings(&rule_component_bindings_path)
+            .context("worker rule binding authority changed or became unreadable")?;
 
         let domains = domain_token_binding_local_sites(&domain_token_bindings);
         let _ = log_event(
@@ -299,10 +345,15 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
             wp_client_token: String,
             route_secret: Option<String>,
             wp_base: String,
+            /// Identity Contract v1.1 §5 (C-1): verified identity this domain
+            /// dispatches under; the lane-level check in the discoverer
+            /// fail-closes on any disagreement.
+            binding_identity: crate::types::PluginIdentity,
             relation_limit: Option<usize>,
         }
         let mut domain_tasks: Vec<DomainTask> = Vec::new();
         let mut missing_route_secret_domains: Vec<String> = Vec::new();
+        let mut identity_bindings_dirty = false;
 
         for domain in &domains {
             let Some(token) = resolve_wp_client_token_for_domain(
@@ -329,13 +380,145 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
                 );
                 continue;
             };
+
+            // Identity Contract v1.1 §5 (C-1): fail-closed identity gate.
+            // A binding whose plugin identity is unknown, mismatched, or past
+            // the 24h verification TTL never dispatches tasks. Event payloads
+            // carry no credential fields.
+            let Some(entry) =
+                resolve_entry_for_domain(&domain.api_base_url, &domain_token_bindings)
+            else {
+                continue;
+            };
+            let binding_identity = match gate(entry, now_unix()) {
+                GateVerdict::Fresh(identity) => Some(identity),
+                GateVerdict::Reverify { .. } => {
+                    // Identity-aware verify base (contract §2/§3): the entry's
+                    // stored identity (v3 migration default wpmmcc_ats)
+                    // selects the endpoint family — ATS bindings verify on
+                    // wptsall/v2/{secret}/client/ping, wpmmcc bindings on
+                    // wpmmcc/v1/{secret}/sync/ping.
+                    let expected_identity = entry
+                        .plugin_identity
+                        .unwrap_or(crate::types::PluginIdentity::WpmmccAts);
+                    let verify_base = build_verify_base_url(
+                        &domain_base,
+                        route_secret.as_deref().unwrap_or(""),
+                        &expected_identity,
+                    )
+                    .unwrap_or_else(|| wp_base.clone());
+                    let outcome = verify_identity(
+                        &client,
+                        &verify_base,
+                        &token,
+                        &worker_config.worker_id,
+                        &worker_config.device_id,
+                        route_secret.as_deref(),
+                    )
+                    .await;
+                    match classify_verify_outcome(&outcome, entry) {
+                        Ok(verified) => {
+                            // Refresh the persisted binding (contract §4):
+                            // verified identity + timestamp + capability
+                            // snapshot. First verify of a migrated v3 entry
+                            // overwrites the migration default.
+                            let caps = match &outcome {
+                                VerifyOutcome::Verified(_, caps) => caps.clone(),
+                                _ => crate::types::IdentityCapabilities::default(),
+                            };
+                            let verified_at = format_rfc3339_utc(now_unix());
+                            let legacy_key = normalize_api_base_url_key(&domain.api_base_url);
+                            let stored = match domain_token_bindings.domains.get_mut(&domain_base) {
+                                Some(stored) => Some(stored),
+                                None => domain_token_bindings.domains.get_mut(&legacy_key),
+                            };
+                            if let Some(stored) = stored {
+                                stored.plugin_identity = Some(verified);
+                                stored.identity_verified_at = Some(verified_at);
+                                stored.identity_capabilities = Some(caps);
+                                identity_bindings_dirty = true;
+                            }
+                            Some(verified)
+                        }
+                        Err(Some(code)) => {
+                            let _ = log_event(
+                                &log_file,
+                                "warning",
+                                code,
+                                json!({ "api_base_url": domain.api_base_url }),
+                            );
+                            None
+                        }
+                        Err(None) => {
+                            // Transport failure: not a reserved-code event;
+                            // retry next cycle.
+                            let _ = log_event(
+                                &log_file,
+                                "warning",
+                                "identity.verify_failed",
+                                json!({ "api_base_url": domain.api_base_url }),
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+            let Some(binding_identity) = binding_identity else {
+                continue;
+            };
+
+            // FL-3 (Wave-2): this collector feeds ONLY the wpmmcc-ats
+            // discovery lanes. A binding that verified as plain `wpmmcc`
+            // is owned by the pair engine (sync lanes); dispatching it here
+            // would trip the lane-entry identity guard on EVERY run-once
+            // iteration (observed: 180-iteration identity_mismatch warn
+            // storms in SIM-08/SIM-13). Filter at task generation; one
+            // info notice per (domain, identity) keeps the exclusion
+            // visible without warn-level radar noise. No credential fields.
+            if binding_identity != crate::types::PluginIdentity::WpmmccAts {
+                if crate::bindings::identity_exclusion_first_notice(
+                    "wpmmcc_ats_task_generation",
+                    &domain.api_base_url,
+                    binding_identity.as_wire_str(),
+                ) {
+                    let _ = log_event(
+                        &log_file,
+                        "info",
+                        "worker.domain_lane_excluded",
+                        json!({
+                            "api_base_url": domain.api_base_url,
+                            "lane": "wpmmcc_ats",
+                            "binding_identity": binding_identity.as_wire_str(),
+                        }),
+                    );
+                }
+                continue;
+            }
+
             domain_tasks.push(DomainTask {
                 api_base_url: domain.api_base_url.clone(),
                 wp_client_token: token,
                 route_secret,
                 wp_base,
+                binding_identity,
                 relation_limit: None,
             });
+        }
+
+        if identity_bindings_dirty {
+            if let Err(err) =
+                save_domain_token_bindings(&domain_token_bindings_path, &domain_token_bindings)
+            {
+                let _ = log_event(
+                    &log_file,
+                    "warning",
+                    "worker.identity_bindings_save_failed",
+                    json!({
+                        "path": domain_token_bindings_path,
+                        "error": format!("{:#}", err)
+                    }),
+                );
+            }
         }
 
         if domain_tasks.is_empty() {
@@ -364,8 +547,11 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
             let worker_config = worker_config.clone();
             let pending_callback_store = Arc::clone(&pending_callback_store);
             let governor = Arc::clone(&governor);
+            let domain_lease = Arc::clone(&runtime_lease);
+            let db = Arc::clone(&db);
 
             domain_joins.spawn(async move {
+                let _lease = domain_lease;
                 let Some(_domain_permit) = governor.domain_sem.acquire().await.ok() else {
                     return Ok(None);
                 };
@@ -386,7 +572,8 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
                     Some(Arc::clone(&governor.global_translation_sem)),
                     Some(Arc::clone(&governor.global_callback_sem)),
                     dt.relation_limit,
-                    None,
+                    Some(Arc::clone(&db)),
+                    dt.binding_identity,
                 )
                 .await;
 
@@ -447,11 +634,237 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
             );
         }
 
+        // WPMMCC Cross-Site Sync Lane (WBS 4.2 / lane: "wpmmcc_sync").
+        //
+        // Every eligible pair runs as its own spawned task (true physical
+        // concurrency — the old serial for-await was mislabeled as
+        // "并发车道"), with per-site HMAC credentials from the pairing
+        // handshake and per-pair translator runtimes for the
+        // sync_and_translate cascade. Errors are logged, never swallowed.
+        {
+            let sync_pairs_path = crate::config::sync_pairs_file();
+            let credentials_path = crate::config::sync_peer_credentials_file();
+            let pairs_doc = match crate::sync_engine::load_sync_pairs(&sync_pairs_path) {
+                Ok(doc) => doc,
+                Err(err) => {
+                    let _ = log_event(
+                        &log_file,
+                        "warning",
+                        "worker.sync_pairs_load_failed",
+                        json!({ "error": format!("{err:#}") }),
+                    );
+                    crate::sync_engine::SyncPairsDoc::default()
+                }
+            };
+            let peer_credentials =
+                match crate::sync_engine::load_peer_credentials(&credentials_path) {
+                    Ok(doc) => doc,
+                    Err(err) => {
+                        let _ = log_event(
+                            &log_file,
+                            "warning",
+                            "worker.sync_credentials_load_failed",
+                            json!({ "error": format!("{err:#}") }),
+                        );
+                        crate::sync_engine::PeerCredentialsDoc::default()
+                    }
+                };
+
+            let now_ts = crate::logging::unix_ts();
+            let mut eligible: Vec<crate::sync_engine::SyncPair> = pairs_doc
+                .pairs
+                .into_iter()
+                .filter(|pair| pair.status == crate::sync_engine::SyncPairStatus::Active)
+                .filter(|pair| {
+                    let should_run = match pair.sync_frequency {
+                        crate::sync_engine::SyncFrequency::Manual => one_shot,
+                        crate::sync_engine::SyncFrequency::EveryMinute => pair
+                            .last_sync_at
+                            .map(|t| now_ts.saturating_sub(t) >= 60)
+                            .unwrap_or(true),
+                        crate::sync_engine::SyncFrequency::Hourly => pair
+                            .last_sync_at
+                            .map(|t| now_ts.saturating_sub(t) >= 3600)
+                            .unwrap_or(true),
+                        crate::sync_engine::SyncFrequency::Daily => pair
+                            .last_sync_at
+                            .map(|t| now_ts.saturating_sub(t) >= 86400)
+                            .unwrap_or(true),
+                    };
+                    // Skip pairs whose ends are not paired yet — the run
+                    // would only record a config error every cycle.
+                    should_run
+                        && crate::sync_engine::find_peer_credential(
+                            &peer_credentials,
+                            &pair.source_domain,
+                        )
+                        .is_some()
+                        && crate::sync_engine::find_peer_credential(
+                            &peer_credentials,
+                            &pair.target_domain,
+                        )
+                        .is_some()
+                        // 批 C: sync-pair cooldown (X-5). A pair whose last
+                        // run was a TOTAL failure (zero synced, ≥1 error)
+                        // waits out its cooldown instead of retrying a dead
+                        // endpoint at full worker cadence. The skip is itself
+                        // logged — the evidence line ops greps for.
+                        && {
+                            let decision =
+                                crate::task_engine::backoff::check_sync_pair(&pair.id);
+                            if decision.blocked {
+                                let _ = log_event(
+                                    &log_file,
+                                    "info",
+                                    "worker.sync_pair_backoff_skip",
+                                    json!({
+                                        "pair_id": pair.id,
+                                        "remaining_secs": decision.remaining_secs,
+                                        "consecutive_failures": decision.consecutive_failures,
+                                    }),
+                                );
+                                false
+                            } else {
+                                true
+                            }
+                        }
+                })
+                .collect();
+
+            if !eligible.is_empty() {
+                let _ = log_event(
+                    &log_file,
+                    "info",
+                    "worker.sync_lane_started",
+                    json!({ "pairs": eligible.len(), "one_shot": one_shot }),
+                );
+                let mut lane = tokio::task::JoinSet::new();
+                for pair in eligible.drain(..) {
+                    let client = client.clone();
+                    let log_file = log_file.clone();
+                    let credentials = peer_credentials.clone();
+                    let pair_lease = Arc::clone(&runtime_lease);
+                    lane.spawn(async move {
+                        let _lease = pair_lease;
+                        let pair_id = pair.id.clone();
+                        let translator = match pair.sync_mode {
+                            crate::sync_engine::SyncMode::SyncAndTranslate => {
+                                let component_id =
+                                    pair.translate_component_id.as_deref().unwrap_or("").trim();
+                                if component_id.is_empty() {
+                                    None // engine records the config error
+                                } else {
+                                    match crate::sync_engine::build_translator(
+                                        &client,
+                                        component_id,
+                                        &log_file,
+                                    )
+                                    .await
+                                    {
+                                        Ok(t) => Some(t),
+                                        Err(err) => {
+                                            let _ = log_event(
+                                                &log_file,
+                                                "warning",
+                                                "worker.sync_translator_unavailable",
+                                                json!({
+                                                    "pair_id": pair_id,
+                                                    "component_id": component_id,
+                                                    "error": format!("{err:#}"),
+                                                }),
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                            }
+                            crate::sync_engine::SyncMode::SyncOnly => None,
+                        };
+                        let result = crate::sync_engine::sync_pair_run(
+                            &client,
+                            &pair_id,
+                            &credentials,
+                            translator.as_ref(),
+                            &log_file,
+                        )
+                        .await;
+                        (pair_id, result)
+                    });
+                }
+                while let Some(joined) = lane.join_next().await {
+                    match joined {
+                        Ok((pair_id, Ok(report))) => {
+                            // 批 C (X-5): feed the sync-pair backoff domain.
+                            // Only a TOTAL failure (zero synced, ≥1 error)
+                            // cools the pair down; any success resets it.
+                            if crate::sync_engine::sync_run_is_total_failure(&report) {
+                                let decision =
+                                    crate::task_engine::backoff::record_sync_pair_failure(&pair_id);
+                                let _ = log_event(
+                                    &log_file,
+                                    "warning",
+                                    "worker.sync_pair_backoff_recorded",
+                                    json!({
+                                        "pair_id": pair_id,
+                                        "trace_id": report.trace_id,
+                                        "cooldown_secs": decision.remaining_secs,
+                                        "consecutive_failures": decision.consecutive_failures,
+                                        "last_error": report.last_error,
+                                    }),
+                                );
+                            } else {
+                                crate::task_engine::backoff::record_sync_pair_success(&pair_id);
+                            }
+                            if report.error_count > 0 {
+                                let _ = log_event(
+                                    &log_file,
+                                    "warning",
+                                    "worker.sync_pair_finished_with_errors",
+                                    json!({
+                                        "pair_id": pair_id,
+                                        "trace_id": report.trace_id,
+                                        "errors": report.error_count,
+                                        "last_error": report.last_error,
+                                    }),
+                                );
+                            }
+                        }
+                        Ok((pair_id, Err(err))) => {
+                            let _ = log_event(
+                                &log_file,
+                                "error",
+                                "worker.sync_pair_failed",
+                                json!({ "pair_id": pair_id, "error": format!("{err:#}") }),
+                            );
+                        }
+                        Err(err) => {
+                            let _ = log_event(
+                                &log_file,
+                                "error",
+                                "worker.sync_pair_join_failed",
+                                json!({ "error": err.to_string() }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if one_shot || shutdown_token.is_cancelled() {
             break;
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(poll_seconds)) => {}
+            // 批 Q: waiter 就绪信号提前结束本轮 sleep（Notify permit 语义
+            // 保证 drain 期间的多次唤醒至多补一轮，不惊群）。
+            _ = event_wake.notified() => {
+                let _ = log_event(
+                    &log_file,
+                    "info",
+                    "worker.event_wake_break",
+                    json!({ "poll_seconds": poll_seconds }),
+                );
+            }
             _ = shutdown_token.cancelled() => {
                 let _ = log_event(&log_file, "info", "worker.shutdown_during_sleep", json!({}));
                 break;
@@ -459,6 +872,9 @@ async fn run_local_worker(shutdown_token: CancellationToken) -> anyhow::Result<(
         }
     }
 
+    if let Some(handle) = event_waiter_handle.take() {
+        handle.abort();
+    }
     maybe_export_log(&log_file, &log_export_path)?;
     let _ = log_event(&log_file, "info", "shutdown", json!({ "mode": "local" }));
     crate::logging::flush_log();
@@ -490,18 +906,23 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
         );
     }
     let db_path = crate::config::db_path();
-    let device_id = if let Ok(id) = std::env::var("WPTSALL_DEVICE_ID") {
-        id
-    } else {
-        match crate::db::open_db(&db_path) {
-            Ok(conn) => {
-                crate::db::migrate_from_json_if_needed(&conn).ok();
-                crate::db::system::load_or_create_device_id(&conn)
-                    .unwrap_or_else(|_| Uuid::new_v4().to_string())
-            }
-            Err(_) => Uuid::new_v4().to_string(),
-        }
-    };
+    let runtime_lease = crate::db::runtime::RuntimeLease::acquire(&db_path)?;
+    let bootstrap_db = crate::db::open_db(&db_path)?;
+    let device_id = crate::db::with_recovery_credit(&bootstrap_db, || {
+        crate::db::system::migrate_device_id_from_file(&bootstrap_db)?;
+        let device_id = match crate::config::wp_device_id_override() {
+            Some(id) => id,
+            None => crate::db::system::load_or_create_device_id(&bootstrap_db)?,
+        };
+        // S3/SEC-02 (07 audit, 12 批 A5): the resolved identity is the default
+        // at-rest encryption source (see bindings::crypto::set_default_device_id).
+        crate::bindings::set_default_device_id(&device_id);
+        crate::db::migrate_from_json_if_needed(&bootstrap_db)?;
+        crate::db::runtime::recover_interrupted_work(&bootstrap_db, &runtime_lease)
+            .context("Failed to recover interrupted client work")?;
+        Ok(device_id)
+    })?;
+    let db = Arc::new(tokio::sync::Mutex::new(bootstrap_db));
     let wp_client_token_fallback = env_or("WPTSALL_WP_CLIENT_TOKEN", "");
     let domain_token_bindings_path = crate::config::domain_token_bindings_file();
     let poll_seconds = env_u64("WPTSALL_POLL_SECONDS", 20).max(1);
@@ -517,15 +938,9 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
     let log_file = crate::config::log_file_path();
     let log_export_path = env_or("WPTSALL_LOG_EXPORT_PATH", "");
     let proxy_pool = {
-        let config_dir = Path::new(&component_bindings_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .to_string_lossy()
-            .to_string();
-        let proxy_profiles_path = Path::new(&config_dir)
-            .join("proxy-profiles.json")
-            .to_string_lossy()
-            .to_string();
+        // P7 unification: proxy profiles resolve through the config.rs
+        // single authority, never derived from the bindings file directory.
+        let proxy_profiles_path = crate::config::proxy_profiles_file();
         match load_proxy_profiles(&proxy_profiles_path)
             .and_then(|doc| ProxyClientPool::new(&doc.profiles))
         {
@@ -548,18 +963,55 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
     let recovered_pending_callbacks = {
         let pending = {
             let store = pending_callback_store.lock().await;
-            store.entry_count()
+            store.entry_count_checked()?
         };
-        let translated = if let Ok(conn) = crate::db::open_db(&db_path) {
-            crate::db::jobs::count_all_items_by_status(&conn, "translated")
-        } else {
-            0
-        };
-        pending + translated as usize
+        let conn = crate::db::open_db(&db_path)?;
+        let translated = crate::db::jobs::count_all_items_by_status(&conn, "translated")?;
+        pending
+            .checked_add(usize::try_from(translated)?)
+            .context("recovered callback count overflow")?
     };
 
     apply_log_settings_from_db(&db_path);
-    init_log_file(&log_file)?;
+    init_runtime_log_file(&log_file)?;
+    // Non-destructive async recovery inventory in the server lane too.
+    if let Ok(conn) = crate::db::open_db(&db_path) {
+        match crate::db::async_jobs::async_jobs_inventory(&conn) {
+            Ok((failed, polling)) => {
+                if failed > 0 || polling > 0 {
+                    let _ = log_event(
+                        &log_file,
+                        "info",
+                        "worker.async_jobs_recovery_inventory",
+                        json!({
+                            "failed_kept": failed,
+                            "polling_resumable": polling,
+                        }),
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("warning: async jobs boot sweep failed: {err}");
+            }
+        }
+        match crate::db::sync_inflight::sync_inflight_inventory(&conn) {
+            Ok(shipping) => {
+                if shipping > 0 {
+                    let _ = log_event(
+                        &log_file,
+                        "info",
+                        "worker.sync_inflight_recovery_inventory",
+                        json!({
+                            "shipping_resumable": shipping,
+                        }),
+                    );
+                }
+            }
+            Err(err) => {
+                return Err(err.context("sync inflight recovery inventory failed"));
+            }
+        }
+    }
     let mut domain_token_bindings = match load_domain_token_bindings(&domain_token_bindings_path) {
         Ok(doc) => doc,
         Err(err) => {
@@ -685,12 +1137,8 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
         return Ok(());
     }
 
-    let client = Client::builder()
-        .no_proxy()
+    let client = crate::auth::wp_http_client_builder()
         .timeout(Duration::from_secs(15))
-        .pool_max_idle_per_host(10)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .connect_timeout(Duration::from_secs(10))
         .build()?;
 
     let mut session_token =
@@ -828,7 +1276,9 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
     );
 
     let mut component_bindings = load_component_bindings(&component_bindings_path)?;
-    let local_components_doc = load_components_local(&components_local_path).unwrap_or_default();
+    let local_components_doc = load_components_local(&components_local_path).map_err(|_| {
+        crate::component_rt::loader::RuntimeConfigurationFault::error("local components file")
+    })?;
     let target_component_ids = collect_configured_runtime_component_ids(
         &local_components_doc,
         Some(&task_type_component_bindings),
@@ -849,6 +1299,9 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
         .await
         {
             Ok(registry) => Some(Arc::new(registry)),
+            Err(err) if err.is::<crate::component_rt::loader::RuntimeConfigurationFault>() => {
+                return Err(err)
+            }
             Err(err) => {
                 let _ = log_event(
                     &log_file,
@@ -1253,11 +1706,15 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
             route_secret: Option<String>,
             wp_base: String,
             domain_base: String,
+            /// Identity Contract v1.1 §5 (C-1): verified identity this domain
+            /// dispatches under; checked again at the discoverer lane entry.
+            binding_identity: crate::types::PluginIdentity,
             is_local_dev: bool,
             relation_limit: Option<usize>,
         }
         let mut domain_tasks: Vec<DomainTask> = Vec::new();
         let mut missing_route_secret_domains: Vec<String> = Vec::new();
+        let mut identity_bindings_dirty = false;
         let occupied_domain_bases: HashSet<String> = domains_resp
             .items
             .iter()
@@ -1359,15 +1816,136 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
                 wp_base
             };
 
+            // Identity Contract v1.1 §5 (C-1): same fail-closed gate as the
+            // local-worker loop — unknown / mismatched / stale identity never
+            // dispatches. No credential fields in events.
+            let Some(entry) = resolve_entry_for_domain(&domain_api_base, &domain_token_bindings)
+            else {
+                let _ = log_event(
+                    &log_file,
+                    "warning",
+                    "identity.no_binding_entry",
+                    json!({ "api_base_url": domain_api_base }),
+                );
+                continue;
+            };
+            let binding_identity = match gate(entry, now_unix()) {
+                GateVerdict::Fresh(identity) => Some(identity),
+                GateVerdict::Reverify { .. } => {
+                    // Identity-aware verify base (contract §2/§3), same as
+                    // the local-worker loop above.
+                    let expected_identity = entry
+                        .plugin_identity
+                        .unwrap_or(crate::types::PluginIdentity::WpmmccAts);
+                    let verify_base = build_verify_base_url(
+                        &domain_base,
+                        domain_route_secret.as_deref().unwrap_or(""),
+                        &expected_identity,
+                    )
+                    .unwrap_or_else(|| wp_base.clone());
+                    let outcome = verify_identity(
+                        &client,
+                        &verify_base,
+                        &domain_wp_client_token,
+                        &worker_config.worker_id,
+                        &worker_config.device_id,
+                        domain_route_secret.as_deref(),
+                    )
+                    .await;
+                    match classify_verify_outcome(&outcome, entry) {
+                        Ok(verified) => {
+                            let caps = match &outcome {
+                                VerifyOutcome::Verified(_, caps) => caps.clone(),
+                                _ => crate::types::IdentityCapabilities::default(),
+                            };
+                            let verified_at = format_rfc3339_utc(now_unix());
+                            let legacy_key = normalize_api_base_url_key(&domain_api_base);
+                            let stored = match domain_token_bindings.domains.get_mut(&domain_base) {
+                                Some(stored) => Some(stored),
+                                None => domain_token_bindings.domains.get_mut(&legacy_key),
+                            };
+                            if let Some(stored) = stored {
+                                stored.plugin_identity = Some(verified);
+                                stored.identity_verified_at = Some(verified_at);
+                                stored.identity_capabilities = Some(caps);
+                                identity_bindings_dirty = true;
+                            }
+                            Some(verified)
+                        }
+                        Err(Some(code)) => {
+                            let _ = log_event(
+                                &log_file,
+                                "warning",
+                                code,
+                                json!({ "api_base_url": domain_api_base }),
+                            );
+                            None
+                        }
+                        Err(None) => {
+                            let _ = log_event(
+                                &log_file,
+                                "warning",
+                                "identity.verify_failed",
+                                json!({ "api_base_url": domain_api_base }),
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+            let Some(binding_identity) = binding_identity else {
+                continue;
+            };
+
+            // FL-3 (Wave-2): same ATS-lane pre-filter as the local-worker
+            // collector — wpmmcc-bound domains belong to the pair engine,
+            // never to this discovery lane.
+            if binding_identity != crate::types::PluginIdentity::WpmmccAts {
+                if crate::bindings::identity_exclusion_first_notice(
+                    "wpmmcc_ats_task_generation",
+                    &domain_api_base,
+                    binding_identity.as_wire_str(),
+                ) {
+                    let _ = log_event(
+                        &log_file,
+                        "info",
+                        "worker.domain_lane_excluded",
+                        json!({
+                            "api_base_url": domain_api_base,
+                            "lane": "wpmmcc_ats",
+                            "binding_identity": binding_identity.as_wire_str(),
+                        }),
+                    );
+                }
+                continue;
+            }
+
             domain_tasks.push(DomainTask {
                 api_base_url: domain_api_base,
                 wp_client_token: domain_wp_client_token,
                 route_secret: domain_route_secret,
                 wp_base,
                 domain_base,
+                binding_identity,
                 is_local_dev,
                 relation_limit,
             });
+        }
+
+        if identity_bindings_dirty {
+            if let Err(err) =
+                save_domain_token_bindings(&domain_token_bindings_path, &domain_token_bindings)
+            {
+                let _ = log_event(
+                    &log_file,
+                    "warning",
+                    "worker.identity_bindings_save_failed",
+                    json!({
+                        "path": domain_token_bindings_path,
+                        "error": format!("{:#}", err)
+                    }),
+                );
+            }
         }
 
         // Spawn concurrent domain workers, limited by ResourceGovernor.
@@ -1392,7 +1970,10 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
 
             let bindings_path_for_recovery = domain_token_bindings_path.clone();
             let bindings_doc_for_recovery = domain_token_bindings.clone();
+            let domain_lease = Arc::clone(&runtime_lease);
+            let db = Arc::clone(&db);
             domain_joins.spawn(async move {
+                    let _lease = domain_lease;
                     // Acquire domain concurrency permit
                     let Some(_domain_permit) = governor.domain_sem.acquire().await.ok() else {
                         return Ok(None);
@@ -1419,7 +2000,8 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
                         Some(Arc::clone(&governor.global_translation_sem)),
                         Some(Arc::clone(&governor.global_callback_sem)),
                         dt.relation_limit,
-                        None,
+                        Some(Arc::clone(&db)),
+                        dt.binding_identity,
                     )
                     .await;
 
@@ -1501,7 +2083,8 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
                                     Some(Arc::clone(&governor.global_translation_sem)),
                                     Some(Arc::clone(&governor.global_callback_sem)),
                                     dt.relation_limit,
-                                    None,
+                                    Some(Arc::clone(&db)),
+                                    dt.binding_identity,
                                 )
                                 .await;
 
@@ -1509,34 +2092,28 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
                                 if result.is_ok() {
                                     if let Some(ref new_s) = run_route_secret {
                                         if let Ok(conn) = crate::db::open_db(&db_path) {
-                                            let mut doc = crate::db::bindings::load_domain_token_bindings_doc(&conn);
-                                            if let Some(entry) = doc.domains.get_mut(&dt.domain_base) {
-                                                entry.route_secret = new_s.clone();
-                                            } else {
-                                                let legacy_key = normalize_api_base_url_key(&dt.api_base_url);
-                                                if let Some(entry) = doc.domains.get_mut(&legacy_key) {
-                                                    entry.route_secret = new_s.clone();
-                                                } else {
-                                                    doc.domains.insert(
-                                                        dt.domain_base.clone(),
-                                                        DomainTokenBindingEntry {
-                                                            wp_client_token: dt.wp_client_token.clone(),
-                                                            route_secret: new_s.clone(),
-                                                        },
-                                                    );
+                                            match crate::db::bindings::persist_refreshed_route_secret(
+                                                &conn, &dt.domain_base, &dt.api_base_url,
+                                                &dt.wp_client_token, new_s,
+                                            ) {
+                                                Ok(doc) => {
+                                                    if crate::bindings::save_domain_token_bindings(
+                                                        &bindings_path_for_recovery, &doc,
+                                                    ).is_err() {
+                                                        let _ = log_event(&log_file, "warning", "domain.route_secret_mirror_failed",
+                                                            json!({"domain": dt.domain_base}));
+                                                    }
+                                                    let _ = log_event(&log_file, "info", "domain.route_secret_persisted",
+                                                        json!({"domain": dt.domain_base}));
+                                                }
+                                                Err(_) => {
+                                                    let _ = log_event(&log_file, "warning", "domain.route_secret_store_failed",
+                                                        json!({"domain": dt.domain_base}));
                                                 }
                                             }
-                                            let _ = crate::db::bindings::save_domain_token_bindings_doc(&conn, &doc);
-                                            let _ = crate::bindings::save_domain_token_bindings(
-                                                &bindings_path_for_recovery,
-                                                &doc,
-                                            );
-                                            let _ = log_event(
-                                                &log_file,
-                                                "info",
-                                                "domain.route_secret_persisted",
-                                                json!({"domain": dt.domain_base}),
-                                            );
+                                        } else {
+                                            let _ = log_event(&log_file, "warning", "domain.route_secret_store_failed",
+                                                json!({"domain": dt.domain_base}));
                                         }
                                     }
                                 }
@@ -1597,7 +2174,8 @@ async fn run_server_worker(shutdown_token: CancellationToken) -> anyhow::Result<
                                 Some(Arc::clone(&governor.global_translation_sem)),
                                 Some(Arc::clone(&governor.global_callback_sem)),
                                 dt.relation_limit,
-                                None,
+                                Some(Arc::clone(&db)),
+                                dt.binding_identity,
                             )
                             .await;
                             let should_stop = retry_result.is_ok()
@@ -1813,6 +2391,7 @@ fn log_loop_summary(log_file: &str, loop_reports: &[DomainRunReport]) {
                 .iter()
                 .map(|r| json!({
                     "api_base_url": r.api_base_url,
+                    "trace_id": r.trace_id,
                     "pulled": r.pulled,
                     "processed": r.processed,
                     "completed": r.completed,
@@ -1824,28 +2403,4 @@ fn log_loop_summary(log_file: &str, loop_reports: &[DomainRunReport]) {
                 .collect::<Vec<Value>>()
         }),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_build_worker_config_defaults() {
-        let config = build_worker_config("worker-test-default");
-        assert_eq!(config.worker_id, "worker-test-default");
-        assert_eq!(config.task_pull_statuses, vec!["pending", "retry"]);
-        assert!(config.task_concurrency >= 1);
-        assert_eq!(config.retry_max, 2);
-        assert!(config.discovery_mode);
-        assert!(!config.review_mode);
-    }
-
-    #[test]
-    fn test_fatal_control_plane_error_classification() {
-        assert!(is_fatal_control_plane_error("Upstream returned RATE_LIMITED error"));
-        assert!(is_fatal_control_plane_error("unauthorized: session expired"));
-        assert!(is_fatal_control_plane_error("status=401"));
-        assert!(!is_fatal_control_plane_error("connection reset by peer"));
-    }
 }

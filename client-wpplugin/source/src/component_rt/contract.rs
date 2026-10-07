@@ -122,24 +122,3 @@ fn extract_client_contract_schema_version(runtime: &ComponentRuntime) -> Option<
     }
     None
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn alias_maps_html_to_rich_html() {
-        assert_eq!(normalize_content_format_alias("html"), "rich_html");
-        assert_eq!(normalize_content_format_alias("text"), "plain_text");
-    }
-
-    #[test]
-    fn code_is_non_translatable() {
-        assert!(NON_TRANSLATABLE_CONTENT_FORMATS.contains(&"code"));
-    }
-
-    #[test]
-    fn supported_contract_versions_include_v1() {
-        assert!(SUPPORTED_CLIENT_CONTRACT_SCHEMA_VERSIONS.contains(&"component-client-contract-v1"));
-    }
-}

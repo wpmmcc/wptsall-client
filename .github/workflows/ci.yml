@@ -1,147 +1,51 @@
-name: CI
-
+name: Production source checks
 on:
   push:
   pull_request:
   workflow_dispatch:
-
+permissions:
+  contents: read
 jobs:
-  core-unit:
-    name: cargo test --lib --bins (Rust core, ${{ matrix.os }})
-    # The core is cross-platform by contract (updater self-replace, install
-    # roots, DB paths differ per OS); unit tests must pass on every desktop
-    # OS we ship kits for, not just the Linux lane (2026-09-12: was
-    # ubuntu-only — win/mac only compiled + smoke-tested).
-    #
-    # 2026-09-12 (12-cell matrix): the OTA/cross-compile contract ships SIX
-    # platforms (linux/windows x86_64+aarch64, darwin x86_64+aarch64) —
-    # updater.rs probes exactly these — so the matrix runs one leg per
-    # shipped platform:
-    #   ubuntu-latest     = linux-x86_64
-    #   ubuntu-24.04-arm  = linux-aarch64   (free ARM runners, public repo)
-    #   windows-latest    = windows-x86_64
-    #   windows-11-arm    = windows-aarch64
-    #   macos-latest      = darwin-aarch64  (macos-latest IS Apple Silicon)
-    #   macos-15-intel    = darwin-x86_64   (transition label: macos-13 was
-    #                                      retired 2025-12-04; Intel lives on
-    #                                      via macos-15-intel until the macOS
-    #                                      15 image retires ~Fall 2027 — after
-    #                                      that, darwin-x86_64 falls back to
-    #                                      cross-compile evidence only)
+  production:
+    name: Production builds (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
-      # The Rust core embeds frontend/dist at compile time (static_html.rs
-      # include_str!) — same contract as the monorepo's `--with-ui` builds.
-      - name: Build WebUI frontend
+          cache-dependency-path: |
+            client-wpplugin/source/frontend/package-lock.json
+            client-desktop/frontend/package-lock.json
+      - name: Build and type-check WebUI
         working-directory: client-wpplugin/source/frontend
         run: |
           npm ci
+          npm run check
           npm run build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: client-wpplugin/source
-      # --lib --bins only: the crate's [[test]] integration targets point at
-      # the private monorepo test framework and are intentionally not part of
-      # this public tree (see OPEN-SOURCE-PUBLISH-FLOW §4).
-      - name: Run core unit tests
-        run: cargo test --lib --bins --manifest-path client-wpplugin/source/Cargo.toml
-
-  webui-frontend:
-    name: WebUI frontend (svelte-check + vitest + build)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: client-wpplugin/source/frontend
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
-      - run: npm ci
-      # Type gate: 3 type-drift errors shipped on 2026-09-12 while CI was
-      # green because no lane ran svelte-check (Vitest is untyped).
-      - run: npm run check
-      - run: npm run test:unit
-      - run: npm run build
-
-  desktop-frontend:
-    name: Desktop frontend (svelte-check + vitest + build)
-    runs-on: ubuntu-latest
-    defaults:
-      run:
+      - name: Build and type-check Desktop UI
         working-directory: client-desktop/frontend
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: client-desktop/frontend/package-lock.json
-      - run: npm ci
-      - run: npm run check
-      - run: npm run test
-      - run: npm run build
-
-  desktop-check:
-    # 2026-09-12 (12-cell matrix): was ubuntu-only, so the desktop crate's
-    # unit tests only ever executed on linux-x86_64 — win/mac legs compiled
-    # (build-matrix) but never ran tests. One leg per shipped platform, same
-    # six labels as core-unit: covers the Desktop column of the 2 UI x 6
-    # platform matrix.
-    name: Desktop cargo test + check (Tauri v2, ${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
-      # The desktop crate path-depends on the Rust core, which embeds
-      # frontend/dist at compile time — build the WebUI frontend first.
-      - name: Build WebUI frontend
-        working-directory: client-wpplugin/source/frontend
         run: |
           npm ci
+          npm run check
           npm run build
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Tauri v2 Linux build dependencies
+      - name: Install native Linux build dependencies
         if: runner.os == 'Linux'
         run: |
-          # The runner image's google-chrome apt source (any file format,
-          # list or deb822) intermittently hash-mismatches on dl.google.com
-          # and kills apt-get update; nothing installed here needs it.
-          sudo rm -f /etc/apt/sources.list.d/google-chrome* || true
-          sudo sed -i '/dl\.google\.com/d' /etc/apt/sources.list 2>/dev/null || true
-          sudo apt-get update || true
-          sudo apt-get install -y --no-install-recommends \
-            libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev \
-            librsvg2-dev libayatana-appindicator3-dev libssl-dev
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libglib2.0-dev libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev libssl-dev
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: client-desktop/src-tauri
-      # Unit tests of the desktop crate (command layer, headless — same set
-      # the private module-ci desktop-unit lane runs). 2026-09-12: this job
-      # previously ran cargo check only, so the public repo never executed
-      # the desktop crate's tests.
-      - name: Run desktop crate unit tests
-        run: cargo test --manifest-path client-desktop/src-tauri/Cargo.toml
-      - name: cargo check (desktop crate + path deps)
-        run: cargo check --manifest-path client-desktop/src-tauri/Cargo.toml
+          workspaces: |
+            client-wpplugin/source
+            client-desktop/src-tauri
+      - name: Check production Rust core
+        run: cargo check --locked --lib --bins --manifest-path client-wpplugin/source/Cargo.toml
+      - name: Check production Desktop
+        run: cargo check --locked --manifest-path client-desktop/src-tauri/Cargo.toml

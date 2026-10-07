@@ -1,6 +1,5 @@
 use serde_json::{json, Value};
-#[cfg(test)]
-use std::sync::atomic::Ordering;
+
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -17,14 +16,33 @@ mod bindings;
 mod components;
 mod errors;
 mod http;
-pub(crate) mod legacy_routes;
 mod integrations;
+pub(crate) mod legacy_routes;
+mod media_recovery;
 mod operations;
 mod platform;
 mod provider_catalog;
+mod provider_recovery;
+mod providers;
 mod review;
 mod settings;
+mod storage;
+mod sync_pairs;
+mod sync_review;
 mod worker;
+
+pub(crate) use self::worker::stop_worker_loop;
+
+use self::sync_pairs::{
+    handle_sync_pair_credential_delete, handle_sync_pair_credentials_list,
+    handle_sync_pairs_delete, handle_sync_pairs_list, handle_sync_pairs_pair,
+    handle_sync_pairs_pause, handle_sync_pairs_resume, handle_sync_pairs_run,
+    handle_sync_pairs_upsert, SyncPairDeleteRequest,
+};
+use self::sync_review::{
+    handle_sync_review_approve, handle_sync_review_detail, handle_sync_review_list,
+    handle_sync_review_reject, handle_sync_review_update,
+};
 
 use self::auth::{
     handle_domains_refresh, handle_logout, handle_oauth_callback, handle_oauth_start,
@@ -35,11 +53,7 @@ use self::bindings::{
     handle_rule_component_bindings_upsert, handle_site_connections_import,
     handle_task_type_components_delete, handle_task_type_components_upsert,
 };
-#[cfg(test)]
-use self::components::{
-    backfill_local_components_from_server, invalid_task_override_paths,
-    patch_template_snapshot_for_local_kind,
-};
+
 use self::components::{
     build_local_component_runtime_for_task, component_exists_in_local_doc,
     fetch_signing_key_from_server, find_server_component_by_template_id,
@@ -61,8 +75,8 @@ use self::components::{
     validate_server_component_api_version, validate_task_editable_overrides,
 };
 use self::errors::{
-    maybe_write_upstream_api_error, write_error_response, write_error_response_with_status,
-    write_session_required,
+    err_public, maybe_write_upstream_api_error, write_error_response,
+    write_error_response_with_status, write_session_required,
 };
 use self::http::{read_simple_http_request, write_html_page_response, write_http_response};
 use self::integrations::{
@@ -74,22 +88,26 @@ use self::integrations::{
 };
 use self::operations::{
     handle_discovery_task_update, handle_discovery_tasks_bootstrap, handle_discovery_tasks_list,
-    handle_logs_recent, handle_stats_overview, handle_translations_batch_delete,
-    handle_translations_batch_retry, handle_translations_list,
+    handle_logs_recent, handle_logs_recent_get, handle_stats_overview,
+    handle_translations_batch_delete, handle_translations_batch_retry, handle_translations_list,
 };
 use self::platform::{handle_platform_entitlements, handle_platform_products};
 use self::provider_catalog::{
     handle_install_from_catalog, handle_integration_pack_export, handle_integration_pack_import,
-    handle_integration_pack_preview, handle_provider_catalog_list, handle_provider_catalog_refresh,
+    handle_integration_pack_preview, handle_provider_catalog_install_version,
+    handle_provider_catalog_list, handle_provider_catalog_refresh,
+    handle_provider_catalog_versions,
 };
+use self::providers::handle_providers_test;
 use self::review::{
-    handle_item_approve, handle_item_content, handle_item_override_save, handle_item_resubmit,
-    handle_item_retranslate, handle_item_translated_save, handle_items_batch_approve,
+    handle_item_approve, handle_item_content, handle_item_override_save, handle_item_reject,
+    handle_item_resubmit, handle_item_retranslate, handle_item_translated_save,
+    handle_items_batch_approve, handle_items_batch_reject, handle_items_pending_review,
     handle_job_detail, handle_job_items, handle_jobs_list,
 };
 use self::settings::{
     handle_access_control_get, handle_access_control_update, handle_log_settings_get,
-    handle_log_settings_update,
+    handle_log_settings_update, webui_access_token,
 };
 pub(crate) use self::worker::spawn_worker_loop;
 use self::worker::{
@@ -101,14 +119,14 @@ use crate::bindings::{
     domain_token_binding_status_items, normalize_domain_base, rule_component_binding_status_items,
     task_type_component_binding_status_items,
 };
-#[cfg(test)]
-use crate::bindings::{load_components_local, save_components_local};
+
 use crate::logging::{session_token_prefix, unix_ts};
 use crate::types::*;
 use crate::web_ui::{
     fetch_cloud_api_types_for_session_with_signing_key, fetch_domains_for_session,
     fetch_vendors_for_session, fetch_wp_translation_providers_for_session_with_signing_key,
-    read_trusted_signing_key_pem_from_state, static_html::web_ui_html,
+    read_trusted_signing_key_pem_from_state,
+    static_html::{web_ui_favicon_ico, web_ui_favicon_svg, web_ui_html},
 };
 
 pub(crate) async fn handle_web_ui_connection(
@@ -126,8 +144,9 @@ pub(crate) async fn handle_web_ui_connection(
         return Ok(());
     };
 
-    // For POST requests, verify Origin header to prevent CSRF
-    if method == "POST" {
+    // Every state-changing or unknown method must pass the Origin gate,
+    // including methods added to the dispatcher in the future.
+    if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
         let origin_ok =
             check_csrf_origin(headers.get("origin").map(|s| s.as_str()), &access_control).await;
         if !origin_ok {
@@ -136,6 +155,51 @@ pub(crate) async fn handle_web_ui_connection(
                 "403 Forbidden",
                 "CSRF_REJECTED",
                 "cross-origin request blocked",
+            )
+            .await;
+        }
+    }
+
+    // S4 (07 号 audit): validate the Host header against an allowlist
+    // before any handler runs. DNS-rebinding attacks reach the loopback
+    // listener with the attacker's domain in Host; browsers and HTTP/1.1
+    // clients always send an expected Host, so a missing or unexpected
+    // Host is rejected (fail-closed).
+    if !check_host_header(headers.get("host").map(|s| s.as_str()), &access_control).await {
+        return write_error_response_with_status(
+            &mut socket,
+            "403 Forbidden",
+            "WEBUI_HOST_REJECTED",
+            "host header not allowed",
+        )
+        .await;
+    }
+
+    // S2 (07 号 audit): in external mode every /api request must present
+    // the WebUI access token (`X-WPTSALL-WebUI-Token`). Loopback peers
+    // keep read access to GET /api/access-control so the token can be
+    // recovered on the machine itself; static assets stay open (they are
+    // the token entry surface and hold no state). Local loopback mode is
+    // exempt — the loopback bind, the Origin check above and the Host
+    // allowlist already gate it.
+    let peer_ip = socket.peer_addr().map(|addr| addr.ip()).ok();
+    if webui_token_required(
+        access_control.is_external().await,
+        peer_ip,
+        &method,
+        &target,
+    ) {
+        let provided = headers
+            .get("x-wptsall-webui-token")
+            .map(|s| s.trim())
+            .unwrap_or("");
+        let expected = webui_access_token(&state).await?;
+        if !constant_time_eq(expected.as_bytes(), provided.as_bytes()) {
+            return write_error_response_with_status(
+                &mut socket,
+                "401 Unauthorized",
+                "WEBUI_TOKEN_REQUIRED",
+                "web ui access token required",
             )
             .await;
         }
@@ -160,6 +224,14 @@ pub(crate) async fn handle_web_ui_connection(
         ("GET", "/") | ("GET", "/index.html") => {
             let html = web_ui_html();
             write_html_page_response(&mut socket, &html).await?;
+        }
+        ("GET", "/favicon.svg") | ("GET", "/logo.svg") => {
+            write_http_response(&mut socket, "200 OK", "image/svg+xml", web_ui_favicon_svg())
+                .await?;
+        }
+        ("GET", "/favicon.ico") => {
+            write_http_response(&mut socket, "200 OK", "image/x-icon", web_ui_favicon_ico())
+                .await?;
         }
         ("GET", "/health") => {
             handle_health(&mut socket, start_time).await?;
@@ -218,8 +290,30 @@ pub(crate) async fn handle_web_ui_connection(
         ("POST", "/api/site-connections/import") => {
             handle_site_connections_import(&mut socket, &state, &body).await?;
         }
+        ("GET", "/api/sync-pairs") => {
+            handle_sync_pairs_list(&mut socket, &state).await?;
+        }
+        ("POST", "/api/sync-pairs") => {
+            handle_sync_pairs_upsert(&mut socket, &state, &body).await?;
+        }
+        ("POST", "/api/sync-pairs/delete") => {
+            let req: SyncPairDeleteRequest = serde_json::from_slice(&body)?;
+            handle_sync_pairs_delete(&mut socket, &state, &req.id).await?;
+        }
         ("POST", "/api/worker/run-once") => {
             handle_worker_run_once(&mut socket, &state, log_file, &body).await?;
+        }
+        ("GET", "/api/media-recovery") => {
+            media_recovery::list(&mut socket).await?;
+        }
+        ("POST", "/api/media-recovery/reconcile") => {
+            media_recovery::reconcile(&mut socket, &state, &body).await?;
+        }
+        ("GET", "/api/provider-recovery") => {
+            provider_recovery::list(&mut socket, &state).await?;
+        }
+        ("POST", "/api/provider-recovery/reconcile") => {
+            provider_recovery::reconcile(&mut socket, &state, &body).await?;
         }
         ("POST", "/api/worker/start") => {
             handle_worker_start(&mut socket, &state, &runtime_control, log_file, &body).await?;
@@ -230,14 +324,36 @@ pub(crate) async fn handle_web_ui_connection(
         ("GET", "/api/worker/config") => {
             handle_worker_config_get(&mut socket, &state).await?;
         }
+        ("GET", "/api/storage/capacity") => {
+            storage::get(&mut socket).await?;
+        }
+        ("POST", "/api/storage/capacity") => {
+            storage::update(&mut socket, &body).await?;
+        }
         ("POST", "/api/worker/config") => {
             handle_worker_config(&mut socket, &state, &body).await?;
         }
         ("POST", "/api/worker/stop") => {
-            handle_worker_stop(&mut socket, &state, &runtime_control).await?;
+            handle_worker_stop(&mut socket, &state, log_file, &runtime_control).await?;
         }
         ("POST", "/api/logs/recent") => {
             handle_logs_recent(&mut socket, &state, &body, log_file).await?;
+        }
+        ("POST", "/api/logs/clear") => {
+            handle_logs_clear(&mut socket, log_file).await?;
+        }
+        // Client-side (browser / desktop WebView) JS error ingestion: the
+        // frontends report window.onerror + unhandledrejection here so
+        // render crashes surface in the same log stream as engine events.
+        ("POST", "/api/logs/client") => {
+            handle_logs_client(&mut socket, &body).await?;
+        }
+        ("GET", "/api/logs/recent") => {
+            handle_logs_recent_get(&mut socket, &state, &query, log_file).await?;
+        }
+        // Alias used by some desktop/docs clients.
+        ("GET", "/api/logs") => {
+            handle_logs_recent_get(&mut socket, &state, &query, log_file).await?;
         }
         ("POST", "/api/domains/refresh") => {
             handle_domains_refresh(&mut socket, &state).await?;
@@ -282,6 +398,15 @@ pub(crate) async fn handle_web_ui_connection(
         }
         ("POST", "/api/provider-catalog/refresh") => {
             handle_provider_catalog_refresh(&mut socket, &state).await?;
+        }
+        ("GET", "/api/provider-catalog/versions") => {
+            handle_provider_catalog_versions(&mut socket, &state).await?;
+        }
+        ("POST", "/api/provider-catalog/install-version") => {
+            handle_provider_catalog_install_version(&mut socket, &state, &body).await?;
+        }
+        ("POST", "/api/providers/test") => {
+            handle_providers_test(&mut socket, &state, &body).await?;
         }
         ("GET", "/api/components/server-search") => {
             handle_server_components_search(&mut socket, &state, &query).await?;
@@ -380,21 +505,102 @@ pub(crate) async fn handle_web_ui_connection(
     Ok(())
 }
 
+pub(super) async fn handle_capacity_only_connection(
+    mut socket: TcpStream,
+    start: std::time::Instant,
+    access: super::AccessControl,
+) -> anyhow::Result<()> {
+    let Some((method, target, _, headers, body)) = read_simple_http_request(&mut socket).await?
+    else {
+        return Ok(());
+    };
+    if !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS")
+        && !check_csrf_origin(headers.get("origin").map(String::as_str), &access).await
+    {
+        return write_error_response_with_status(
+            &mut socket,
+            "403 Forbidden",
+            "CSRF_REJECTED",
+            "cross-origin request blocked",
+        )
+        .await;
+    }
+    if !check_host_header(headers.get("host").map(String::as_str), &access).await {
+        return write_error_response_with_status(
+            &mut socket,
+            "403 Forbidden",
+            "WEBUI_HOST_REJECTED",
+            "host header not allowed",
+        )
+        .await;
+    }
+    match (method.as_str(), target.as_str()) {
+        ("GET", "/") | ("GET", "/index.html") => {
+            write_html_page_response(&mut socket, &web_ui_html()).await
+        }
+        ("GET", "/favicon.svg") | ("GET", "/logo.svg") => {
+            write_http_response(&mut socket, "200 OK", "image/svg+xml", web_ui_favicon_svg()).await
+        }
+        ("GET", "/favicon.ico") => {
+            write_http_response(&mut socket, "200 OK", "image/x-icon", web_ui_favicon_ico()).await
+        }
+        ("GET", "/api/status") => {
+            write_http_response(&mut socket, "200 OK", "application/json", &serde_json::to_vec(
+                &json!({"success":true,"data":{
+                    "storage_paused":true,"database_available":false,
+                    "worker_loop_running":false,"worker_status":"paused_storage",
+                    "restart_required":true,
+                    "last_error":"STORAGE_CAPACITY_EXHAUSTED",
+                    "last_event":"webui.capacity_paused"
+                }}))?).await
+        }
+        ("GET", "/health" | "/api/health") => {
+            write_http_response(&mut socket, "200 OK", "application/json",
+                &serde_json::to_vec(&json!({"success":true,"data":{
+                    "storage_paused":true,"uptime_seconds":start.elapsed().as_secs()
+                }}))?).await
+        }
+        ("GET", "/api/storage/capacity") => storage::get(&mut socket).await,
+        ("POST", "/api/storage/capacity") => storage::update(&mut socket, &body).await,
+        _ => write_error_response_with_status(&mut socket, "503 Service Unavailable",
+            "STORAGE_CAPACITY_EXHAUSTED",
+            "Database access is paused by storage capacity. Existing evidence is retained. Increase capacity and restart; no work was submitted.").await,
+    }
+}
+
 /// Return the site status shape exposed to the local browser UI.
 ///
 /// `WebUiState` intentionally keeps secrets in memory for direct-WP requests,
 /// but HTTP status/auth responses are not allowed to serialize them.  The
 /// client can submit a replacement secret; it never needs the old value.
-pub(super) fn redacted_domain_status_items(domains: &[DomainStatusItem]) -> Vec<Value> {
+pub(super) fn redacted_domain_status_items(
+    domains: &[DomainStatusItem],
+    domain_token_bindings: &DomainTokenBindingsDoc,
+) -> Vec<Value> {
     domains
         .iter()
         .map(|domain| {
+            // §67 recheck (tasks/cursor CURSOR-COMMERCIAL-USE-RECHECK-20260929):
+            // the status page offered no way to tell which plugin lane a
+            // domain serves (wpmmcc-ats vs wpmmcc) — the identity lived only
+            // inside the encrypted binding doc, so an operator could not
+            // confirm a client was mounted on both lanes. Surface the lane
+            // identity and its verification timestamp per domain, resolved
+            // through the same key order the token/secret resolvers use.
+            // Secret material (token / route secret) stays redacted.
+            let binding =
+                crate::bindings::resolve_entry_for_domain(&domain.api_base_url, domain_token_bindings);
             json!({
                 "api_base_url": domain.api_base_url,
                 "site_status": domain.site_status,
                 "route_secret_set": domain.route_secret.as_deref().is_some_and(|v| !v.trim().is_empty()),
                 "max_relations": domain.max_relations,
                 "plan_expires_at": domain.plan_expires_at,
+                "plugin_identity": binding
+                    .and_then(|entry| entry.plugin_identity)
+                    .map(|identity| identity.as_wire_str().to_string()),
+                "identity_verified_at": binding
+                    .and_then(|entry| entry.identity_verified_at.clone()),
             })
         })
         .collect()
@@ -473,7 +679,7 @@ async fn handle_get_status(
         let mut data = json!({
             "runtime_mode": crate::config::runtime_mode(),
             "device_id": guard.device_id.clone(),
-            "domains": redacted_domain_status_items(&guard.domains),
+            "domains": redacted_domain_status_items(&guard.domains, &guard.domain_token_bindings),
             "component_bindings_path": guard.component_bindings_path.clone(),
             "component_bindings": redacted_component_bindings(&guard.component_bindings),
             "domain_token_bindings_path": guard.domain_token_bindings_path.clone(),
@@ -491,7 +697,13 @@ async fn handle_get_status(
             "local_components_backfill_error": guard.local_components_backfill_error.clone(),
             "last_error": guard.last_error.clone(),
             "last_event": guard.last_event.clone(),
-            "updated_at": guard.updated_at
+            "updated_at": guard.updated_at,
+            // S12 (batch G): surfaced so the UI can render a prominent
+            // warning banner while insecure TLS is enabled (default false).
+            "allow_insecure_tls": crate::config::env_bool(
+                "WPTSALL_ALLOW_INSECURE_TLS",
+                false,
+            ),
         });
         if legacy_control_plane {
             data["server_base"] = json!(guard.server_base.clone());
@@ -523,10 +735,23 @@ async fn handle_health(
     start_time: std::time::Instant,
 ) -> anyhow::Result<()> {
     let uptime_seconds = start_time.elapsed().as_secs();
+    // Envelope contract (批 O3 疤): /health used to return a FLAT payload —
+    // the only web UI endpoint outside the {"success": true, "data": …}
+    // convention. The frontend's isOk() therefore rejected it and the About
+    // tab's pre-check version block never rendered (masked by an API-level
+    // mock in Settings.test.ts that shaped the response as if wrapped).
+    // Wrap it like every other endpoint; the fields move under "data".
     let payload = json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-        "uptime_seconds": uptime_seconds
+        "success": true,
+        "data": {
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+            // On-disk UI bundle version (VERSION-WEBUI, else binary version).
+            // Local-only read: lets the About tab pre-display versions without
+            // contacting the update server.
+            "ui_version": crate::updater::current_ui_version(),
+            "uptime_seconds": uptime_seconds
+        }
     });
     let encoded = serde_json::to_vec(&payload)?;
     write_http_response(socket, "200 OK", "application/json", &encoded).await
@@ -538,10 +763,14 @@ async fn handle_translation_retry(
     id_str: &str,
 ) -> anyhow::Result<()> {
     let id: i64 = match id_str.parse() {
-        Ok(v) => v,
-        Err(_) => {
-            return write_error_response(socket, "INVALID_ID", "translation id must be an integer")
-                .await;
+        Ok(v) if v > 0 => v,
+        _ => {
+            return write_error_response(
+                socket,
+                "INVALID_ID",
+                "translation id must be a positive integer",
+            )
+            .await;
         }
     };
 
@@ -553,22 +782,26 @@ async fn handle_translation_retry(
     // Look up the translation record and verify it's failed.
     let result = {
         let conn = db_arc.lock().await;
-        (|| -> Option<bool> {
-            let record = crate::db::translations::get_translation_record_by_id(&conn, id)?;
+        (|| -> anyhow::Result<Option<bool>> {
+            let Some(record) = crate::db::translations::get_translation_record_by_id(&conn, id)?
+            else {
+                return Ok(None);
+            };
             if record.status != "failed" {
-                return None; // Only failed records can be retried
+                return Ok(None); // Only failed records can be retried
             }
             if record.relation_id.is_none() || record.object_id.is_none() {
-                return None; // Need relation_id and object_id for retry
+                return Ok(None); // Need relation_id and object_id for retry
             }
-            crate::db::translations::insert_retry_queue_entry(&conn, &record).ok()?;
-            Some(true)
+            Ok(Some(crate::db::translations::insert_retry_queue_entry(
+                &conn, &record,
+            )?))
         })()
     };
 
     match result {
-        Some(true) => {
-            let payload = json!({ "success": true, "data": { "queued": true } });
+        Ok(Some(queued)) => {
+            let payload = json!({ "success": true, "data": { "queued": queued } });
             write_http_response(
                 socket,
                 "200 OK",
@@ -577,11 +810,20 @@ async fn handle_translation_retry(
             )
             .await
         }
-        _ => {
+        Ok(None) => {
             write_error_response(
                 socket,
                 "RETRY_FAILED",
                 "Record not found, not in failed status, or missing relation/object ID",
+            )
+            .await
+        }
+        Err(error) => {
+            write_error_response_with_status(
+                socket,
+                "500 Internal Server Error",
+                "RETRY_ENQUEUE_FAILED",
+                &err_public(&error),
             )
             .await
         }
@@ -831,9 +1073,19 @@ async fn handle_dynamic_routes(
         }
     }
 
-    // POST /api/items/batch-approve (must be before /api/items/:id to avoid conflict)
+    // GET /api/items/pending-review — aggregated inbox (before /api/items/:id)
+    if method == "GET" && target == "/api/items/pending-review" {
+        handle_items_pending_review(socket, state, query).await?;
+        return Ok(true);
+    }
+
+    // POST /api/items/batch-approve | batch-reject (must be before /api/items/:id)
     if method == "POST" && target == "/api/items/batch-approve" {
         handle_items_batch_approve(socket, state, body).await?;
+        return Ok(true);
+    }
+    if method == "POST" && target == "/api/items/batch-reject" {
+        handle_items_batch_reject(socket, state, body).await?;
         return Ok(true);
     }
 
@@ -856,7 +1108,7 @@ async fn handle_dynamic_routes(
         } else if rest.ends_with("/retranslate") {
             let id_str = rest.strip_suffix("/retranslate").unwrap_or("");
             if method == "POST" && !id_str.is_empty() {
-                handle_item_retranslate(socket, state, id_str).await?;
+                handle_item_retranslate(socket, state, id_str, body).await?;
                 return Ok(true);
             }
         } else if rest.ends_with("/translated") {
@@ -877,6 +1129,12 @@ async fn handle_dynamic_routes(
                 handle_item_approve(socket, state, id_str).await?;
                 return Ok(true);
             }
+        } else if rest.ends_with("/reject") {
+            let id_str = rest.strip_suffix("/reject").unwrap_or("");
+            if method == "POST" && !id_str.is_empty() {
+                handle_item_reject(socket, state, id_str, body).await?;
+                return Ok(true);
+            }
         }
     }
 
@@ -891,6 +1149,81 @@ async fn handle_dynamic_routes(
             }
         } else if !rest.is_empty() && !rest.contains('/') && method == "GET" {
             handle_job_detail(socket, state, rest).await?;
+            return Ok(true);
+        }
+    }
+
+    // GET /api/sync-review | GET/PUT /api/sync-review/:id | POST .../approve|reject
+    if method == "GET" && target == "/api/sync-review" {
+        handle_sync_review_list(socket, state, query).await?;
+        return Ok(true);
+    }
+    if let Some(rest) = target.strip_prefix("/api/sync-review/") {
+        if rest.ends_with("/approve") {
+            let id = rest.strip_suffix("/approve").unwrap_or("");
+            if method == "POST" && !id.is_empty() && !id.contains('/') {
+                handle_sync_review_approve(socket, state, id).await?;
+                return Ok(true);
+            }
+        } else if rest.ends_with("/reject") {
+            let id = rest.strip_suffix("/reject").unwrap_or("");
+            if method == "POST" && !id.is_empty() && !id.contains('/') {
+                handle_sync_review_reject(socket, state, id, body).await?;
+                return Ok(true);
+            }
+        } else if !rest.is_empty() && !rest.contains('/') {
+            if method == "GET" {
+                handle_sync_review_detail(socket, state, rest).await?;
+                return Ok(true);
+            }
+            if method == "PUT" {
+                handle_sync_review_update(socket, state, rest, body).await?;
+                return Ok(true);
+            }
+        }
+    }
+
+    // /api/sync-pairs/pair | /api/sync-pairs/credentials[/:domain]
+    if target == "/api/sync-pairs/pair" && method == "POST" {
+        handle_sync_pairs_pair(socket, state, &body).await?;
+        return Ok(true);
+    }
+    if target == "/api/sync-pairs/credentials" && method == "GET" {
+        handle_sync_pair_credentials_list(socket, state).await?;
+        return Ok(true);
+    }
+    if let Some(domain) = target.strip_prefix("/api/sync-pairs/credentials/") {
+        if method == "DELETE" && !domain.is_empty() {
+            // The frontend sends encodeURIComponent(domain); the raw wire
+            // path is percent-encoded, so decode before matching.
+            let domain = self::http::urldecode(domain);
+            handle_sync_pair_credential_delete(socket, state, &domain).await?;
+            return Ok(true);
+        }
+    }
+
+    // /api/sync-pairs/:id/*
+    if let Some(rest) = target.strip_prefix("/api/sync-pairs/") {
+        if let Some(pair_id) = rest.strip_suffix("/run") {
+            if method == "POST" && !pair_id.is_empty() && !pair_id.contains('/') {
+                handle_sync_pairs_run(socket, state, pair_id).await?;
+                return Ok(true);
+            }
+        } else if let Some(pair_id) = rest.strip_suffix("/pause") {
+            if method == "POST" && !pair_id.is_empty() && !pair_id.contains('/') {
+                handle_sync_pairs_pause(socket, state, pair_id).await?;
+                return Ok(true);
+            }
+        } else if let Some(pair_id) = rest.strip_suffix("/resume") {
+            if method == "POST" && !pair_id.is_empty() && !pair_id.contains('/') {
+                handle_sync_pairs_resume(socket, state, pair_id).await?;
+                return Ok(true);
+            }
+        } else if (method == "DELETE" || method == "POST")
+            && !rest.is_empty()
+            && !rest.contains('/')
+        {
+            handle_sync_pairs_delete(socket, state, rest).await?;
             return Ok(true);
         }
     }
@@ -965,7 +1298,7 @@ async fn handle_vendors_list(
             if let Some(response) = maybe_write_upstream_api_error(socket, &err).await {
                 return response;
             }
-            write_error_response(socket, "VENDORS_LIST_FAILED", &format!("{:#}", err)).await
+            write_error_response(socket, "VENDORS_LIST_FAILED", &err_public(&err)).await
         }
     }
 }
@@ -1021,7 +1354,7 @@ async fn handle_wp_translation_providers_list(
             return write_error_response(
                 socket,
                 "WP_TRANSLATION_PROVIDERS_LIST_FAILED",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await;
         }
@@ -1075,7 +1408,7 @@ async fn handle_cloud_api_types_list(
             if let Some(response) = maybe_write_upstream_api_error(socket, &err).await {
                 return response;
             }
-            write_error_response(socket, "CLOUD_API_TYPES_LIST_FAILED", &format!("{:#}", err)).await
+            write_error_response(socket, "CLOUD_API_TYPES_LIST_FAILED", &err_public(&err)).await
         }
     }
 }
@@ -1091,47 +1424,217 @@ async fn handle_cloud_api_types_list(
 /// Check CSRF Origin header validity.
 /// Returns true if the request should be allowed, false if it should be rejected.
 ///
-/// Rules:
-/// - No Origin header → allowed (same-origin; browsers omit for same-origin requests)
-/// - Origin from localhost/127.0.0.1 → always allowed
-/// - External mode + Origin IP in whitelist → allowed
-/// - Everything else → rejected
+/// Rules (S1/Y-2 fix, tasks/5.3falsh2/07-S1 + 12 批 A1):
+/// - No Origin header → allowed in LOCAL mode only (loopback-bound server;
+///   local tooling and test lanes speak plain HTTP without browser headers).
+///   REJECTED in external mode — a non-browser client stripping Origin must
+///   not bypass the CSRF face; external-mode API tooling must send an Origin
+///   header on writes.
+/// - Loopback Origin hosts (127.0.0.1 / localhost / ::1 — EXACT host match,
+///   any port, either scheme) → always allowed. Prefix matching is gone:
+///   `http://127.0.0.1.evil.com` and `http://localhost.evil.com` used to
+///   pass `starts_with`.
+/// - External mode + Origin host (IP) in whitelist → allowed.
+/// - Everything else (malformed, non-IP hostnames, bad ports) → rejected.
 pub(crate) async fn check_csrf_origin(
     origin: Option<&str>,
     access_control: &super::AccessControl,
 ) -> bool {
+    let external = access_control.is_external().await;
     let Some(origin) = origin else {
-        return true; // No Origin header → same-origin
+        return !external; // No Origin header: local same-origin/tooling only
     };
-    let o = origin.to_lowercase();
-    if o.starts_with("http://127.0.0.1")
-        || o.starts_with("http://localhost")
-        || o.starts_with("https://127.0.0.1")
-        || o.starts_with("https://localhost")
-    {
+    let lowered = origin.to_lowercase();
+    let Some(host) = origin_host(&lowered) else {
+        return false; // Malformed Origin → fail closed
+    };
+    if is_loopback_host(host) {
         return true;
     }
-    if !access_control.is_external().await {
+    if !external {
         return false;
     }
     // In external mode, allow origins from whitelisted IPs
-    if let Some(host) = o
-        .split("://")
-        .nth(1)
-        .map(|h| h.split(':').next().unwrap_or(h))
-    {
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            access_control.is_allowed(ip).await
-        } else {
-            false
-        }
-    } else {
-        false
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => access_control.is_allowed(ip).await,
+        Err(_) => false,
     }
 }
 
-#[cfg(test)]
-mod tests;
+/// Exact loopback Origin hosts, always allowed (any port, either scheme).
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+/// Extract and validate the host part of an Origin header value (input
+/// already lowercased by the caller). Returns None for malformed values —
+/// missing scheme, empty host, non-numeric port, unbalanced IPv6 brackets —
+/// so callers fail closed.
+fn origin_host(origin: &str) -> Option<&str> {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    let authority = rest.split(&['/', '?', '#'][..]).next()?;
+    if authority.contains(']') {
+        // IPv6 literal: [::1] or [::1]:8977
+        let inner = authority.strip_prefix('[')?;
+        let close = inner.find(']')?;
+        let host = &inner[..close];
+        let tail = &inner[close + 1..];
+        if let Some(port) = tail.strip_prefix(':') {
+            valid_port(port)?;
+        } else if !tail.is_empty() {
+            return None;
+        }
+        return Some(host);
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    if let Some(p) = port {
+        valid_port(p)?;
+    }
+    Some(host)
+}
+
+fn valid_port(port: &str) -> Option<()> {
+    if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// S4 (07 号 audit, 12 批 A2): Host-header allowlist — the DNS-rebinding
+/// gate. Local mode allows loopback host names only. External mode also
+/// allows the configured bind host and any `WPTSALL_WEB_UI_HOST_ALLOWLIST`
+/// entries (comma-separated, for reverse-proxy deployments). Exact host
+/// equality, port-insensitive: `127.0.0.1.evil.com` is not `127.0.0.1`.
+pub(crate) async fn check_host_header(
+    host_header: Option<&str>,
+    access_control: &super::AccessControl,
+) -> bool {
+    let Some(value) = host_header else {
+        return false;
+    };
+    let Some(host) = host_header_host(value) else {
+        return false;
+    };
+    let external = access_control.is_external().await;
+    let bind_host = crate::web_ui::web_ui_effective_bind_addr();
+    let bind_host = host_header_host(&bind_host).map(|s| s.to_string());
+    let allowlist = std::env::var("WPTSALL_WEB_UI_HOST_ALLOWLIST")
+        .map(|raw| {
+            raw.split(',')
+                .map(|entry| entry.trim().to_string())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    host_header_allowed(host, external, bind_host.as_deref(), &allowlist)
+}
+
+/// Pure decision core of the Host allowlist (unit-testable without a live
+/// AccessControl or process env). `host` must already be the extracted,
+/// lowercased host part (see `host_header_host`).
+fn host_header_allowed(
+    host: &str,
+    external: bool,
+    bind_host: Option<&str>,
+    allowlist: &[String],
+) -> bool {
+    if is_loopback_host(host) {
+        return true;
+    }
+    if !external {
+        return false;
+    }
+    if let Some(bind_host) = bind_host {
+        if host == bind_host.trim().to_ascii_lowercase() {
+            return true;
+        }
+    }
+    allowlist
+        .iter()
+        .any(|entry| entry.eq_ignore_ascii_case(host))
+}
+
+/// Extract and validate the host part of a Host header (or bind address).
+/// Handles bare hosts, `host:port`, and bracketed IPv6 `[::1]:port`.
+/// Returns None for malformed values (empty host, non-numeric port,
+/// unbalanced brackets, multi-colon unbracketed forms) so callers fail
+/// closed.
+fn host_header_host(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        // IPv6 literal: [::1] or [::1]:8977
+        let (host, tail) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        if let Some(port) = tail.strip_prefix(':') {
+            valid_port(port)?;
+        } else if !tail.is_empty() {
+            return None;
+        }
+        return Some(host);
+    }
+    match value.split(':').count() {
+        1 => Some(value),
+        2 => {
+            let (host, port) = value.rsplit_once(':')?;
+            if host.is_empty() {
+                return None;
+            }
+            valid_port(port)?;
+            Some(host)
+        }
+        // Unbracketed multi-colon form (bare IPv6 is invalid in Host)
+        _ => None,
+    }
+}
+
+/// S2 (07 号 audit, 12 批 A2): token-gate decision. Pure so the decision
+/// matrix is unit-testable without a live socket. Remote peers are always
+/// gated in external mode; loopback peers keep only read access to the
+/// access-control state (token recovery lane); local mode never gates;
+/// static assets (non-/api targets) never gate.
+fn webui_token_required(
+    external: bool,
+    peer: Option<std::net::IpAddr>,
+    method: &str,
+    target: &str,
+) -> bool {
+    if !external || !target.starts_with("/api") {
+        return false;
+    }
+    if peer.map(|ip| ip.is_loopback()).unwrap_or(false) {
+        return !(method.eq_ignore_ascii_case("GET") && target == "/api/access-control");
+    }
+    true
+}
+
+/// Constant-time equality for token comparison (no early exit on the first
+/// differing byte; length mismatch still short-circuits, which leaks only
+/// the token length — acceptable for a fixed-format 32-hex token).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+
 
 // ── update-check (lightweight, polls wptsall-server releases manifest) ─────
 
@@ -1143,7 +1646,27 @@ async fn handle_update_check(
         let guard = state.lock().await;
         (guard.server_base.clone(), guard.http_client.clone())
     };
-    let payload = match crate::updater::check_for_update(&http_client, &server_base).await {
+    let outcome = crate::updater::check_for_update(&http_client, &server_base).await;
+    match &outcome {
+        Ok(result) => {
+            crate::logging::log_event_global(
+                "info",
+                "ota.update_checked",
+                json!({
+                    "update_available": result.update_available,
+                    "latest_version": result.latest_version,
+                }),
+            );
+        }
+        Err(err) => {
+            crate::logging::log_event_global(
+                "warn",
+                "ota.update_check_failed",
+                json!({ "error": format!("{:#}", err) }),
+            );
+        }
+    }
+    let payload = match outcome {
         Ok(result) => json!({
             "success": true,
             "data": result,
@@ -1153,11 +1676,81 @@ async fn handle_update_check(
             "error": {
                 "code": "UPDATE_CHECK_FAILED",
                 "message": e.to_string(),
+            },
+            // Local-only versions so the About tab can still show "you are
+            // on vX" even when the manifest fetch fails.
+            "data": {
+                "current_version": env!("CARGO_PKG_VERSION"),
+                "ui_current_version": crate::updater::current_ui_version(),
             }
         }),
     };
     let encoded = serde_json::to_vec(&payload)?;
     write_http_response(socket, "200 OK", "application/json", &encoded).await
+}
+
+// ── logs management (route-local, mirrors the update-check style) ─────────
+
+/// POST /api/logs/clear — truncate the client log file. The "logs.cleared"
+/// marker event is written AFTER the truncate so it becomes the first line
+/// of the fresh file (audit trail of the clear action itself).
+async fn handle_logs_clear(socket: &mut TcpStream, log_file: &str) -> anyhow::Result<()> {
+    match crate::logging::clear_log_file(log_file) {
+        Ok(()) => {
+            crate::logging::log_event_global("info", "logs.cleared", json!({}));
+            let payload = json!({ "success": true, "data": { "cleared": true } });
+            write_http_response(
+                socket,
+                "200 OK",
+                "application/json",
+                &serde_json::to_vec(&payload)?,
+            )
+            .await
+        }
+        Err(err) => write_error_response(socket, "LOG_CLEAR_FAILED", &err_public(&err)).await,
+    }
+}
+
+/// POST /api/logs/client — client-side JS error ingestion (see dispatch arm).
+/// Level is always error; the central redaction boundary sanitizes stack
+/// text and message bodies.
+async fn handle_logs_client(socket: &mut TcpStream, body: &[u8]) -> anyhow::Result<()> {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            return write_error_response(
+                socket,
+                "INVALID_JSON",
+                "expected { \"message\": \"...\", ... } client error report",
+            )
+            .await;
+        }
+    };
+    let message = req
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown client error")
+        .to_string();
+    let detail = json!({
+        "kind": req.get("kind").and_then(serde_json::Value::as_str).unwrap_or("js_error"),
+        "message": crate::logging::snippet(&message),
+        "source": req.get("source").and_then(serde_json::Value::as_str),
+        "lineno": req.get("lineno"),
+        "colno": req.get("colno"),
+        "stack": req
+            .get("stack")
+            .and_then(serde_json::Value::as_str)
+            .map(crate::logging::snippet),
+    });
+    crate::logging::log_event_global("error", "webui.client_error", detail);
+    let payload = json!({ "success": true, "data": { "recorded": true } });
+    write_http_response(
+        socket,
+        "200 OK",
+        "application/json",
+        &serde_json::to_vec(&payload)?,
+    )
+    .await
 }
 
 // ── perform-update (binary self-replace OR UI-only disk swap) ─────────
@@ -1189,7 +1782,7 @@ async fn handle_perform_update(
     let check = match crate::updater::check_for_update(&http_client, &server_base).await {
         Ok(r) => r,
         Err(e) => {
-            return write_error_response(socket, "UPDATE_CHECK_FAILED", &format!("{:#}", e)).await;
+            return write_error_response(socket, "UPDATE_CHECK_FAILED", &err_public(&e)).await;
         }
     };
 
@@ -1199,6 +1792,17 @@ async fn handle_perform_update(
 
     // Prefer binary when it is newer; otherwise apply UI-only bundle.
     let apply_ui_only = crate::updater::should_apply_ui_only(&check);
+
+    // A self-replacing update is about to begin — audit it before any
+    // destructive step so a failed swap is still traceable.
+    crate::logging::log_event_global(
+        "info",
+        "ota.perform_update_started",
+        json!({
+            "latest_version": check.latest_version,
+            "mode": if apply_ui_only { "ui_only" } else { "binary" },
+        }),
+    );
 
     update_flag.store(true, std::sync::atomic::Ordering::Relaxed);
 
@@ -1244,7 +1848,7 @@ async fn handle_perform_update(
                 return write_error_response(
                     socket,
                     "SECURE_UPDATE_VERIFY_FAILED",
-                    &format!("{:#}", e),
+                    &err_public(&e),
                 )
                 .await;
             }
@@ -1280,7 +1884,7 @@ async fn handle_perform_update(
                 return write_error_response(
                     socket,
                     "SHA256SUMS_FETCH_FAILED",
-                    &format!("{:#}", e),
+                    &err_public(&anyhow::Error::from(e)),
                 )
                 .await;
             }
@@ -1304,13 +1908,13 @@ async fn handle_perform_update(
             Ok(p) => p,
             Err(e) => {
                 update_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-                return write_error_response(socket, "DOWNLOAD_FAILED", &format!("{:#}", e)).await;
+                return write_error_response(socket, "DOWNLOAD_FAILED", &err_public(&e)).await;
             }
         };
         if let Err(e) = client_runtime_core::updater::verify_checksum(&tmp, &expected_hash).await {
             update_flag.store(false, std::sync::atomic::Ordering::Relaxed);
             let _ = tokio::fs::remove_file(&tmp).await;
-            return write_error_response(socket, "CHECKSUM_MISMATCH", &format!("{:#}", e)).await;
+            return write_error_response(socket, "CHECKSUM_MISMATCH", &err_public(&e)).await;
         }
         match client_runtime_core::updater::extract_update_binary(&tmp) {
             Ok(bin) => {
@@ -1322,8 +1926,7 @@ async fn handle_perform_update(
             Err(e) => {
                 update_flag.store(false, std::sync::atomic::Ordering::Relaxed);
                 let _ = tokio::fs::remove_file(&tmp).await;
-                return write_error_response(socket, "KIT_EXTRACT_FAILED", &format!("{:#}", e))
-                    .await;
+                return write_error_response(socket, "KIT_EXTRACT_FAILED", &err_public(&e)).await;
             }
         }
     };
@@ -1334,7 +1937,12 @@ async fn handle_perform_update(
         Err(e) => {
             update_flag.store(false, std::sync::atomic::Ordering::Relaxed);
             let _ = tokio::fs::remove_file(&tmp_binary).await;
-            return write_error_response(socket, "CURRENT_EXE_FAILED", &format!("{:#}", e)).await;
+            return write_error_response(
+                socket,
+                "CURRENT_EXE_FAILED",
+                &err_public(&anyhow::Error::from(e)),
+            )
+            .await;
         }
     };
 
@@ -1354,7 +1962,7 @@ async fn handle_perform_update(
         } else {
             "SELF_REPLACE_FAILED"
         };
-        return write_error_response(socket, code, &format!("{:#}", e)).await;
+        return write_error_response(socket, code, &err_public(&e)).await;
     }
 
     // Success — service will restart shortly
@@ -1419,7 +2027,7 @@ async fn perform_ui_only_update(
         }
         Err(e) => {
             update_flag.store(false, std::sync::atomic::Ordering::Relaxed);
-            write_error_response(socket, "UI_APPLY_FAILED", &format!("{:#}", e)).await
+            write_error_response(socket, "UI_APPLY_FAILED", &err_public(&e)).await
         }
     }
 }

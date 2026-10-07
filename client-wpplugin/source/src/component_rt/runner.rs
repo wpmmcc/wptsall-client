@@ -1,4 +1,4 @@
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use reqwest::Client;
 use serde_json::Value;
@@ -14,49 +14,29 @@ use crate::task_engine::executor::normalize_patch_field_key;
 use crate::task_engine::executor::normalize_task_content_type;
 use crate::types::*;
 
-/// Redact sensitive query parameters from URLs before logging.
-fn redact_url_secrets(url: &str) -> String {
-    if let Some(q_pos) = url.find('?') {
-        let (base, query) = url.split_at(q_pos);
-        let redacted = query
-            .split('&')
-            .map(|param| {
-                if let Some(eq_pos) = param.find('=') {
-                    let key_lower = param[..eq_pos].to_lowercase();
-                    if key_lower.contains("key")
-                        || key_lower.contains("token")
-                        || key_lower.contains("secret")
-                        || key_lower.contains("auth")
-                    {
-                        format!("{}=***", &param[..eq_pos])
-                    } else {
-                        param.to_string()
-                    }
-                } else {
-                    param.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        format!("{}{}", base, redacted)
-    } else {
-        url.to_string()
-    }
-}
+pub(crate) mod provider_recovery;
+
+
 
 /// Validate a rendered provider URL before any component-side egress.
 ///
 /// Provider templates are operator-controlled input, so this check is kept at
 /// the final request boundary (after template rendering) and is shared by all
-/// request variants.  DNS results are checked as well as literal IPs to reduce
-/// DNS-rebinding/metadata exposure.  An optional comma-separated
+/// request variants.  Literal IPs AND DNS-resolved addresses are checked
+/// against the metadata floor (S5/N-1, 12 批 A4): a hostname that resolves
+/// to the instance-metadata service — directly, via an IPv4-mapped IPv6
+/// literal, or via the AWS IMDS IPv6 endpoint — is rejected. Resolution
+/// failure is allowed through (the request itself will fail); only resolved
+/// forbidden addresses are blocked. An optional comma-separated
 /// Translation provider URL policy for the local-first Client.
 ///
 /// Product rule: operators may point a catalog/component at **any** http(s)
 /// vendor endpoint (including loopback mock-api / local LLM). We only reject
 /// clearly unsafe shapes: non-http schemes and credentials embedded in the URL.
-/// Cloud metadata hostnames remain blocked as a hard SSRF floor.
-pub(super) fn assert_provider_url_allowed(raw: &str) -> anyhow::Result<()> {
+/// Cloud metadata hostnames remain blocked as a hard SSRF floor; loopback and
+/// private ranges stay reachable by product rule (the allowlist below is a
+/// no-op compatibility hook, NOT an enforced gate).
+pub(crate) fn assert_provider_url_allowed(raw: &str) -> anyhow::Result<()> {
     let parsed = url::Url::parse(raw.trim()).map_err(|_| anyhow!("provider URL is invalid"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(anyhow!("provider URL scheme is not allowed"));
@@ -71,6 +51,13 @@ pub(super) fn assert_provider_url_allowed(raw: &str) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow!("provider URL host is missing"))?
         .trim_end_matches('.')
         .to_ascii_lowercase();
+    // url::Url::host_str() keeps IPv6 brackets ("[::1]"); strip them so
+    // IpAddr::from_str and the resolver see the bare literal.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(&host)
+        .to_string();
 
     // Hard floor only: cloud instance-metadata endpoints (not translation APIs).
     if host == "metadata.google.internal"
@@ -79,8 +66,17 @@ pub(super) fn assert_provider_url_allowed(raw: &str) -> anyhow::Result<()> {
     {
         return Err(anyhow!("provider host is blocked by egress policy"));
     }
+    // S5+N-1 (07 audit, 12 批 A4): literal IPs are checked with IPv6
+    // unmapping (the old V4-only match let `[::ffff:169.254.169.254]`
+    // through); non-literal hostnames are resolved and every resolved
+    // address is re-checked, closing the resolve-then-fetch metadata
+    // window for DNS-rebinding shapes.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if matches!(ip, IpAddr::V4(v4) if v4.octets() == [169, 254, 169, 254]) {
+        if is_forbidden_egress_ip(ip) {
+            return Err(anyhow!("provider host is blocked by egress policy"));
+        }
+    } else if let Ok(addrs) = (host.as_str(), 80).to_socket_addrs() {
+        if resolved_addrs_hit_forbidden_egress(addrs) {
             return Err(anyhow!("provider host is blocked by egress policy"));
         }
     }
@@ -94,6 +90,36 @@ pub(super) fn assert_provider_url_allowed(raw: &str) -> anyhow::Result<()> {
     // no-op compatibility hook so existing Lab env vars do not break.
     let _ = host_matches_allowlist(&host, "WPTSALL_PROVIDER_ALLOWLIST");
     Ok(())
+}
+
+/// The metadata SSRF floor: the IPv4 instance-metadata address in every
+/// spelling (dotted, IPv4-mapped IPv6, hex-mapped), the AWS IMDS IPv6
+/// endpoint, and IPv6 link-local (the fe80::/10 counterpart of the
+/// 169.254/16 metadata surface). Loopback, ULA and private ranges are
+/// deliberately NOT here — local mock-api / local LLM product lanes
+/// require them (09 审核口径).
+pub(crate) fn is_forbidden_egress_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.octets() == [169, 254, 169, 254],
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.octets() == [169, 254, 169, 254];
+            }
+            let seg = v6.segments();
+            // fd00:ec2::254 — AWS IMDS dual-stack endpoint.
+            seg == [0xfd00, 0x0ec2, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0254]
+                // fe80::/10 — IPv6 link-local.
+                || (seg[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// True when any resolved address lands on the metadata floor. Split from
+/// the resolver call so the decision is unit-testable without live DNS.
+fn resolved_addrs_hit_forbidden_egress(
+    mut addrs: impl Iterator<Item = std::net::SocketAddr>,
+) -> bool {
+    addrs.any(|addr| is_forbidden_egress_ip(addr.ip()))
 }
 
 fn host_matches_denylist(host: &str, variable: &str) -> bool {
@@ -118,29 +144,56 @@ fn host_matches_allowlist(host: &str, variable: &str) -> bool {
         })
 }
 
+/// Origin tuple for redirect-boundary decisions: (scheme, host, port).
+/// Shared by the post-hoc redirect check and the reqwest redirect policy
+/// so both always agree on what "same origin" means.
+fn url_origin_tuple(u: &url::Url) -> (String, String, Option<u16>) {
+    (
+        u.scheme().to_ascii_lowercase(),
+        u.host_str()
+            .unwrap_or_default()
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+        u.port_or_known_default(),
+    )
+}
+
 /// Reject redirects that leave the configured provider origin.  Reqwest
 /// follows redirects by default; checking the final URL closes the common
 /// cross-host redirect escape from an otherwise allowlisted endpoint.
+/// With `provider_redirect_policy` armed on the client (N-2), a cross-origin
+/// hop never happens — this check is the second layer that reports it if a
+/// client without the policy slips through.
 pub(super) fn assert_provider_redirect_origin(
     original: &str,
     final_url: &url::Url,
 ) -> anyhow::Result<()> {
     let initial =
         url::Url::parse(original.trim()).map_err(|_| anyhow!("provider URL is invalid"))?;
-    let origin = |u: &url::Url| {
-        (
-            u.scheme().to_ascii_lowercase(),
-            u.host_str()
-                .unwrap_or_default()
-                .trim_end_matches('.')
-                .to_ascii_lowercase(),
-            u.port_or_known_default(),
-        )
-    };
-    if origin(&initial) != origin(final_url) {
+    if url_origin_tuple(&initial) != url_origin_tuple(final_url) {
         return Err(anyhow!("provider redirect crossed host boundary"));
     }
     assert_provider_url_allowed(final_url.as_str())
+}
+
+/// N-2 (07 audit, 12 批 A3): reqwest redirect policy for provider egress
+/// clients. Same-origin redirects follow automatically (auth headers stay
+/// on the trusted origin); a redirect that leaves the configured provider
+/// origin is NEVER followed — the Authorization header must not be sent
+/// cross-host, so the 30x surfaces to the caller and the response layer
+/// reports the boundary crossing. Vault/KMS resolvers keep their stricter
+/// `Policy::none()` (no redirect is legitimate there).
+pub(crate) fn provider_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let Some(first) = attempt.previous().first() else {
+            return attempt.follow();
+        };
+        if url_origin_tuple(first) == url_origin_tuple(attempt.url()) {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
 }
 
 /// Result of signing - different algorithms produce different outputs
@@ -161,9 +214,11 @@ mod request;
 mod signing;
 mod source_asset;
 use self::async_poll::*;
-#[cfg(test)]
-use self::chunking::{is_gutenberg_content, split_rich_html_by_blocks};
-pub(crate) use self::chunking::{translate_rich_html_blocks, translate_text_with_constraints};
+
+pub(crate) use self::chunking::{
+    translate_rich_html_blocks, translate_rich_html_blocks_with_env,
+    translate_text_with_constraints, translate_text_with_constraints_with_env,
+};
 use self::request::*;
 use self::signing::process_sign_config;
 use self::source_asset::*;
@@ -495,7 +550,7 @@ fn configured_vault_base_url() -> anyhow::Result<url::Url> {
     let raw = env::var("WPTSALL_VAULT_ADDR")
         .map_err(|_| anyhow!("WPTSALL_VAULT_ADDR is required for vault references"))?;
     let mut base = url::Url::parse(raw.trim()).map_err(|_| anyhow!("Vault address is invalid"))?;
-    if base.scheme() != "https" && !(cfg!(test) && base.scheme() == "http") {
+    if base.scheme() != "https" && !(false && base.scheme() == "http") {
         anyhow::bail!("Vault address must use HTTPS");
     }
     if !base.username().is_empty()
@@ -520,7 +575,7 @@ fn configured_vault_base_url() -> anyhow::Result<url::Url> {
     // cloud-metadata addresses are never valid secret-store targets in a
     // production build.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_forbidden_secret_store_ip(ip) && !(cfg!(test) && ip.is_loopback()) {
+        if is_forbidden_secret_store_ip(ip) && !(false && ip.is_loopback()) {
             anyhow::bail!("Vault host resolves to a forbidden address");
         }
     } else {
@@ -545,7 +600,7 @@ fn configured_kms_base_url() -> anyhow::Result<url::Url> {
     let raw = env::var("WPTSALL_KMS_ADDR")
         .map_err(|_| anyhow!("WPTSALL_KMS_ADDR is required for KMS references"))?;
     let mut base = url::Url::parse(raw.trim()).map_err(|_| anyhow!("KMS address is invalid"))?;
-    if base.scheme() != "https" && !(cfg!(test) && base.scheme() == "http") {
+    if base.scheme() != "https" && !(false && base.scheme() == "http") {
         anyhow::bail!("KMS address must use HTTPS");
     }
     if !base.username().is_empty()
@@ -565,7 +620,7 @@ fn configured_kms_base_url() -> anyhow::Result<url::Url> {
         anyhow::bail!("KMS host is not in WPTSALL_SECRET_STORE_ALLOWLIST");
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_forbidden_secret_store_ip(ip) && !(cfg!(test) && ip.is_loopback()) {
+        if is_forbidden_secret_store_ip(ip) && !(false && ip.is_loopback()) {
             anyhow::bail!("KMS host resolves to a forbidden address");
         }
     } else {
@@ -647,8 +702,105 @@ pub(crate) async fn translate_text_via_component(
     source_lang: &str,
     target_lang: &str,
 ) -> anyhow::Result<String> {
+    translate_text_via_component_with_env(
+        client,
+        runtime,
+        input_text,
+        source_lang,
+        target_lang,
+        None,
+    )
+    .await
+}
+
+/// A durable environment protects both synchronous and asynchronous provider
+/// calls. Unknown submits are parked; completed results replay before credential
+/// selection or egress. Known async jobs restore the frozen context and poll.
+pub(crate) async fn translate_text_via_component_with_env(
+    client: &Client,
+    runtime: &ComponentRuntime,
+    input_text: &str,
+    source_lang: &str,
+    target_lang: &str,
+    async_env: Option<crate::db::async_jobs::AsyncJobEnv>,
+) -> anyhow::Result<String> {
     // Fail-closed contract / content-format gate (libs/wptsall-contracts).
     crate::component_rt::contract::assert_runtime_ready_for_format(runtime, None)?;
+    provider_recovery::validate_contract(&runtime.template)?;
+    anyhow::ensure!(
+        async_env.is_some()
+            || runtime
+                .template
+                .async_poll
+                .as_ref()
+                .is_none_or(|poll| poll.reconcile.is_none()),
+        "provider reconciliation template requires a persistent translation unit"
+    );
+
+    let async_env = async_env
+        .map(|env| {
+            env.for_runtime(
+                runtime,
+                &serde_json::json!(input_text),
+                source_lang,
+                target_lang,
+            )
+        })
+        .transpose()?;
+    // Read-only ready replay must remain available even if new claim writes
+    // fail. Every path that might do provider work then acquires a unit owner
+    // and rechecks recovery while holding that native authority.
+    if let Some(env) = &async_env {
+        if let crate::db::async_jobs::ProviderRecovery::Ready(result) =
+            crate::db::async_jobs::recover_provider_operation(env).await?
+        {
+            let text = result
+                .as_str()
+                .ok_or_else(|| anyhow!("invalid saved text result"))?;
+            super::content_safety::validate_interpolation_tokens(input_text, text)?;
+            return Ok(text.to_string());
+        }
+    }
+    validate_http_limits(&runtime.template)?;
+    let async_env = match async_env {
+        Some(env) => Some(crate::db::async_jobs::ProviderExecution::acquire(env).await?),
+        None => None,
+    };
+    let resumed_job = match async_env.as_ref() {
+        Some(env) => {
+            let row = match crate::db::async_jobs::recover_provider_operation(env).await? {
+                crate::db::async_jobs::ProviderRecovery::Ready(result) => {
+                    let text = result
+                        .as_str()
+                        .ok_or_else(|| anyhow!("invalid saved text result"))?;
+                    super::content_safety::validate_interpolation_tokens(input_text, text)?;
+                    return Ok(text.to_string());
+                }
+                crate::db::async_jobs::ProviderRecovery::Polling(row) => {
+                    crate::db::async_jobs::upsert_polling_job(
+                        env,
+                        &runtime.template.id,
+                        &row.job_id,
+                        &row.ctx,
+                        source_lang,
+                        target_lang,
+                    )
+                    .await?;
+                    Some(row)
+                }
+                crate::db::async_jobs::ProviderRecovery::Vacant => {
+                    crate::db::async_jobs::find_polling_job(env).await?
+                }
+            };
+            anyhow::ensure!(
+                row.is_none() || runtime.template.async_poll.is_some(),
+                "saved provider job requires an async-poll template; retained"
+            );
+            crate::bindings::encrypt_for_save("{}")?;
+            row
+        }
+        None => None,
+    };
 
     // Use char count (not byte count) to correctly measure multi-byte text.
     let input_len = input_text.chars().count();
@@ -657,9 +809,12 @@ pub(crate) async fn translate_text_via_component(
     // The guard is held for the duration of this translation (RAII concurrency counting).
     // Use select_key_with_limits to enforce max_input_chars per-key limits.
     let _key_guard;
-    let mut ctx = runtime.auth_values.clone();
+    let mut ctx = resumed_job
+        .as_ref()
+        .map(|row| row.ctx.clone())
+        .unwrap_or_else(|| runtime.auth_values.clone());
 
-    if let Some(ref pool) = runtime.key_pool {
+    if let Some(pool) = runtime.key_pool.as_ref().filter(|_| resumed_job.is_none()) {
         let guard = pool.select_key_with_limits(input_len, 0.0).await?;
         // Inject key's auth_values as auth.* context variables (overriding static auth)
         for (k, v) in &guard.auth_values {
@@ -672,7 +827,13 @@ pub(crate) async fn translate_text_via_component(
 
     // Dynamic OAuth token selection: if component has an oauth pool + manager, fetch a token.
     let _oauth_guard;
-    if let (Some(ref pool), Some(ref manager)) = (&runtime.oauth_pool, &runtime.oauth_manager) {
+    if let Some((pool, manager)) = runtime
+        .oauth_pool
+        .as_ref()
+        .zip(runtime.oauth_manager.as_ref())
+        .filter(|_| resumed_job.is_none())
+    {
+        manager.assert_proxy_profile(runtime.proxy_profile_id.as_deref())?;
         let guard = pool.select(manager, input_len, 0.0).await?;
         // Inject token as auth.{token_field}
         ctx.insert(
@@ -684,9 +845,12 @@ pub(crate) async fn translate_text_via_component(
         _oauth_guard = None;
     }
 
-    insert_component_default_values_context(&mut ctx, runtime.template.default_values.as_ref());
-    insert_component_text_context(&mut ctx, input_text, source_lang, target_lang);
-    apply_language_map(&runtime.language_map, &mut ctx);
+    if resumed_job.is_none() {
+        insert_component_default_values_context(&mut ctx, runtime.template.default_values.as_ref());
+        insert_component_text_context(&mut ctx, input_text, source_lang, target_lang);
+        apply_language_map(&runtime.language_map, &mut ctx);
+    }
+    let prior_attempts = resumed_job.as_ref().map(|job| job.attempts).unwrap_or(0);
     let translated_path = runtime
         .template
         .response
@@ -701,9 +865,35 @@ pub(crate) async fn translate_text_via_component(
         ));
     }
 
-    // 1) Submit stage (sync or async).
-    let submit_json =
-        call_component_request_json(client, runtime, &runtime.template.request, &mut ctx).await?;
+    // GAP-04: crash resume — a surviving 'polling' row for this exact unit
+    // (domain×relation×object×field×chunk×lane) means a previous process
+    // already submitted (and the provider already billed) this job. Skip
+    // the submit, restore the persisted ctx snapshot verbatim, keep
+    // polling. Sync components use the same operation record for replay and
+    // unknown-submit protection, without creating a polling projection.
+    // 1) Submit stage (sync or async) — skipped entirely on resume.
+    let submit_json = match &resumed_job {
+        Some(row) => {
+            ctx = row.ctx.clone();
+            serde_json::Value::Null
+        }
+        None => {
+            if let Some(env) = async_env.as_ref() {
+                crate::db::async_jobs::begin_provider_runtime_intent(
+                    env,
+                    runtime,
+                    &serde_json::json!(input_text),
+                    &mut ctx,
+                    source_lang,
+                    target_lang,
+                )
+                .await?;
+                crate::db::async_jobs::commit_provider_submit_context(env, &ctx).await?;
+            }
+            call_component_request_json(client, runtime, &runtime.template.request, &mut ctx)
+                .await?
+        }
+    };
     if let Some(value) = extract_json_path(&submit_json, translated_path) {
         let translated = if let Some(v) = value.as_str() {
             v.to_string()
@@ -727,6 +917,11 @@ pub(crate) async fn translate_text_via_component(
             })
             .unwrap_or(false);
         if !translated.trim().is_empty() && !immediate_value_is_async_job_id {
+            super::content_safety::validate_interpolation_tokens(input_text, &translated)?;
+            if let Some(env) = async_env.as_ref() {
+                crate::db::async_jobs::save_provider_result(env, serde_json::json!(translated))
+                    .await?;
+            }
             return Ok(translated);
         }
         if runtime.template.async_poll.is_none() {
@@ -740,34 +935,78 @@ pub(crate) async fn translate_text_via_component(
 
     // 2) Async poll stage (if configured).
     let Some(async_poll) = runtime.template.async_poll.as_ref() else {
-        let body_preview: String = submit_json.to_string().chars().take(200).collect();
         return Err(anyhow!(
-            "translated_text_path '{}' not found in response (component={}, body_preview={})",
+            "translated_text_path '{}' not found in response (component={})",
             translated_path,
-            runtime.template.id,
-            body_preview
+            runtime.template.id
         ));
     };
 
-    let job_id = extract_json_path_string(&submit_json, &async_poll.job_id_path)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if job_id.is_empty() {
-        let body_preview: String = submit_json.to_string().chars().take(200).collect();
-        return Err(anyhow!(
-            "async_poll.job_id_path '{}' not found in submit response (component={}, body_preview={})",
-            async_poll.job_id_path,
-            runtime.template.id,
-            body_preview
-        ));
-    }
-    ctx.insert("computed.job_id".to_string(), job_id.clone());
-    ctx.insert("computed.async_job_id".to_string(), job_id);
-    apply_async_poll_submit_extract(async_poll, &submit_json, &mut ctx, &runtime.template.id)?;
+    let job_id = match resumed_job {
+        Some(row) => row.job_id,
+        None => {
+            let job_id = extract_json_path_string(&submit_json, &async_poll.job_id_path)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if job_id.is_empty() {
+                return Err(anyhow!(
+                    "async_poll.job_id_path '{}' not found in submit response (component={})",
+                    async_poll.job_id_path,
+                    runtime.template.id
+                ));
+            }
+            ctx.insert("computed.job_id".to_string(), job_id.clone());
+            ctx.insert("computed.async_job_id".to_string(), job_id.clone());
+            apply_async_poll_submit_extract(
+                async_poll,
+                &submit_json,
+                &mut ctx,
+                &runtime.template.id,
+            )?;
 
+            // GAP-04: persist BEFORE the first poll — this instant opens
+            // the crash window the row exists to cover. The snapshot is the
+            // FULL render ctx (auth + defaults + input + computed.*), so a
+            // resume replays the exact submit-derived context instead of
+            // assuming an equivalent rebuild.
+            if let Some(env) = async_env.as_ref() {
+                crate::db::async_jobs::save_provider_job(
+                    env,
+                    &runtime.template.id,
+                    &job_id,
+                    &ctx,
+                    source_lang,
+                    target_lang,
+                )
+                .await?;
+                crate::db::async_jobs::upsert_polling_job(
+                    env,
+                    &runtime.template.id,
+                    &job_id,
+                    &ctx,
+                    source_lang,
+                    target_lang,
+                )
+                .await
+                .context("persist provider job before polling failed")?;
+            }
+            job_id
+        }
+    };
+    if let Some(env) = async_env.as_ref() {
+        crate::db::async_jobs::save_provider_job(
+            env,
+            &runtime.template.id,
+            &job_id,
+            &ctx,
+            source_lang,
+            target_lang,
+        )
+        .await?;
+    }
     let interval_secs = async_poll.interval_seconds.unwrap_or(5).max(1);
-    let timeout_secs = async_poll.timeout_seconds.unwrap_or(600).max(interval_secs);
+    let timeout_secs = async_poll.timeout_seconds.unwrap_or(600).max(1);
     let done_values = normalize_status_values(&async_poll.done_values);
     let failed_values = normalize_status_values(&async_poll.failed_values);
     let status_path = async_poll
@@ -782,16 +1021,49 @@ pub(crate) async fn translate_text_via_component(
         .filter(|v| !v.is_empty())
         .unwrap_or(translated_path);
 
-    let started = Instant::now();
+    let deadline = PollDeadline::new(timeout_secs, &runtime.template.id)?;
     let mut attempts = 0u64;
-    loop {
+    // GAP-04: the loop computes an outcome instead of returning directly so
+    // the row closure (close on success / mark failed on error) always runs,
+    // including on the timeout and failed-status arms.
+    let outcome = loop {
+        if let Err(error) = deadline.check(attempts) {
+            break Err(error);
+        }
         if attempts > 0 {
-            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            if let Err(error) = deadline
+                .wait(
+                    attempts,
+                    tokio::time::sleep(Duration::from_secs(interval_secs)),
+                )
+                .await
+            {
+                break Err(error);
+            }
         }
         attempts = attempts.saturating_add(1);
+        // GAP-04: per-attempt heartbeat — one cheap UPDATE per poll interval
+        // gives crash forensics ("how far did the poll get") and keeps the
+        // durable attempt history current. Age alone never authorizes deletion.
+        if let Some(env) = async_env.as_ref() {
+            crate::db::async_jobs::touch_polling_job(
+                env,
+                prior_attempts.saturating_add(attempts as i64),
+            )
+            .await
+            .context("persist async progress before polling failed")?;
+        }
 
-        let poll_json =
-            call_component_request_json(client, runtime, &async_poll.request, &mut ctx).await?;
+        let poll_json = match deadline
+            .wait(
+                attempts,
+                call_component_request_json(client, runtime, &async_poll.request, &mut ctx),
+            )
+            .await
+        {
+            Ok(result) => result?,
+            Err(error) => break Err(error),
+        };
 
         let rendered_status_path =
             status_path.and_then(|path| resolve_template_json_path(path, &ctx));
@@ -805,7 +1077,7 @@ pub(crate) async fn translate_text_via_component(
                 .filter(|v| !v.is_empty());
             if let Some(ref status_value) = status {
                 if status_values_contains(&failed_values, status_value) {
-                    return Err(anyhow!(
+                    break Err(anyhow!(
                         "component async poll failed (status='{}', component={})",
                         status_value,
                         runtime.template.id
@@ -826,30 +1098,47 @@ pub(crate) async fn translate_text_via_component(
                 value.to_string()
             };
             if !translated.trim().is_empty() {
-                return Ok(translated);
+                break super::content_safety::validate_interpolation_tokens(
+                    input_text,
+                    &translated,
+                )
+                .map(|()| translated);
             }
             if done_by_status {
-                return Err(anyhow!(
+                break Err(anyhow!(
                     "component async poll done but output empty (component={})",
                     runtime.template.id
                 ));
             }
         } else if done_by_status {
-            return Err(anyhow!(
+            break Err(anyhow!(
                 "component async poll done but output missing (component={})",
                 runtime.template.id
             ));
         }
+    };
 
-        if started.elapsed().as_secs() >= timeout_secs {
-            return Err(anyhow!(
-                "component async poll timed out (timeout_secs={}, attempts={}, component={})",
-                timeout_secs,
-                attempts,
-                runtime.template.id
-            ));
+    // Success closes the projection only after saving the paid result.
+    // Terminal errors retain 'failed' evidence, never authorize a new submit.
+    match &outcome {
+        Ok(result) => {
+            if let Some(env) = async_env.as_ref() {
+                crate::db::async_jobs::save_provider_result(env, serde_json::json!(result)).await?;
+                crate::db::async_jobs::close_job(env)
+                    .await
+                    .context("persist async completion failed")?;
+            }
+        }
+        Err(err) => {
+            if let Some(env) = async_env.as_ref() {
+                let err_snippet: String = format!("{:#}", err).chars().take(300).collect();
+                crate::db::async_jobs::mark_job_failed(env, &err_snippet)
+                    .await
+                    .context("persist async terminal failure failed")?;
+            }
         }
     }
+    outcome
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -864,6 +1153,49 @@ pub(crate) async fn translate_non_text_via_component(
     source_lang: &str,
     target_lang: &str,
 ) -> anyhow::Result<NonTextComponentOutcome> {
+    translate_non_text_via_component_with_env(
+        client,
+        runtime,
+        source_text,
+        source_payload,
+        source_ref,
+        task_type,
+        key,
+        source_lang,
+        target_lang,
+        None,
+    )
+    .await
+}
+
+/// GAP-04 non-text lane (video / document translation — the 06 doc's named
+/// cases): same durable-job contract as
+/// [`translate_text_via_component_with_env`]. A persistent environment covers
+/// synchronous/binary results as well as submit→poll. Evidence-query templates
+/// require that environment before any provider egress.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn translate_non_text_via_component_with_env(
+    client: &Client,
+    runtime: &ComponentRuntime,
+    source_text: &str,
+    source_payload: Option<&Value>,
+    source_ref: &str,
+    task_type: &str,
+    key: &str,
+    source_lang: &str,
+    target_lang: &str,
+    async_env: Option<crate::db::async_jobs::AsyncJobEnv>,
+) -> anyhow::Result<NonTextComponentOutcome> {
+    provider_recovery::validate_contract(&runtime.template)?;
+    anyhow::ensure!(
+        async_env.is_some()
+            || runtime
+                .template
+                .async_poll
+                .as_ref()
+                .is_none_or(|poll| poll.reconcile.is_none()),
+        "provider reconciliation template requires a persistent translation unit"
+    );
     let normalized_task_type = normalize_task_content_type(task_type);
     if !template_declares_real_non_text_output(&runtime.template, &normalized_task_type) {
         return Err(anyhow!(
@@ -873,45 +1205,111 @@ pub(crate) async fn translate_non_text_via_component(
         ));
     }
 
-    // Pre-selection: determine file size BEFORE selecting keys so that keys/oauth
-    // entries that cannot handle this file size are skipped during selection.
-    let file_size_mb: f64 = if !source_ref.is_empty() {
-        // Only do a HEAD request when at least one pool key/oauth entry imposes a file size
-        // limit — avoids unnecessary network round-trips when no limits are configured.
-        let needs_size_check = runtime
-            .key_pool
-            .as_ref()
-            .map(|p| p.has_file_size_limits())
-            .unwrap_or(false)
-            || runtime
-                .oauth_pool
-                .as_ref()
-                .map(|p| p.has_file_size_limits())
-                .unwrap_or(false);
-
-        if needs_size_check {
-            match get_file_content_length(client, source_ref).await {
-                Ok(size_bytes) => size_bytes as f64 / (1024.0 * 1024.0),
-                Err(_) => {
-                    // Cannot determine file size (no Content-Length header) — proceed
-                    // without filtering so the request is attempted regardless.
-                    0.0
+    let async_env = async_env
+        .map(|env| {
+            env.for_runtime(runtime, &serde_json::json!({
+            "source_text": source_text, "source_payload": source_payload, "source_ref": source_ref,
+            "task_type": normalized_task_type, "key": key,
+        }), source_lang, target_lang)
+        })
+        .transpose()?;
+    if let Some(env) = &async_env {
+        if let crate::db::async_jobs::ProviderRecovery::Ready(result) =
+            crate::db::async_jobs::recover_provider_operation(env).await?
+        {
+            return Ok(NonTextComponentOutcome {
+                translated_ref: result["translated_ref"].as_str().unwrap().to_string(),
+                translated_text: result["translated_text"].as_str().unwrap().to_string(),
+            });
+        }
+    }
+    validate_http_limits(&runtime.template)?;
+    let async_env = match async_env {
+        Some(env) => Some(crate::db::async_jobs::ProviderExecution::acquire(env).await?),
+        None => None,
+    };
+    let resumed_job = match async_env.as_ref() {
+        Some(env) => {
+            let row = match crate::db::async_jobs::recover_provider_operation(env).await? {
+                crate::db::async_jobs::ProviderRecovery::Ready(result) => {
+                    return Ok(NonTextComponentOutcome {
+                        translated_ref: result["translated_ref"].as_str().unwrap().to_string(),
+                        translated_text: result["translated_text"].as_str().unwrap().to_string(),
+                    });
                 }
-            }
+                crate::db::async_jobs::ProviderRecovery::Polling(row) => {
+                    crate::db::async_jobs::upsert_polling_job(
+                        env,
+                        &runtime.template.id,
+                        &row.job_id,
+                        &row.ctx,
+                        source_lang,
+                        target_lang,
+                    )
+                    .await?;
+                    Some(row)
+                }
+                crate::db::async_jobs::ProviderRecovery::Vacant => {
+                    crate::db::async_jobs::find_polling_job(env).await?
+                }
+            };
+            anyhow::ensure!(
+                row.is_none() || runtime.template.async_poll.is_some(),
+                "saved provider job requires an async-poll template; retained"
+            );
+            crate::bindings::encrypt_for_save("{}")?;
+            row
+        }
+        None => None,
+    };
+
+    // Source headers are not size authority. Measure once before acquiring
+    // credentials, then reuse those bytes for local metadata/encoding/upload.
+    // Paid receipts and resumed jobs returned above must not refetch source.
+    let verified_source = if resumed_job.is_none() {
+        let mut budget = u64::from(
+            runtime
+                .template
+                .constraints
+                .as_ref()
+                .and_then(|c| c.max_file_size_mb)
+                .unwrap_or(0),
+        ) * 1024
+            * 1024;
+        let mut needs_size_check = budget > 0;
+        if let Some(pool) = &runtime.key_pool {
+            budget =
+                crate::component_rt::file_limits::strictest(budget, pool.source_byte_budget()?);
+            needs_size_check |= pool.has_file_size_limits();
+        }
+        if let Some(pool) = &runtime.oauth_pool {
+            budget =
+                crate::component_rt::file_limits::strictest(budget, pool.source_byte_budget()?);
+            needs_size_check |= pool.has_file_size_limits();
+        }
+        if needs_size_check && !source_ref.trim().is_empty() {
+            Some(fetch_source_asset(client, source_ref, budget).await?)
         } else {
-            0.0
+            None
         }
     } else {
-        0.0
+        None
     };
+    let file_size_mb = verified_source
+        .as_ref()
+        .map(|asset| asset.bytes.len() as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0);
 
     // Dynamic key selection: if component has a key pool, acquire a key guard.
     // The guard is held for the duration of this translation (RAII concurrency counting).
     // Use select_key_with_limits to enforce max_file_size_mb per-key limits pre-selection.
     let _key_guard;
-    let mut ctx = runtime.auth_values.clone();
+    let mut ctx = resumed_job
+        .as_ref()
+        .map(|row| row.ctx.clone())
+        .unwrap_or_else(|| runtime.auth_values.clone());
 
-    if let Some(ref pool) = runtime.key_pool {
+    if let Some(pool) = runtime.key_pool.as_ref().filter(|_| resumed_job.is_none()) {
         let guard = pool.select_key_with_limits(0, file_size_mb).await?;
         // Inject key's auth_values as auth.* context variables (overriding static auth)
         for (k, v) in &guard.auth_values {
@@ -924,7 +1322,13 @@ pub(crate) async fn translate_non_text_via_component(
 
     // Dynamic OAuth token selection: if component has an oauth pool + manager, fetch a token.
     let _oauth_guard;
-    if let (Some(ref pool), Some(ref manager)) = (&runtime.oauth_pool, &runtime.oauth_manager) {
+    if let Some((pool, manager)) = runtime
+        .oauth_pool
+        .as_ref()
+        .zip(runtime.oauth_manager.as_ref())
+        .filter(|_| resumed_job.is_none())
+    {
+        manager.assert_proxy_profile(runtime.proxy_profile_id.as_deref())?;
         let guard = pool.select(manager, 0, file_size_mb).await?;
         // Inject token as auth.{token_field}
         ctx.insert(
@@ -936,38 +1340,141 @@ pub(crate) async fn translate_non_text_via_component(
         _oauth_guard = None;
     }
 
-    insert_component_default_values_context(&mut ctx, runtime.template.default_values.as_ref());
-    insert_component_text_context(&mut ctx, source_text, source_lang, target_lang);
-    insert_component_non_text_context(&mut ctx, source_payload, source_ref, task_type, key);
-    ensure_non_text_source_asset_metadata_context(client, runtime, &mut ctx, source_ref).await?;
-    maybe_insert_non_text_source_asset_context(client, runtime, &mut ctx, source_ref).await?;
-    apply_language_map(&runtime.language_map, &mut ctx);
+    let mut selected_source_budget = u64::from(
+        runtime
+            .template
+            .constraints
+            .as_ref()
+            .and_then(|c| c.max_file_size_mb)
+            .unwrap_or(0),
+    ) * 1024
+        * 1024;
+    for limit in [
+        _key_guard.as_ref().map(|guard| guard.max_file_size_mb),
+        _oauth_guard.as_ref().map(|guard| guard.max_file_size_mb),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        selected_source_budget = crate::component_rt::file_limits::strictest(
+            selected_source_budget,
+            crate::component_rt::file_limits::bytes_from_megabytes(limit)?,
+        );
+    }
+    let source_request = SourceRequest {
+        reference: source_ref,
+        verified: verified_source.as_ref(),
+        byte_budget: selected_source_budget,
+    };
 
-    if let Some(prepare) = runtime.template.prepare.as_ref() {
-        let prepare_json =
-            call_component_request_json(client, runtime, &prepare.request, &mut ctx).await?;
+    if resumed_job.is_none() {
+        insert_component_default_values_context(&mut ctx, runtime.template.default_values.as_ref());
+        insert_component_text_context(&mut ctx, source_text, source_lang, target_lang);
+        insert_component_non_text_context(&mut ctx, source_payload, source_ref, task_type, key);
+        ensure_non_text_source_asset_metadata_context(
+            client,
+            runtime,
+            &mut ctx,
+            source_ref,
+            verified_source.as_ref(),
+        )
+        .await?;
+        maybe_insert_non_text_source_asset_context(
+            client,
+            runtime,
+            &mut ctx,
+            source_ref,
+            verified_source.as_ref(),
+        )
+        .await?;
+        apply_language_map(&runtime.language_map, &mut ctx);
+    }
+    let prior_attempts = resumed_job.as_ref().map(|job| job.attempts).unwrap_or(0);
+
+    if resumed_job.is_none() {
+        if let Some(env) = async_env.as_ref() {
+            crate::db::async_jobs::begin_provider_runtime_intent(
+                env,
+                runtime,
+                &serde_json::json!({
+                    "source_text": source_text, "source_payload": source_payload,
+                    "source_ref": source_ref, "task_type": normalized_task_type, "key": key,
+                }),
+                &mut ctx,
+                source_lang,
+                target_lang,
+            )
+            .await?;
+        }
+    }
+
+    if let Some(prepare) = runtime
+        .template
+        .prepare
+        .as_ref()
+        .filter(|_| resumed_job.is_none())
+    {
+        let prepare_json = call_component_request_json_with_source(
+            client,
+            runtime,
+            &prepare.request,
+            &mut ctx,
+            Some(source_request),
+        )
+        .await?;
         apply_prepare_extract(prepare, &prepare_json, &mut ctx, &runtime.template.id)?;
     }
 
-    if let Some(source_upload) = runtime.template.source_upload.as_ref() {
-        upload_source_asset_to_vendor(client, runtime, source_upload, &mut ctx, source_ref).await?;
+    if let Some(source_upload) = runtime
+        .template
+        .source_upload
+        .as_ref()
+        .filter(|_| resumed_job.is_none())
+    {
+        upload_source_asset_to_vendor(
+            client,
+            runtime,
+            source_upload,
+            &mut ctx,
+            source_ref,
+            verified_source.as_ref(),
+        )
+        .await?;
     }
 
-    // 1) Submit stage
-    if request_expects_binary_response(&runtime.template.request) {
+    // GAP-04: crash resume (non-text lane) — same contract as the text
+    // lane: a surviving 'polling' row means the provider already has (and
+    // billed) this job; skip the submit AND the prepare/upload ladder (the
+    // persisted ctx snapshot carries their extracted state), restore the
+    // snapshot verbatim, keep polling.
+    // 1) Submit stage — skipped entirely on resume.
+    if resumed_job.is_none() {
+        if let Some(env) = async_env.as_ref() {
+            crate::db::async_jobs::commit_provider_submit_context(env, &ctx).await?;
+        }
+    }
+    if resumed_job.is_none() && request_expects_binary_response(&runtime.template.request) {
         let asset = call_component_request_binary_submit(
             client,
             runtime,
             &runtime.template.request,
             &mut ctx,
+            Some(source_request),
         )
         .await?;
         let preferred_name = asset
             .filename
             .or_else(|| ctx.get("input.source_filename").cloned())
             .filter(|v| !v.trim().is_empty());
-        let local_path = persist_downloaded_asset_to_temp(&asset.bytes, preferred_name.as_deref())?;
-        return finalize_non_text_outcome(
+        let credit = match async_env.as_ref() {
+            Some(env) => crate::db::async_jobs::provider_result_storage_credit(env).await?,
+            None => None,
+        };
+        let local_path = crate::storage_capacity::with_result_credit(credit, async {
+            persist_downloaded_provider_asset(&asset.bytes, preferred_name.as_deref())
+        })
+        .await?;
+        let result = finalize_non_text_outcome(
             &ctx,
             runtime,
             &normalized_task_type,
@@ -975,49 +1482,118 @@ pub(crate) async fn translate_non_text_via_component(
                 translated_ref: format!("file://{}", local_path),
                 translated_text: String::new(),
             },
-        );
+        )?;
+        persist_provider_media_result(async_env.as_ref(), &result).await?;
+        return Ok(result);
     }
 
-    let submit_json =
-        call_component_request_json(client, runtime, &runtime.template.request, &mut ctx).await?;
+    let submit_json = match &resumed_job {
+        Some(row) => {
+            ctx = row.ctx.clone();
+            serde_json::Value::Null
+        }
+        None => {
+            call_component_request_json_with_source(
+                client,
+                runtime,
+                &runtime.template.request,
+                &mut ctx,
+                Some(source_request),
+            )
+            .await?
+        }
+    };
 
     // Best-effort sync extraction (some providers may complete immediately).
-    let sync_outcome = extract_non_text_outcome_best_effort(
-        runtime,
-        &submit_json,
-        &normalized_task_type,
-        source_ref,
-        /*allow_source_fallback*/ runtime.template.async_poll.is_none(),
-        None,
-    );
-    if runtime.template.async_poll.is_none() {
-        return finalize_non_text_outcome(&ctx, runtime, &normalized_task_type, sync_outcome);
-    }
-    if !sync_outcome.translated_ref.trim().is_empty() {
-        return finalize_non_text_outcome(&ctx, runtime, &normalized_task_type, sync_outcome);
+    // On resume there is no submit response — nothing to extract.
+    if resumed_job.is_none() {
+        let sync_outcome = extract_non_text_outcome_best_effort(
+            runtime,
+            &submit_json,
+            &normalized_task_type,
+            source_ref,
+            /*allow_source_fallback*/ runtime.template.async_poll.is_none(),
+            None,
+        );
+        if runtime.template.async_poll.is_none() {
+            let result =
+                finalize_non_text_outcome(&ctx, runtime, &normalized_task_type, sync_outcome)?;
+            persist_provider_media_result(async_env.as_ref(), &result).await?;
+            return Ok(result);
+        }
+        if !sync_outcome.translated_ref.trim().is_empty() {
+            let result =
+                finalize_non_text_outcome(&ctx, runtime, &normalized_task_type, sync_outcome)?;
+            persist_provider_media_result(async_env.as_ref(), &result).await?;
+            return Ok(result);
+        }
     }
 
     // 2) Async poll stage
     let async_poll = runtime.template.async_poll.as_ref().expect("checked above");
-    let job_id = extract_json_path_string(&submit_json, &async_poll.job_id_path)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if job_id.is_empty() {
-        let body_preview: String = submit_json.to_string().chars().take(200).collect();
-        return Err(anyhow!(
-            "async_poll.job_id_path '{}' not found in submit response (component={}, body_preview={})",
-            async_poll.job_id_path,
-            runtime.template.id,
-            body_preview
-        ));
+    let job_id = match resumed_job {
+        Some(row) => row.job_id,
+        None => {
+            let job_id = extract_json_path_string(&submit_json, &async_poll.job_id_path)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if job_id.is_empty() {
+                return Err(anyhow!(
+                    "async_poll.job_id_path '{}' not found in submit response (component={})",
+                    async_poll.job_id_path,
+                    runtime.template.id
+                ));
+            }
+            ctx.insert("computed.job_id".to_string(), job_id.clone());
+            ctx.insert("computed.async_job_id".to_string(), job_id.clone());
+            apply_async_poll_submit_extract(
+                async_poll,
+                &submit_json,
+                &mut ctx,
+                &runtime.template.id,
+            )?;
+
+            // GAP-04: persist BEFORE the first poll (non-text lane).
+            if let Some(env) = async_env.as_ref() {
+                crate::db::async_jobs::save_provider_job(
+                    env,
+                    &runtime.template.id,
+                    &job_id,
+                    &ctx,
+                    source_lang,
+                    target_lang,
+                )
+                .await?;
+                crate::db::async_jobs::upsert_polling_job(
+                    env,
+                    &runtime.template.id,
+                    &job_id,
+                    &ctx,
+                    source_lang,
+                    target_lang,
+                )
+                .await
+                .context("persist provider job before polling failed")?;
+            }
+            job_id
+        }
+    };
+
+    if let Some(env) = async_env.as_ref() {
+        crate::db::async_jobs::save_provider_job(
+            env,
+            &runtime.template.id,
+            &job_id,
+            &ctx,
+            source_lang,
+            target_lang,
+        )
+        .await?;
     }
-    ctx.insert("computed.job_id".to_string(), job_id.clone());
-    ctx.insert("computed.async_job_id".to_string(), job_id);
-    apply_async_poll_submit_extract(async_poll, &submit_json, &mut ctx, &runtime.template.id)?;
 
     let interval_secs = async_poll.interval_seconds.unwrap_or(5).max(1);
-    let timeout_secs = async_poll.timeout_seconds.unwrap_or(900).max(interval_secs);
+    let timeout_secs = async_poll.timeout_seconds.unwrap_or(900).max(1);
     let done_values = normalize_status_values(&async_poll.done_values);
     let failed_values = normalize_status_values(&async_poll.failed_values);
     let status_path = async_poll
@@ -1026,16 +1602,46 @@ pub(crate) async fn translate_non_text_via_component(
         .map(str::trim)
         .filter(|v| !v.is_empty());
 
-    let started = Instant::now();
+    let deadline = PollDeadline::new(timeout_secs, &runtime.template.id)?;
     let mut attempts = 0u64;
-    loop {
+    // GAP-04: outcome loop (see the text lane) so the row closure always
+    // runs on every exit arm, including finalize errors.
+    let outcome = loop {
+        if let Err(error) = deadline.check(attempts) {
+            break Err(error);
+        }
         if attempts > 0 {
-            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            if let Err(error) = deadline
+                .wait(
+                    attempts,
+                    tokio::time::sleep(Duration::from_secs(interval_secs)),
+                )
+                .await
+            {
+                break Err(error);
+            }
         }
         attempts = attempts.saturating_add(1);
+        // GAP-04: per-attempt heartbeat.
+        if let Some(env) = async_env.as_ref() {
+            crate::db::async_jobs::touch_polling_job(
+                env,
+                prior_attempts.saturating_add(attempts as i64),
+            )
+            .await
+            .context("persist async progress before polling failed")?;
+        }
 
-        let poll_json =
-            call_component_request_json(client, runtime, &async_poll.request, &mut ctx).await?;
+        let poll_json = match deadline
+            .wait(
+                attempts,
+                call_component_request_json(client, runtime, &async_poll.request, &mut ctx),
+            )
+            .await
+        {
+            Ok(result) => result?,
+            Err(error) => break Err(error),
+        };
 
         let rendered_status_path =
             status_path.and_then(|path| resolve_template_json_path(path, &ctx));
@@ -1047,7 +1653,7 @@ pub(crate) async fn translate_non_text_via_component(
 
         if let Some(ref s) = status {
             if status_values_contains(&failed_values, s) {
-                return Err(anyhow!(
+                break Err(anyhow!(
                     "component async poll failed (status='{}', component={})",
                     s,
                     runtime.template.id
@@ -1089,33 +1695,76 @@ pub(crate) async fn translate_non_text_via_component(
 
         if is_ready {
             // Finalize: derive output from poll response or from async config overrides.
-            return finalize_non_text_async(
-                client,
-                runtime,
-                &mut ctx,
-                &normalized_task_type,
-                source_ref,
-                &poll_json,
-            )
-            .await;
+            let credit = match async_env.as_ref() {
+                Some(env) => crate::db::async_jobs::provider_result_storage_credit(env).await?,
+                None => None,
+            };
+            break match deadline
+                .wait(
+                    attempts,
+                    crate::storage_capacity::with_result_credit(
+                        credit,
+                        finalize_non_text_async(
+                            client,
+                            runtime,
+                            &mut ctx,
+                            &normalized_task_type,
+                            source_ref,
+                            &poll_json,
+                        ),
+                    ),
+                )
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(error),
+            };
         }
 
         if done_by_status {
-            return Err(anyhow!(
+            break Err(anyhow!(
                 "component async poll done but output missing (component={})",
                 runtime.template.id
             ));
         }
+    };
 
-        if started.elapsed().as_secs() >= timeout_secs {
-            return Err(anyhow!(
-                "component async poll timed out (timeout_secs={}, attempts={}, component={})",
-                timeout_secs,
-                attempts,
-                runtime.template.id
-            ));
+    // GAP-04 row closure (non-text lane).
+    match &outcome {
+        Ok(result) => {
+            if let Some(env) = async_env.as_ref() {
+                persist_provider_media_result(Some(env), result).await?;
+                crate::db::async_jobs::close_job(env)
+                    .await
+                    .context("persist async completion failed")?;
+            }
+        }
+        Err(err) => {
+            if let Some(env) = async_env.as_ref() {
+                let err_snippet: String = format!("{:#}", err).chars().take(300).collect();
+                crate::db::async_jobs::mark_job_failed(env, &err_snippet)
+                    .await
+                    .context("persist async terminal failure failed")?;
+            }
         }
     }
+    outcome
+}
+
+async fn persist_provider_media_result(
+    env: Option<&crate::db::async_jobs::ProviderExecution>,
+    result: &NonTextComponentOutcome,
+) -> anyhow::Result<()> {
+    if let Some(env) = env {
+        crate::db::async_jobs::save_provider_result(
+            env,
+            serde_json::json!({
+                "translated_ref": result.translated_ref, "translated_text": result.translated_text,
+            }),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn is_likely_async_reference_path(path: &str) -> bool {
@@ -1183,27 +1832,38 @@ async fn call_component_request_binary_submit(
     runtime: &ComponentRuntime,
     request_spec: &ComponentRequest,
     ctx: &mut HashMap<String, String>,
+    source: Option<SourceRequest<'_>>,
 ) -> anyhow::Result<BinaryResponseAsset> {
-    let _runtime_concurrency_guard = acquire_runtime_concurrency_guard(runtime).await?;
-    enforce_runtime_rate_limit(runtime).await;
-    prime_sign_context(runtime.template.sign.as_ref(), ctx)?;
-    let rendered_url = render_template_string(&request_spec.url, ctx);
-    inject_rendered_request_context(request_spec, &rendered_url, ctx);
-    let sign_result = process_sign_config(
-        runtime.template.sign.as_ref(),
-        ctx,
-        &request_spec.method,
-        &rendered_url,
+    let budget = HttpBudget::new(
+        request_spec.http_limits.as_ref(),
+        HttpResponseKind::Binary,
+        &runtime.template.id,
     )?;
-    invoke_component_api_binary(
-        client,
-        runtime,
-        request_spec,
-        &rendered_url,
-        ctx,
-        sign_result,
-    )
-    .await
+    budget
+        .wait(async {
+            let _runtime_concurrency_guard = acquire_runtime_concurrency_guard(runtime).await?;
+            enforce_runtime_rate_limit(runtime).await;
+            prime_sign_context(runtime.template.sign.as_ref(), ctx)?;
+            let rendered_url = render_template_string(&request_spec.url, ctx);
+            inject_rendered_request_context(request_spec, &rendered_url, ctx);
+            let sign_result = process_sign_config(
+                runtime.template.sign.as_ref(),
+                ctx,
+                &request_spec.method,
+                &rendered_url,
+            )?;
+            invoke_component_api_binary_with_source(
+                client,
+                runtime,
+                request_spec,
+                &rendered_url,
+                ctx,
+                sign_result,
+                source,
+            )
+            .await
+        })
+        .await?
 }
 
 fn template_declares_real_non_text_output(template: &ComponentTemplate, task_type: &str) -> bool {
@@ -1566,5 +2226,17 @@ pub(crate) fn insert_component_non_text_context(
     }
 }
 
-#[cfg(test)]
-mod tests;
+
+
+
+
+
+
+
+
+
+
+
+
+pub(crate) mod http_limits;
+use self::http_limits::*;

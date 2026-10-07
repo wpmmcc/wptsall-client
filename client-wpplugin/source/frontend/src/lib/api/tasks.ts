@@ -24,6 +24,11 @@ export interface DiscoveryTask {
 export const listDiscoveryTasks = (): Promise<ApiResult<{ items: DiscoveryTask[] }>> =>
   apiFetch('/api/discovery-tasks');
 
+/** Scan bound sites and create/refresh discovery tasks from site relations. */
+export const bootstrapDiscoveryTasks = (): Promise<
+  ApiResult<{ created?: number; updated?: number; items?: DiscoveryTask[] }>
+> => apiFetch('/api/discovery-tasks/bootstrap', { method: 'POST', body: {} });
+
 export const updateDiscoveryTask = (
   id: number,
   params: Partial<Omit<DiscoveryTask, 'id' | 'domain' | 'relation_id' | 'last_run_at' | 'created_at' | 'updated_at'>>

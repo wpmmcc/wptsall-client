@@ -3,13 +3,12 @@ use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::auth::{request_json, request_json_encrypted, UpstreamApiError};
 use crate::bindings::{
-    load_proxy_profiles, load_vendor_keys, load_vendor_oauth, parse_business_line_key,
+    read_proxy_profiles, read_vendor_keys, read_vendor_oauth, parse_business_line_key,
     save_component_bindings, save_components_local,
 };
 use crate::component_rt::key_pool::KeyPool;
@@ -45,11 +44,35 @@ fn web_ui_sqlite_storage_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn load_local_components_runtime_doc(components_local_path: &str) -> ComponentsLocalDoc {
+#[derive(Debug)]
+pub(crate) struct RuntimeConfigurationFault(&'static str);
+
+impl std::fmt::Display for RuntimeConfigurationFault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "runtime configuration authority: {} is unreadable or damaged",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for RuntimeConfigurationFault {}
+
+impl RuntimeConfigurationFault {
+    pub(crate) fn error(resource: &'static str) -> anyhow::Error {
+        Self(resource).into()
+    }
+}
+
+fn load_local_components_runtime_doc(
+    components_local_path: &str,
+) -> anyhow::Result<ComponentsLocalDoc> {
     if web_ui_sqlite_storage_enabled() {
         crate::db::components::load_runtime_local_components_doc()
     } else {
-        crate::bindings::load_components_local(components_local_path).unwrap_or_default()
+        crate::bindings::read_components_local(components_local_path)
+            .map_err(|_| RuntimeConfigurationFault::error("local components file"))
     }
 }
 
@@ -162,7 +185,7 @@ pub(crate) async fn load_component_runtimes(
     signing_key_override: Option<&str>,
 ) -> anyhow::Result<ComponentRuntimeRegistry> {
     let components_local_path = crate::config::components_local_file();
-    let mut local_doc = load_local_components_runtime_doc(&components_local_path);
+    let mut local_doc = load_local_components_runtime_doc(&components_local_path)?;
 
     let server_target_ids: Option<BTreeSet<String>> = target_component_ids.map(|ids| {
         ids.iter()
@@ -220,10 +243,10 @@ pub(crate) async fn load_component_runtimes(
             .ok();
             Some(pem.to_string())
         } else {
-            let config_dir = Path::new(component_bindings_path)
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
-            let signing_pub_key_path = config_dir.join("signing-public-key.pem");
+            // P7 unification: the signing key path is owned by config.rs,
+            // never derived from the bindings file directory.
+            let signing_pub_key_path =
+                std::path::PathBuf::from(crate::config::signing_public_key_file());
             match std::fs::read_to_string(&signing_pub_key_path) {
                 Ok(pem) if pem.trim().starts_with("-----BEGIN PUBLIC KEY-----") => {
                     log_event(
@@ -271,20 +294,22 @@ pub(crate) async fn load_component_runtimes(
     };
     let trusted_pub_key_ref = trusted_public_key.as_deref();
 
-    // Load vendor keys and oauth configs for per-component pool building
-    let config_dir = std::path::Path::new(component_bindings_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_string_lossy()
-        .to_string();
-    let vk_path = format!("{}/vendor-keys.json", config_dir);
-    let vo_path = format!("{}/vendor-oauth.json", config_dir);
-    let vendor_keys_doc = crate::bindings::load_vendor_keys(&vk_path).unwrap_or_default();
-    let vendor_oauth_doc = crate::bindings::load_vendor_oauth(&vo_path).unwrap_or_default();
-    let oauth_http_client = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap_or_default();
+    // Load vendor keys and oauth configs for per-component pool building.
+    // P7 unification: paths come from the config.rs single authority (the
+    // write side saves through the same functions), never derived from the
+    // bindings file directory.
+    let vk_path = crate::config::vendor_keys_file();
+    let vo_path = crate::config::vendor_oauth_file();
+    let vendor_keys_doc = read_vendor_keys(&vk_path)
+        .map_err(|_| RuntimeConfigurationFault::error("vendor keys"))?;
+    let vendor_oauth_doc = read_vendor_oauth(&vo_path)
+        .map_err(|_| RuntimeConfigurationFault::error("vendor OAuth"))?;
+    let proxy_profiles =
+        read_proxy_profiles(&crate::config::proxy_profiles_file())
+            .map_err(|_| RuntimeConfigurationFault::error("proxy profiles"))?;
+    let oauth_proxy_pool = ProxyClientPool::new(&proxy_profiles.profiles)
+        .map_err(|_| RuntimeConfigurationFault::error("proxy profiles"))?;
+    let oauth_http_client = oauth_proxy_pool.get_oauth_client(None)?.clone();
     let oauth_manager_arc: Option<std::sync::Arc<crate::component_rt::oauth::OAuthTokenManager>> =
         if !vendor_oauth_doc.configs.is_empty() {
             Some(std::sync::Arc::new(
@@ -559,11 +584,21 @@ pub(crate) async fn load_component_runtimes(
             }),
         );
 
-        let language_map = component_bindings
+        // Language mapping: template constraints provide vendor-code defaults
+        // (e.g. DeepL upper-case targets); binding-level entries win.
+        let mut language_map = template
+            .constraints
+            .as_ref()
+            .map(|c| c.language_map.clone())
+            .unwrap_or_default();
+        for (code, mapped) in component_bindings
             .components
             .get(&template.id)
             .map(|entry| entry.language_map.clone())
-            .unwrap_or_default();
+            .unwrap_or_default()
+        {
+            language_map.insert(code, mapped);
+        }
 
         apply_binding_overrides_to_template(&mut template, binding_entry.as_ref());
 
@@ -768,13 +803,30 @@ pub(crate) async fn load_component_runtimes(
             apply_component_instance_overrides_to_template(
                 &mut template,
                 comp.component_overrides.as_ref(),
-            );
-            // Resolve auth from component_bindings (same as Server components)
+            )?;
+            // Resolve auth from component_bindings (same as Server components).
+            // Components created via the provider wizard keep their credentials
+            // in the vendor-key store linked from a component VERSION, so the
+            // selected version's key_ids also count as pooled auth.
             let binding_entry = component_bindings.components.get(comp_id).cloned();
+            let selected_version = select_local_component_version(comp);
+            // Version config_overrides (request.url / model / response path) are
+            // persisted by the provider wizard but historically were only applied
+            // during quick-test. Apply them here so Run Once uses the mock URL.
+            if let Some((_, version)) = selected_version {
+                apply_version_config_overrides_to_template(
+                    &mut template,
+                    &version.config_overrides,
+                )?;
+            }
+            let version_key_ids = selected_version
+                .map(|(_, version)| version.key_ids.clone())
+                .unwrap_or_default();
             let has_pooled_auth = binding_entry
                 .as_ref()
                 .map(|entry| !entry.key_ids.is_empty() || !entry.oauth_ids.is_empty())
-                .unwrap_or(false);
+                .unwrap_or(false)
+                || !version_key_ids.is_empty();
             let (auth_values, updated) =
                 match resolve_auth_values(comp_id, template.auth.as_ref(), component_bindings) {
                     Ok(result) => result,
@@ -805,16 +857,33 @@ pub(crate) async fn load_component_runtimes(
                     }
                 };
             bindings_dirty = bindings_dirty || updated;
-            let language_map = component_bindings
+            // Template constraints supply vendor-code defaults (e.g. DeepL
+            // upper-case targets); binding-level entries override them.
+            let mut language_map = template
+                .constraints
+                .as_ref()
+                .map(|c| c.language_map.clone())
+                .unwrap_or_default();
+            for (code, mapped) in component_bindings
                 .components
                 .get(comp_id)
                 .map(|e| e.language_map.clone())
-                .unwrap_or_default();
+                .unwrap_or_default()
+            {
+                language_map.insert(code, mapped);
+            }
             apply_binding_overrides_to_template(&mut template, binding_entry.as_ref());
+            // Pool source: legacy binding ids, else the selected version's
+            // key_ids (provider-wizard track) so pooled rotation works for
+            // wizard-created components exactly like legacy-bound ones.
+            let pool_binding = local_component_pool_binding(
+                binding_entry.as_ref(),
+                selected_version.map(|(_, version)| version),
+            )?;
             let (key_pool, oauth_pool) = build_component_pools(
                 comp_id,
                 Some(comp.vendor_id.as_str()),
-                binding_entry.as_ref(),
+                pool_binding.as_ref(),
                 &vendor_keys_doc,
                 &vendor_oauth_doc,
             )?;
@@ -822,10 +891,17 @@ pub(crate) async fn load_component_runtimes(
             let normalized_kind = normalize_component_runtime_kind(&comp.kind)
                 .or_else(|| normalize_component_runtime_kind(&template.kind))
                 .unwrap_or_else(|| "text".to_string());
-            let selected_version = select_local_component_version(comp);
             let selected_proxy_profile_id = selected_version
                 .and_then(|(_, version)| version.proxy_profile_id.clone())
                 .filter(|value| !value.trim().is_empty());
+            let selected_oauth_manager = oauth_manager_arc
+                .as_ref()
+                .map(|manager| {
+                    Ok::<_, anyhow::Error>(Arc::new(manager.for_http_client(
+                        oauth_proxy_pool.get_oauth_client(selected_proxy_profile_id.as_deref())?,
+                    )))
+                })
+                .transpose()?;
             let supported_content_formats = if !inherited_supported_content_formats.is_empty() {
                 inherited_supported_content_formats
             } else {
@@ -875,7 +951,7 @@ pub(crate) async fn load_component_runtimes(
                     supported_formats,
                     key_pool,
                     oauth_pool,
-                    oauth_manager: oauth_manager_arc.clone(),
+                    oauth_manager: selected_oauth_manager,
                     proxy_profile_id: selected_proxy_profile_id,
                     runtime_max_concurrent_requests,
                     runtime_min_interval_ms,
@@ -932,7 +1008,7 @@ pub(crate) async fn load_component_runtimes(
     })
 }
 
-fn select_local_component_version<'a>(
+pub(crate) fn select_local_component_version<'a>(
     comp: &'a ComponentInstanceLocal,
 ) -> Option<(&'a String, &'a ComponentVersion)> {
     if let Some(active) = comp
@@ -989,22 +1065,16 @@ pub(crate) fn load_local_data_resources_with_registry(
     log_file: &str,
     registry: Option<&GlobalKeyRegistry>,
 ) -> anyhow::Result<LocalDataResources> {
-    let vendor_keys_path = Path::new(config_dir)
-        .join("vendor-keys.json")
-        .to_string_lossy()
-        .to_string();
-    let proxy_profiles_path = Path::new(config_dir)
-        .join("proxy-profiles.json")
-        .to_string_lossy()
-        .to_string();
-    let vendor_oauth_path = Path::new(config_dir)
-        .join("vendor-oauth.json")
-        .to_string_lossy()
-        .to_string();
+    // P7 unification: file paths come from the config.rs single authority;
+    // `config_dir` is kept for signature compatibility only.
+    let _ = config_dir;
+    let vendor_keys_path = crate::config::vendor_keys_file();
+    let proxy_profiles_path = crate::config::proxy_profiles_file();
+    let vendor_oauth_path = crate::config::vendor_oauth_file();
 
     // Load vendor keys
     let vendor_keys_doc =
-        load_vendor_keys(&vendor_keys_path).with_context(|| "load vendor keys failed")?;
+        read_vendor_keys(&vendor_keys_path).with_context(|| "load vendor keys failed")?;
     let _ = log_event(
         log_file,
         "info",
@@ -1032,14 +1102,18 @@ pub(crate) fn load_local_data_resources_with_registry(
     for (vendor_id, keys) in vendor_key_groups {
         let pool = match registry {
             Some(r) => KeyPool::new_with_registry(keys, KeySelectionStrategy::RoundRobin, r),
-            None => KeyPool::new(keys, KeySelectionStrategy::RoundRobin),
+            None => KeyPool::new_with_registry(
+                keys,
+                KeySelectionStrategy::RoundRobin,
+                GlobalKeyRegistry::process(),
+            ),
         };
         key_pools.insert(vendor_id, pool);
     }
 
     // Load proxy profiles
     let proxy_profiles_doc =
-        load_proxy_profiles(&proxy_profiles_path).with_context(|| "load proxy profiles failed")?;
+        read_proxy_profiles(&proxy_profiles_path).with_context(|| "load proxy profiles failed")?;
     let _ = log_event(
         log_file,
         "info",
@@ -1051,17 +1125,14 @@ pub(crate) fn load_local_data_resources_with_registry(
 
     // Load vendor OAuth configs
     let vendor_oauth_doc =
-        load_vendor_oauth(&vendor_oauth_path).with_context(|| "load vendor oauth failed")?;
+        read_vendor_oauth(&vendor_oauth_path).with_context(|| "load vendor oauth failed")?;
     let _ = log_event(
         log_file,
         "info",
         "local_data.vendor_oauth_loaded",
         json!({ "count": vendor_oauth_doc.configs.len(), "path": vendor_oauth_path }),
     );
-    let oauth_http_client = Client::builder()
-        .no_proxy()
-        .build()
-        .with_context(|| "build oauth http client failed")?;
+    let oauth_http_client = proxy_pool.get_oauth_client(None)?.clone();
     let oauth_manager = OAuthTokenManager::new(
         vendor_oauth_doc.configs,
         oauth_http_client,
@@ -1295,6 +1366,14 @@ pub(crate) fn merge_component_constraints(
             input_artifact_kind: override_constraints
                 .input_artifact_kind
                 .or(base_constraints.input_artifact_kind),
+            // Per-code merge: template defaults stay, override codes win.
+            language_map: {
+                let mut merged = base_constraints.language_map.clone();
+                for (code, mapped) in &override_constraints.language_map {
+                    merged.insert(code.clone(), mapped.clone());
+                }
+                merged
+            },
             output_artifact_kinds: override_constraints
                 .output_artifact_kinds
                 .or(base_constraints.output_artifact_kinds),
@@ -1318,12 +1397,31 @@ pub(crate) fn template_allows_editable_path(template: &ComponentTemplate, path: 
     })
 }
 
+fn editable_limit_u64(value: &Value, path: &str) -> anyhow::Result<u64> {
+    value.as_u64().ok_or_else(|| {
+        RuntimeConfigurationFault::error("editable numeric limits").context(format!(
+            "invalid editable limit '{path}': expected unsigned integer"
+        ))
+    })
+}
+
+fn editable_limit_u32(value: &Value, path: &str) -> anyhow::Result<u32> {
+    u32::try_from(editable_limit_u64(value, path)?).map_err(|_| {
+        RuntimeConfigurationFault::error("editable numeric limits").context(format!(
+            "invalid editable limit '{path}': outside u32 range"
+        ))
+    })
+}
+
 pub(crate) fn task_editable_overrides_to_component_overrides(
     value: Option<&serde_json::Value>,
-) -> ComponentInstanceOverrides {
-    let Some(obj) = value.and_then(|v| v.as_object()) else {
-        return ComponentInstanceOverrides::default();
+) -> anyhow::Result<ComponentInstanceOverrides> {
+    let Some(value) = value else {
+        return Ok(ComponentInstanceOverrides::default());
     };
+    let obj = value
+        .as_object()
+        .ok_or_else(|| RuntimeConfigurationFault::error("editable overrides object"))?;
 
     let mut constraints_override = ComponentConstraints::default();
     let mut has_constraints = false;
@@ -1331,9 +1429,16 @@ pub(crate) fn task_editable_overrides_to_component_overrides(
     let mut request_body_map = serde_json::Map::new();
     let mut request_url: Option<String> = None;
     let mut default_values_map = serde_json::Map::new();
+    let mut normalized_paths = BTreeSet::new();
+    let mut http_limits_overrides = std::collections::BTreeMap::new();
 
     for (path, raw_value) in obj {
         let normalized = path.trim();
+        if normalized.is_empty() || !normalized_paths.insert(normalized) {
+            return Err(RuntimeConfigurationFault::error(
+                "editable override path identity",
+            ));
+        }
         if normalized == "request.url" {
             if let Some(v) = raw_value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
                 request_url = Some(v.to_string());
@@ -1354,29 +1459,71 @@ pub(crate) fn task_editable_overrides_to_component_overrides(
             default_values_map.insert(key.to_string(), raw_value.clone());
             continue;
         }
+        if let Some((phase, member)) = normalized.split_once(".http_limits.") {
+            let phase = ComponentHttpPhase::from_path(phase)
+                .ok_or_else(|| RuntimeConfigurationFault::error("editable HTTP phase"))?;
+            let limits = http_limits_overrides
+                .entry(phase)
+                .or_insert_with(ComponentHttpLimits::default);
+            match member {
+                "max_response_bytes" => {
+                    limits.max_response_bytes = Some(editable_limit_u64(
+                        raw_value,
+                        "http_limits.max_response_bytes",
+                    )?);
+                }
+                "timeout_ms" => {
+                    limits.timeout_ms =
+                        Some(editable_limit_u64(raw_value, "http_limits.timeout_ms")?);
+                }
+                _ => {
+                    return Err(RuntimeConfigurationFault::error(
+                        "editable HTTP limit member",
+                    ))
+                }
+            }
+            crate::component_rt::runner::http_limits::validate(Some(limits))?;
+            continue;
+        }
+        if normalized.ends_with(".http_limits") {
+            return Err(RuntimeConfigurationFault::error(
+                "editable HTTP limit member",
+            ));
+        }
         match normalized {
             "constraints.max_input_chars" => {
-                constraints_override.max_input_chars = raw_value.as_u64();
+                constraints_override.max_input_chars =
+                    Some(editable_limit_u64(raw_value, normalized)?);
                 has_constraints = true;
             }
             "constraints.max_input_bytes" => {
-                constraints_override.max_input_bytes = raw_value.as_u64();
+                constraints_override.max_input_bytes =
+                    Some(editable_limit_u64(raw_value, normalized)?);
                 has_constraints = true;
             }
             "constraints.rate_limit_rpm" => {
-                constraints_override.rate_limit_rpm = raw_value.as_u64().map(|v| v as u32);
+                constraints_override.rate_limit_rpm =
+                    Some(editable_limit_u32(raw_value, normalized)?);
                 has_constraints = true;
             }
             "constraints.rate_limit_qps" => {
-                constraints_override.rate_limit_qps = raw_value.as_u64().map(|v| v as u32);
+                constraints_override.rate_limit_qps =
+                    Some(editable_limit_u32(raw_value, normalized)?);
                 has_constraints = true;
             }
             "constraints.max_concurrent_requests" => {
-                constraints_override.max_concurrent_requests = raw_value.as_u64().map(|v| v as u32);
+                let limit = editable_limit_u32(raw_value, normalized)?;
+                if limit as usize > tokio::sync::Semaphore::MAX_PERMITS {
+                    return Err(RuntimeConfigurationFault::error(
+                        "editable concurrency limit",
+                    ));
+                }
+                constraints_override.max_concurrent_requests = Some(limit);
                 has_constraints = true;
             }
             "constraints.max_file_size_mb" => {
-                constraints_override.max_file_size_mb = raw_value.as_f64().map(|v| v as u32);
+                constraints_override.max_file_size_mb =
+                    Some(editable_limit_u32(raw_value, normalized)?);
                 has_constraints = true;
             }
             "constraints.split_strategy" => {
@@ -1410,7 +1557,12 @@ pub(crate) fn task_editable_overrides_to_component_overrides(
         }
     }
 
-    ComponentInstanceOverrides {
+    Ok(ComponentInstanceOverrides {
+        http_limits_overrides: if http_limits_overrides.is_empty() {
+            None
+        } else {
+            Some(http_limits_overrides)
+        },
         constraints_override: if has_constraints {
             Some(constraints_override)
         } else {
@@ -1442,7 +1594,7 @@ pub(crate) fn task_editable_overrides_to_component_overrides(
         } else {
             Some(serde_json::Value::Object(default_values_map))
         },
-    }
+    })
 }
 
 fn filter_constraints_override_by_editable(
@@ -1454,6 +1606,12 @@ fn filter_constraints_override_by_editable(
         |field: &str| template_allows_editable_path(template, &format!("constraints.{field}"));
 
     let filtered = ComponentConstraints {
+        // Vendor-code map is gated like every other constraints field.
+        language_map: if allow("language_map") {
+            override_constraints.language_map.clone()
+        } else {
+            HashMap::new()
+        },
         max_input_chars: if allow("max_input_chars") {
             override_constraints.max_input_chars
         } else {
@@ -1565,16 +1723,117 @@ pub(crate) fn apply_binding_overrides_to_template(
 pub(crate) fn apply_component_instance_overrides_to_template(
     template: &mut ComponentTemplate,
     overrides: Option<&ComponentInstanceOverrides>,
-) -> Option<ComponentConstraints> {
+) -> anyhow::Result<Option<ComponentConstraints>> {
+    if let Some(limits) = overrides.and_then(|entry| entry.http_limits_overrides.as_ref()) {
+        let mut updated = template.clone();
+        for (phase, limits) in limits {
+            crate::component_rt::runner::http_limits::validate(Some(limits))?;
+            let bytes_allowed = template_allows_editable_path(
+                template,
+                &format!("{}.http_limits.max_response_bytes", phase.path()),
+            );
+            let time_allowed = template_allows_editable_path(
+                template,
+                &format!("{}.http_limits.timeout_ms", phase.path()),
+            );
+            if (limits.max_response_bytes.is_some() && !bytes_allowed)
+                || (limits.timeout_ms.is_some() && !time_allowed)
+            {
+                return Err(RuntimeConfigurationFault::error("non-editable HTTP limit"));
+            }
+            let target = match phase {
+                ComponentHttpPhase::Request => Some(&mut updated.request.http_limits),
+                ComponentHttpPhase::Prepare => updated
+                    .prepare
+                    .as_mut()
+                    .map(|value| &mut value.request.http_limits),
+                ComponentHttpPhase::Poll => updated
+                    .async_poll
+                    .as_mut()
+                    .map(|value| &mut value.request.http_limits),
+                ComponentHttpPhase::ResultRequest => updated
+                    .async_poll
+                    .as_mut()
+                    .and_then(|value| value.result_request.as_mut())
+                    .map(|value| &mut value.http_limits),
+                ComponentHttpPhase::ResultDownload => updated
+                    .async_poll
+                    .as_mut()
+                    .and_then(|value| value.result_download.as_mut())
+                    .map(|value| &mut value.http_limits),
+                ComponentHttpPhase::Reconcile => updated
+                    .async_poll
+                    .as_mut()
+                    .and_then(|value| value.reconcile.as_mut())
+                    .map(|value| &mut value.request.http_limits),
+                ComponentHttpPhase::SourceUpload => updated
+                    .source_upload
+                    .as_mut()
+                    .map(|value| &mut value.http_limits),
+            }
+            .ok_or_else(|| RuntimeConfigurationFault::error("missing editable HTTP phase"))?;
+            let mut merged = target.clone().unwrap_or_default();
+            merged.max_response_bytes = limits.max_response_bytes.or(merged.max_response_bytes);
+            merged.timeout_ms = limits.timeout_ms.or(merged.timeout_ms);
+            *target = Some(merged);
+        }
+        *template = updated;
+    }
     let constraints_override = overrides.and_then(|entry| entry.constraints_override.clone());
     let request_overrides = overrides.and_then(|entry| entry.request_overrides.clone());
     let default_values_override = overrides.and_then(|entry| entry.default_values_override.clone());
-    apply_template_overrides(
+    Ok(apply_template_overrides(
         template,
         constraints_override,
         request_overrides,
         default_values_override,
-    )
+    ))
+}
+
+/// Apply dotted-path version `config_overrides` (e.g. `request.url`) onto a template.
+pub(crate) fn apply_version_config_overrides_to_template(
+    template: &mut ComponentTemplate,
+    config_overrides: &HashMap<String, serde_json::Value>,
+) -> anyhow::Result<()> {
+    if config_overrides.is_empty() {
+        return Ok(());
+    }
+    let as_value = serde_json::Value::Object(
+        config_overrides
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    );
+    let instance = task_editable_overrides_to_component_overrides(Some(&as_value))?;
+    apply_component_instance_overrides_to_template(template, Some(&instance))?;
+
+    if let Some(path) = config_overrides
+        .get("response.translated_text_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        // Prefer editable gate; if the catalog omits it, still allow when the
+        // template already declares a response path (wizard mock overrides).
+        if template_allows_editable_path(template, "response.translated_text_path")
+            || template.response.translated_text_path.is_some()
+        {
+            template.response.translated_text_path = Some(path.to_string());
+        }
+    }
+    if let Some(path) = config_overrides
+        .get("response.error_path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if template_allows_editable_path(template, "response.error_path")
+            || template.response.error_path.is_some()
+        {
+            template.response.error_path = Some(path.to_string());
+        }
+    }
+    Ok(())
 }
 
 fn apply_template_overrides(
@@ -1920,7 +2179,30 @@ pub(crate) fn normalize_component_supported_business_lines(raw_lines: &[String])
 }
 
 /// Build per-component KeyPool and OAuthPool from the component binding's key_ids / oauth_ids.
-fn build_component_pools(
+pub(crate) fn local_component_pool_binding(
+    binding: Option<&crate::types::ComponentBindingEntry>,
+    selected_version: Option<&crate::types::ComponentVersion>,
+) -> anyhow::Result<Option<crate::types::ComponentBindingEntry>> {
+    if let Some(binding) =
+        binding.filter(|entry| !entry.key_ids.is_empty() || !entry.oauth_ids.is_empty())
+    {
+        return Ok(Some(binding.clone()));
+    }
+    selected_version
+        .filter(|version| !version.key_ids.is_empty())
+        .map(|version| {
+            Ok(crate::types::ComponentBindingEntry {
+                key_ids: version.key_ids.clone(),
+                auth_strategy: serde_json::from_value(json!(version.key_selection_strategy))
+                    .context("invalid selected-version key selection strategy")?,
+                ..Default::default()
+            })
+        })
+        .transpose()
+}
+
+/// Build pools from the already selected credential binding.
+pub(crate) fn build_component_pools(
     _component_id: &str,
     component_vendor_id: Option<&str>,
     binding: Option<&crate::types::ComponentBindingEntry>,
@@ -1966,9 +2248,10 @@ fn build_component_pools(
         }
         if !entries.is_empty() {
             Some(std::sync::Arc::new(
-                crate::component_rt::key_pool::KeyPool::new_with_ext_with_rps(
+                crate::component_rt::key_pool::KeyPool::new_with_registry_ext_with_rps(
                     entries,
                     binding.auth_strategy.clone(),
+                    GlobalKeyRegistry::process(),
                 ),
             ))
         } else {
@@ -2003,7 +2286,10 @@ fn build_component_pools(
         }
         if !entries.is_empty() {
             Some(std::sync::Arc::new(
-                crate::component_rt::oauth::OAuthPool::new(entries, binding.auth_strategy.clone()),
+                crate::component_rt::oauth::OAuthPool::new_with_registry(
+                    entries,
+                    binding.auth_strategy.clone(),
+                ),
             ))
         } else {
             None
@@ -2014,6 +2300,3 @@ fn build_component_pools(
 
     Ok((key_pool, oauth_pool))
 }
-
-#[cfg(test)]
-mod tests;

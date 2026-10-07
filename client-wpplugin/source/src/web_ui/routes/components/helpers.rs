@@ -4,11 +4,13 @@ use super::*;
 // Dynamic route dispatcher for new CRUD endpoints with path params
 // ---------------------------------------------------------------------------
 
-pub(crate) fn load_local_components_runtime_doc() -> ComponentsLocalDoc {
+pub(crate) fn load_local_components_runtime_doc() -> anyhow::Result<ComponentsLocalDoc> {
     if web_ui_sqlite_storage_enabled() {
         crate::db::components::load_runtime_local_components_doc()
     } else {
-        load_components_local(&components_local_path()).unwrap_or_default()
+        load_components_local(&components_local_path()).map_err(|_| {
+            crate::component_rt::loader::RuntimeConfigurationFault::error("local components file")
+        })
     }
 }
 
@@ -363,7 +365,7 @@ pub(crate) async fn ensure_local_component_snapshot(
         let guard = state.lock().await;
         guard.components.clone()
     };
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let comp = doc
         .components
         .get_mut(component_id)
@@ -512,7 +514,7 @@ pub(crate) fn sync_local_components_from_server(
         return Ok(0);
     }
 
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let updated = backfill_local_components_from_server(&mut doc, server_components);
     if updated > 0 {
         save_local_components_runtime_doc(&doc)?;
@@ -524,7 +526,7 @@ pub(crate) async fn refresh_local_component_snapshot_from_server(
     state: &Arc<Mutex<WebUiState>>,
     component_id: &str,
 ) -> anyhow::Result<crate::types::ComponentInstanceLocal> {
-    let mut doc = load_local_components_runtime_doc();
+    let mut doc = load_local_components_runtime_doc()?;
     let comp = doc
         .components
         .get_mut(component_id)
@@ -649,110 +651,8 @@ pub(crate) fn component_in_use_message(summary: &ComponentUsageSummary) -> Strin
 
 fn task_editable_overrides_to_component_overrides(
     value: Option<&serde_json::Value>,
-) -> ComponentInstanceOverrides {
-    let Some(obj) = value.and_then(|v| v.as_object()) else {
-        return ComponentInstanceOverrides::default();
-    };
-
-    let mut constraints_override = ComponentConstraints::default();
-    let mut has_constraints = false;
-    let mut request_headers: HashMap<String, String> = HashMap::new();
-    let mut request_body_map = serde_json::Map::new();
-    let mut request_url: Option<String> = None;
-    let mut default_values_map = serde_json::Map::new();
-
-    for (path, raw_value) in obj {
-        let normalized = path.trim();
-        if normalized == "request.url" {
-            if let Some(v) = raw_value.as_str().map(str::trim).filter(|v| !v.is_empty()) {
-                request_url = Some(v.to_string());
-            }
-            continue;
-        }
-        if let Some(key) = normalized.strip_prefix("request.headers.") {
-            if let Some(v) = raw_value.as_str() {
-                request_headers.insert(key.to_string(), v.to_string());
-            }
-            continue;
-        }
-        if let Some(key) = normalized.strip_prefix("request.body.") {
-            request_body_map.insert(key.to_string(), raw_value.clone());
-            continue;
-        }
-        if let Some(key) = normalized.strip_prefix("default_values.") {
-            default_values_map.insert(key.to_string(), raw_value.clone());
-            continue;
-        }
-        match normalized {
-            "constraints.max_input_chars" => {
-                constraints_override.max_input_chars = raw_value.as_u64();
-                has_constraints = true;
-            }
-            "constraints.max_input_bytes" => {
-                constraints_override.max_input_bytes = raw_value.as_u64();
-                has_constraints = true;
-            }
-            "constraints.rate_limit_rpm" => {
-                constraints_override.rate_limit_rpm = raw_value.as_u64().map(|v| v as u32);
-                has_constraints = true;
-            }
-            "constraints.rate_limit_qps" => {
-                constraints_override.rate_limit_qps = raw_value.as_u64().map(|v| v as u32);
-                has_constraints = true;
-            }
-            "constraints.max_concurrent_requests" => {
-                constraints_override.max_concurrent_requests = raw_value.as_u64().map(|v| v as u32);
-                has_constraints = true;
-            }
-            "constraints.max_file_size_mb" => {
-                constraints_override.max_file_size_mb = raw_value.as_f64().map(|v| v as u32);
-                has_constraints = true;
-            }
-            "constraints.split_strategy" => {
-                constraints_override.split_strategy = raw_value.as_str().map(|v| v.to_string());
-                has_constraints = true;
-            }
-            "constraints.split_separator" => {
-                constraints_override.split_separator = raw_value.as_str().map(|v| v.to_string());
-                has_constraints = true;
-            }
-            _ => {}
-        }
-    }
-
-    ComponentInstanceOverrides {
-        constraints_override: if has_constraints {
-            Some(constraints_override)
-        } else {
-            None
-        },
-        request_overrides: if request_url.is_some()
-            || !request_headers.is_empty()
-            || !request_body_map.is_empty()
-        {
-            Some(ComponentRequestOverrides {
-                method: None,
-                url: request_url,
-                headers: if request_headers.is_empty() {
-                    None
-                } else {
-                    Some(request_headers)
-                },
-                body: if request_body_map.is_empty() {
-                    None
-                } else {
-                    Some(serde_json::Value::Object(request_body_map))
-                },
-            })
-        } else {
-            None
-        },
-        default_values_override: if default_values_map.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(default_values_map))
-        },
-    }
+) -> anyhow::Result<ComponentInstanceOverrides> {
+    crate::component_rt::loader::task_editable_overrides_to_component_overrides(value)
 }
 
 fn resolve_task_override_component_id(
@@ -824,12 +724,12 @@ pub(crate) fn validate_editable_overrides_for_component_id(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("editable_overrides requires a resolvable local component"))?;
-    let local_doc = load_local_components_runtime_doc();
+    let local_doc = load_local_components_runtime_doc()?;
     let comp = local_doc
         .components
         .get(component_id)
         .ok_or_else(|| anyhow!("local component '{}' not found", component_id))?;
-    let template: ComponentTemplate = comp
+    let mut template: ComponentTemplate = comp
         .template_json
         .clone()
         .ok_or_else(|| {
@@ -849,6 +749,11 @@ pub(crate) fn validate_editable_overrides_for_component_id(
 
     let invalid_paths = invalid_task_override_paths(&template, editable_overrides);
     if invalid_paths.is_empty() {
+        let overrides = task_editable_overrides_to_component_overrides(Some(editable_overrides))?;
+        crate::component_rt::loader::apply_component_instance_overrides_to_template(
+            &mut template,
+            Some(&overrides),
+        )?;
         return Ok(());
     }
 
@@ -877,31 +782,6 @@ pub(crate) async fn validate_local_component_runtime_ready_for_task(
     Ok(())
 }
 
-fn merge_component_instance_overrides(
-    base: Option<&ComponentInstanceOverrides>,
-    task: Option<&serde_json::Value>,
-) -> Option<ComponentInstanceOverrides> {
-    let task_overrides = task_editable_overrides_to_component_overrides(task);
-    let mut merged = base.cloned().unwrap_or_default();
-    if task_overrides.constraints_override.is_some() {
-        merged.constraints_override = task_overrides.constraints_override;
-    }
-    if task_overrides.request_overrides.is_some() {
-        merged.request_overrides = task_overrides.request_overrides;
-    }
-    if task_overrides.default_values_override.is_some() {
-        merged.default_values_override = task_overrides.default_values_override;
-    }
-    if merged.constraints_override.is_none()
-        && merged.request_overrides.is_none()
-        && merged.default_values_override.is_none()
-    {
-        None
-    } else {
-        Some(merged)
-    }
-}
-
 pub(crate) async fn build_local_component_runtime_for_task(
     state: &Arc<Mutex<WebUiState>>,
     component_id: &str,
@@ -912,7 +792,7 @@ pub(crate) async fn build_local_component_runtime_for_task(
         return Err(anyhow!("component_id is required"));
     }
 
-    let local_doc = load_local_components_runtime_doc();
+    let local_doc = load_local_components_runtime_doc()?;
     let comp = local_doc
         .components
         .get(component_id)
@@ -935,6 +815,26 @@ pub(crate) async fn build_local_component_runtime_for_task(
     } else {
         validate_local_component_api_version_with_cached_components(&comp, &[])?;
     }
+    let vendor_keys = load_vendor_keys(&vendor_keys_path()).map_err(|_| {
+        crate::component_rt::loader::RuntimeConfigurationFault::error("vendor keys")
+    })?;
+    let vendor_oauth = load_vendor_oauth(&vendor_oauth_path()).map_err(|_| {
+        crate::component_rt::loader::RuntimeConfigurationFault::error("vendor OAuth")
+    })?;
+    let proxy_profiles = load_proxy_profiles(&proxy_profiles_path()).map_err(|_| {
+        crate::component_rt::loader::RuntimeConfigurationFault::error("proxy profiles")
+    })?;
+    let proxy_pool = crate::component_rt::proxy::ProxyClientPool::new(&proxy_profiles.profiles)?;
+    let selected_version = crate::component_rt::loader::select_local_component_version(&comp);
+    let proxy_profile_id = selected_version
+        .and_then(|(_, version)| version.proxy_profile_id.clone())
+        .filter(|id| !id.trim().is_empty());
+    // Validate the selected provider and token transports before source fetch
+    // or paid intent. An absent proxy never falls back to direct egress.
+    proxy_pool.get_client(proxy_profile_id.as_deref())?;
+    let oauth_transport = proxy_pool
+        .get_oauth_client(proxy_profile_id.as_deref())?
+        .clone();
     let mut template: ComponentTemplate = comp
         .template_json
         .clone()
@@ -949,37 +849,71 @@ pub(crate) async fn build_local_component_runtime_for_task(
                 .with_context(|| format!("invalid local component template for '{}'", component_id))
         })?;
     crate::component_rt::loader::apply_local_component_kind_to_template(&mut template, &comp.kind);
-    let merged_component_overrides = merge_component_instance_overrides(
-        comp.component_overrides.as_ref(),
-        task_editable_overrides,
-    );
+    template.id = component_id.to_string();
     crate::component_rt::loader::apply_component_instance_overrides_to_template(
         &mut template,
-        merged_component_overrides.as_ref(),
-    );
+        comp.component_overrides.as_ref(),
+    )?;
+    if let Some((_, version)) = selected_version {
+        crate::component_rt::loader::apply_version_config_overrides_to_template(
+            &mut template,
+            &version.config_overrides,
+        )?;
+    }
 
-    let component_bindings = {
+    let (component_bindings, db) = {
         let guard = state.lock().await;
-        guard.component_bindings.clone()
+        (guard.component_bindings.clone(), guard.db.clone())
     };
     let binding_entry = component_bindings.components.get(component_id);
+    // Components created via the provider wizard keep their credentials in the
+    // vendor-key store linked from a component VERSION (no legacy binding
+    // entry); the selected version's key_ids also count as pooled auth.
+    let has_version_keys = selected_version
+        .map(|(_, version)| !version.key_ids.is_empty())
+        .unwrap_or(false);
     let has_pooled_auth = binding_entry
         .map(|entry| !entry.key_ids.is_empty() || !entry.oauth_ids.is_empty())
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || has_version_keys;
+    let pool_binding = crate::component_rt::loader::local_component_pool_binding(
+        binding_entry,
+        selected_version.map(|(_, version)| version),
+    )?;
+    let (key_pool, oauth_pool) = crate::component_rt::loader::build_component_pools(
+        component_id,
+        Some(&comp.vendor_id),
+        pool_binding.as_ref(),
+        &vendor_keys,
+        &vendor_oauth,
+    )?;
+    anyhow::ensure!(
+        !has_pooled_auth || key_pool.is_some() || oauth_pool.is_some(),
+        "component '{}' has no usable auth in its configured credential pool",
+        component_id
+    );
     let mut component_bindings_mut = component_bindings.clone();
+    let mut auth_resolve_failed = false;
     let (mut auth_values, _updated) = match crate::component_rt::runner::resolve_auth_values(
         component_id,
         template.auth.as_ref(),
         &mut component_bindings_mut,
     ) {
         Ok(result) => result,
-        Err(_) if has_pooled_auth => (HashMap::new(), false),
+        Err(_) if has_pooled_auth => {
+            auth_resolve_failed = true;
+            (HashMap::new(), false)
+        }
         Err(err) => return Err(err),
     };
     crate::component_rt::loader::apply_binding_overrides_to_template(&mut template, binding_entry);
+    let task_overrides = task_editable_overrides_to_component_overrides(task_editable_overrides)?;
+    crate::component_rt::loader::apply_component_instance_overrides_to_template(
+        &mut template,
+        Some(&task_overrides),
+    )?;
 
     if let Some(entry) = binding_entry {
-        let vendor_keys = load_vendor_keys(&vendor_keys_path()).unwrap_or_default();
         let expected_vendor_id = normalized_vendor_id(&comp.vendor_id);
         for key_id in &entry.key_ids {
             if let Some(vendor_key) = vendor_keys.keys.get(key_id) {
@@ -996,28 +930,39 @@ pub(crate) async fn build_local_component_runtime_for_task(
                 }
             }
         }
-        if auth_values.is_empty() && !entry.oauth_ids.is_empty() {
-            let oauth_doc = load_vendor_oauth(&vendor_oauth_path()).unwrap_or_default();
-            if let Some(oauth_id) = entry.oauth_ids.iter().find(|oauth_id| {
-                oauth_doc
-                    .configs
-                    .get(*oauth_id)
-                    .map(|cfg| {
-                        expected_vendor_id
+    }
+
+    // Wizard track: resolve credentials from the selected version's key_ids
+    // via the vendor-key store, exactly like the version quick-test does.
+    if auth_values.is_empty() {
+        if let Some((_, version)) = selected_version {
+            let expected_vendor_id = normalized_vendor_id(&comp.vendor_id);
+            for key_id in &version.key_ids {
+                if let Some(vendor_key) = vendor_keys.keys.get(key_id) {
+                    if vendor_key.enabled
+                        && expected_vendor_id
                             .as_deref()
-                            .map(|expected| cfg.vendor_id.trim() == expected)
+                            .map(|expected| vendor_key.vendor_id.trim() == expected)
                             .unwrap_or(true)
-                    })
-                    .unwrap_or(false)
-            }) {
-                if let Some(cfg) = oauth_doc.configs.get(oauth_id) {
-                    if let Some(token) = cfg.cached_token.as_ref().filter(|t| !t.trim().is_empty())
                     {
-                        auth_values.insert(format!("auth.{}", cfg.token_field), token.clone());
+                        for (k, v) in &vendor_key.auth_values {
+                            auth_values.insert(format!("auth.{}", k), v.clone());
+                        }
+                        break;
                     }
                 }
             }
         }
+    }
+
+    // If auth was required but neither track produced any usable credentials,
+    // fail loudly instead of building a runtime that can never authenticate.
+    if auth_values.is_empty() && auth_resolve_failed && key_pool.is_none() && oauth_pool.is_none() {
+        return Err(anyhow!(
+            "component '{}' has no usable auth: no env/inline auth, no legacy binding keys, \
+             and no enabled key on its selected version in the vendor-key store",
+            component_id
+        ));
     }
 
     let normalized_kind = crate::component_rt::loader::normalize_component_runtime_kind(&comp.kind)
@@ -1039,20 +984,36 @@ pub(crate) async fn build_local_component_runtime_for_task(
         runtime_concurrency_sem,
         runtime_last_request_at,
     ) = crate::component_rt::loader::runtime_limits_from_constraints(template.constraints.as_ref());
+    let mut language_map = template
+        .constraints
+        .as_ref()
+        .map(|constraints| constraints.language_map.clone())
+        .unwrap_or_default();
+    if let Some(binding) = binding_entry {
+        language_map.extend(binding.language_map.clone());
+    }
+    let oauth_manager = (!vendor_oauth.configs.is_empty()).then(|| {
+        Arc::new(
+            crate::component_rt::oauth::OAuthTokenManager::new(
+                vendor_oauth.configs,
+                oauth_transport,
+                vendor_oauth_path(),
+            )
+            .with_recovery_db(db),
+        )
+    });
 
     Ok(ComponentRuntime {
         template,
         auth_values,
         supported_business_lines: vec![],
-        language_map: binding_entry
-            .map(|e| e.language_map.clone())
-            .unwrap_or_default(),
+        language_map,
         supported_content_formats,
         supported_formats,
-        key_pool: None,
-        oauth_pool: None,
-        oauth_manager: None,
-        proxy_profile_id: None,
+        key_pool,
+        oauth_pool,
+        oauth_manager,
+        proxy_profile_id,
         runtime_max_concurrent_requests,
         runtime_min_interval_ms,
         runtime_concurrency_sem,

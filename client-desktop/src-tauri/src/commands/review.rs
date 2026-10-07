@@ -119,10 +119,7 @@ pub async fn list_job_items(job_id: String, status: Option<String>) -> Result<Va
     if job_id.is_empty() {
         return Err("job id is required".into());
     }
-    let path = query_path(
-        &format!("/api/jobs/{job_id}/items"),
-        &[("status", status)],
-    );
+    let path = query_path(&format!("/api/jobs/{job_id}/items"), &[("status", status)]);
     webui_proxy::get(&path).await
 }
 
@@ -163,48 +160,23 @@ pub async fn resubmit_item(item_id: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn retranslate_item(item_id: String) -> Result<Value, String> {
+pub async fn retranslate_item(item_id: String, request: Value) -> Result<Value, String> {
     let item_id = item_id.trim();
     if item_id.is_empty() {
         return Err("item id is required".into());
     }
-    webui_proxy::post(&format!("/api/items/{item_id}/retranslate"), Value::Null).await
+    webui_proxy::post(&format!("/api/items/{item_id}/retranslate"), request).await
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn builds_job_query_paths() {
-        assert_eq!(
-            query_path(
-                "/api/jobs",
-                &[
-                    ("domain", Some("https://example.test".into())),
-                    ("limit", Some("20".into())),
-                    ("offset", None),
-                ]
-            ),
-            "/api/jobs?domain=https%3A%2F%2Fexample.test&limit=20"
-        );
-        assert_eq!(query_path("/api/jobs", &[]), "/api/jobs");
+#[tauri::command]
+pub async fn reject_item(item_id: String, request: Option<Value>) -> Result<Value, String> {
+    let item_id = item_id.trim();
+    if item_id.is_empty() {
+        return Err("item id is required".into());
     }
-
-    #[test]
-    fn builds_translation_query_paths() {
-        assert_eq!(
-            query_path(
-                "/api/translations",
-                &[
-                    ("page", Some("2".into())),
-                    ("limit", Some("20".into())),
-                    ("domain", Some("blog.example.test".into())),
-                    ("status", Some("failed".into())),
-                    ("search", None),
-                ]
-            ),
-            "/api/translations?page=2&limit=20&domain=blog.example.test&status=failed"
-        );
-    }
+    webui_proxy::post(
+        &format!("/api/items/{item_id}/reject"),
+        request.unwrap_or(Value::Null),
+    )
+    .await
 }

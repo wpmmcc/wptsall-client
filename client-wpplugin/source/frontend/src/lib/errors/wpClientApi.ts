@@ -4,6 +4,7 @@ export type WpClientApiErrorContext =
   | 'site_test'
   | 'worker_run'
   | 'item_approve'
+  | 'item_reject'
   | 'item_resubmit'
   | 'item_retranslate'
   | 'batch_approve';
@@ -48,6 +49,8 @@ function contextTitle(context: WpClientApiErrorContext, tokenRevoked: boolean): 
         return 'Worker 无法继续访问 WP';
       case 'item_approve':
         return 'WP Token 已失效，无法确认同步';
+      case 'item_reject':
+        return 'WP Token 已失效，无法驳回条目';
       case 'item_resubmit':
         return 'WP Token 已失效，无法重新提交';
       case 'item_retranslate':
@@ -64,6 +67,8 @@ function contextTitle(context: WpClientApiErrorContext, tokenRevoked: boolean): 
       return 'Worker 被 WP 站点拒绝';
     case 'item_approve':
       return 'WP 已拒绝当前确认同步';
+    case 'item_reject':
+      return 'WP 已拒绝当前驳回操作';
     case 'item_resubmit':
       return 'WP 已拒绝当前重新提交';
     case 'item_retranslate':

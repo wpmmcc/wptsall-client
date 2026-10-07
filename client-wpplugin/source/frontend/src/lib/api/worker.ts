@@ -9,6 +9,15 @@ export interface WorkerConfigData {
   global_translation_concurrency?: number;
   global_callback_concurrency?: number;
   relation_max_pending_callbacks?: number;
+  storage_max_retained_units?: number;
+  storage_max_reserved_bytes?: number;
+  storage_capacity?: {
+    retained_units: number;
+    reserved_bytes: number;
+    legacy_units: number;
+    max_retained_units: number;
+    max_reserved_bytes: number;
+  };
   adaptive_rate_control?: boolean;
   adaptive_max_delay_ms?: number;
   callback_concurrency?: number;
@@ -91,8 +100,16 @@ export const refreshDomains = () =>
 export const refreshComponents = () =>
   apiFetch<{ components: unknown[]; local_components_backfilled?: number; local_components_backfill_error?: string | null }>('/api/components/refresh', { method: 'POST', body: {} });
 
-export const runWorkerOnce = () =>
-  apiFetch<WorkerRunSummary>('/api/worker/run-once', { method: 'POST', body: {} });
+// 12号批 H 小项② (2026-09-23): the WebUI Rust route (WorkerRunOnceRequest)
+// has accepted max_items_per_run all along; the frontend never sent it, so
+// the Overview button could not bound a manual run. All fields optional —
+// omitted fields fall back to the server/env defaults.
+export interface RunOnceRequest {
+  max_items_per_run?: number;
+}
+
+export const runWorkerOnce = (body: RunOnceRequest = {}) =>
+  apiFetch<WorkerRunSummary>('/api/worker/run-once', { method: 'POST', body });
 
 export const startWorkerLoopCheck = () =>
   apiFetch<WorkerStartPreflightData>('/api/worker/start-check', { method: 'POST', body: {} });
@@ -107,7 +124,7 @@ export const getWorkerConfig = () =>
   apiFetch<WorkerConfigData>('/api/worker/config');
 
 export const saveWorkerConfig = (body: WorkerConfigData) =>
-  apiFetch<Record<string, unknown>>('/api/worker/config', { method: 'POST', body });
+  apiFetch<WorkerConfigData>('/api/worker/config', { method: 'POST', body });
 
 export const getOverviewStats = () =>
   apiFetch<OverviewStatsData>('/api/stats/overview');

@@ -5,10 +5,9 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::types::{WebUiBatchTranslationRequest, WebUiLogsRequest, WebUiState};
-use crate::web_ui::read_recent_log_lines;
 
 use super::errors::{
-    write_error_response, write_error_response_with_status, write_not_found_response,
+    err_public, write_error_response, write_error_response_with_status, write_not_found_response,
 };
 use super::http::{parse_query_string, write_http_response};
 use super::{
@@ -23,14 +22,44 @@ pub(super) async fn handle_logs_recent(
     log_file: &str,
 ) -> anyhow::Result<()> {
     let req = if body.is_empty() {
-        WebUiLogsRequest { limit: None }
+        WebUiLogsRequest {
+            limit: None,
+            min_level: None,
+            before_ts_ms: None,
+            event_prefix: None,
+        }
     } else {
         serde_json::from_slice::<WebUiLogsRequest>(body)
             .with_context(|| "invalid /api/logs/recent json payload")?
     };
     let limit = req.limit.unwrap_or(200).clamp(1, 1000);
-    match read_recent_log_lines(log_file, limit) {
-        Ok(lines) => {
+    let min_level = req
+        .min_level
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(crate::logging::level_to_u8);
+    let event_prefix = req
+        .event_prefix
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // FL-1 (Wave-2): flush the writer BEFORE reading. The log writer batches
+    // info-level audit events until an 8 KB threshold (warn+ flushes
+    // immediately), so without this the Logs page's auto-refresh and any
+    // log-oracle read saw stale data — the tail of a burst (e.g. the final
+    // job.finalized) sat invisible in the buffer until the NEXT event or
+    // shutdown. Flushing on the read path costs one small write syscall per
+    // poll and makes every read reflect every event written so far.
+    crate::logging::flush_log();
+    match crate::web_ui::read_log_lines_page(
+        log_file,
+        limit,
+        min_level,
+        req.before_ts_ms,
+        event_prefix,
+    ) {
+        Ok(page) => {
             {
                 let mut guard = state.lock().await;
                 guard.last_error.clear();
@@ -39,7 +68,15 @@ pub(super) async fn handle_logs_recent(
             }
             let payload = json!({
                 "success": true,
-                "data": { "limit": limit, "lines": lines }
+                "data": {
+                    "limit": limit,
+                    "min_level": req.min_level,
+                    "before_ts_ms": req.before_ts_ms,
+                    "event_prefix": req.event_prefix,
+                    "next_before_ts_ms": page.next_before_ts_ms,
+                    "has_more": page.has_more,
+                    "lines": page.lines
+                }
             });
             write_http_response(
                 socket,
@@ -51,9 +88,39 @@ pub(super) async fn handle_logs_recent(
         }
         Err(err) => {
             update_state_error(state, &err, "logs.recent_fetch_failed").await;
-            write_error_response(socket, "LOGS_FETCH_FAILED", &format!("{:#}", err)).await
+            write_error_response(socket, "LOGS_FETCH_FAILED", &err_public(&err)).await
         }
     }
+}
+
+/// GET /api/logs/recent?limit=&min_level=&before_ts_ms=&event_prefix= — same payload as POST.
+pub(super) async fn handle_logs_recent_get(
+    socket: &mut TcpStream,
+    state: &Arc<Mutex<WebUiState>>,
+    query: &str,
+    log_file: &str,
+) -> anyhow::Result<()> {
+    let params = parse_query_string(query);
+    let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
+    let min_level = params
+        .get("min_level")
+        .cloned()
+        .filter(|s| !s.trim().is_empty());
+    let before_ts_ms = params
+        .get("before_ts_ms")
+        .and_then(|v| v.parse::<u64>().ok());
+    let event_prefix = params
+        .get("event_prefix")
+        .cloned()
+        .filter(|s| !s.trim().is_empty());
+    let body = serde_json::to_vec(&json!({
+        "limit": limit,
+        "min_level": min_level,
+        "before_ts_ms": before_ts_ms,
+        "event_prefix": event_prefix,
+    }))
+    .unwrap_or_default();
+    handle_logs_recent(socket, state, &body, log_file).await
 }
 
 pub(super) async fn handle_translations_list(
@@ -104,7 +171,13 @@ pub(super) async fn handle_translations_list(
             .await
         }
         Err(err) => {
-            write_error_response(socket, "TRANSLATIONS_QUERY_FAILED", &format!("{:#}", err)).await
+            write_error_response_with_status(
+                socket,
+                "500 Internal Server Error",
+                "TRANSLATIONS_QUERY_FAILED",
+                &err_public(&err),
+            )
+            .await
         }
     }
 }
@@ -131,6 +204,14 @@ pub(super) async fn handle_translations_batch_retry(
     if req.ids.len() > 100 {
         return write_error_response(socket, "TOO_MANY_IDS", "maximum 100 ids per request").await;
     }
+    if req.ids.iter().any(|id| *id <= 0) {
+        return write_error_response(
+            socket,
+            "INVALID_ID",
+            "translation ids must be positive integers",
+        )
+        .await;
+    }
 
     let db_arc = {
         let guard = state.lock().await;
@@ -143,6 +224,11 @@ pub(super) async fn handle_translations_batch_retry(
 
     match result {
         Ok(queued) => {
+            crate::logging::log_event_global(
+                "info",
+                "ops.translations_batch_retried",
+                json!({ "count": queued, "requested": req.ids.len() }),
+            );
             let payload = json!({
                 "success": true,
                 "data": { "queued": queued, "requested": req.ids.len() }
@@ -155,7 +241,15 @@ pub(super) async fn handle_translations_batch_retry(
             )
             .await
         }
-        Err(err) => write_error_response(socket, "BATCH_RETRY_FAILED", &format!("{:#}", err)).await,
+        Err(err) => {
+            write_error_response_with_status(
+                socket,
+                "500 Internal Server Error",
+                "BATCH_RETRY_FAILED",
+                &err_public(&err),
+            )
+            .await
+        }
     }
 }
 
@@ -181,6 +275,14 @@ pub(super) async fn handle_translations_batch_delete(
     if req.ids.len() > 100 {
         return write_error_response(socket, "TOO_MANY_IDS", "maximum 100 ids per request").await;
     }
+    if req.ids.iter().any(|id| *id <= 0) {
+        return write_error_response(
+            socket,
+            "INVALID_ID",
+            "translation ids must be positive integers",
+        )
+        .await;
+    }
 
     let db_arc = {
         let guard = state.lock().await;
@@ -193,6 +295,11 @@ pub(super) async fn handle_translations_batch_delete(
 
     match result {
         Ok(deleted) => {
+            crate::logging::log_event_global(
+                "warn",
+                "ops.translations_batch_deleted",
+                json!({ "count": deleted, "requested": req.ids.len() }),
+            );
             let payload = json!({
                 "success": true,
                 "data": { "deleted": deleted, "requested": req.ids.len() }
@@ -205,9 +312,7 @@ pub(super) async fn handle_translations_batch_delete(
             )
             .await
         }
-        Err(err) => {
-            write_error_response(socket, "BATCH_DELETE_FAILED", &format!("{:#}", err)).await
-        }
+        Err(err) => write_error_response(socket, "BATCH_DELETE_FAILED", &err_public(&err)).await,
     }
 }
 
@@ -222,6 +327,18 @@ pub(super) async fn handle_discovery_tasks_list(
     let tasks = {
         let conn = db_arc.lock().await;
         crate::db::discovery_tasks::list_discovery_tasks(&conn)
+    };
+    let tasks = match tasks {
+        Ok(tasks) => tasks,
+        Err(error) => {
+            return write_error_response_with_status(
+                socket,
+                "500 Internal Server Error",
+                "DISCOVERY_TASKS_READ_FAILED",
+                &err_public(&error),
+            )
+            .await
+        }
     };
     let payload = json!({ "success": true, "data": { "items": tasks } });
     write_http_response(
@@ -288,6 +405,7 @@ pub(super) async fn handle_discovery_tasks_bootstrap(
             &relations_url,
             &token,
             &device_id,
+            &device_id,
             Some(route_secret.as_str()),
         )
         .await
@@ -346,6 +464,11 @@ pub(super) async fn handle_discovery_tasks_bootstrap(
         .await;
     }
 
+    crate::logging::log_event_global(
+        "info",
+        "ops.discovery_bootstrapped",
+        json!({ "synced": synced.len(), "skipped": skipped.len(), "failed": failed.len() }),
+    );
     let payload = json!({
         "success": true,
         "data": {
@@ -403,8 +526,20 @@ pub(super) async fn handle_discovery_task_update(
         let conn = db_arc.lock().await;
         crate::db::discovery_tasks::get_discovery_task_by_id(&conn, id)
     };
-    let Some(current_task) = current_task else {
-        return write_not_found_response(socket, "NOT_FOUND", "discovery task not found").await;
+    let current_task = match current_task {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            return write_not_found_response(socket, "NOT_FOUND", "discovery task not found").await
+        }
+        Err(error) => {
+            return write_error_response_with_status(
+                socket,
+                "500 Internal Server Error",
+                "DISCOVERY_TASK_READ_FAILED",
+                &err_public(&error),
+            )
+            .await
+        }
     };
     let requested_component_id = req
         .selected_component_id
@@ -435,12 +570,12 @@ pub(super) async fn handle_discovery_task_update(
                 socket,
                 "422 Unprocessable Entity",
                 "INVALID_COMPONENT_ID",
-                &format!("{:#}", err),
+                &err_public(&err),
             )
             .await;
         }
     } else if let Some(ref component_id) = requested_component_id {
-        let local_doc = load_local_components_runtime_doc();
+        let local_doc = load_local_components_runtime_doc()?;
         if !local_doc.components.contains_key(component_id) {
             return write_error_response(
                 socket,
@@ -458,7 +593,7 @@ pub(super) async fn handle_discovery_task_update(
             socket,
             "422 Unprocessable Entity",
             "INVALID_TASK_EDITABLE_OVERRIDES",
-            &format!("{:#}", err),
+            &err_public(&err),
         )
         .await;
     }
@@ -468,6 +603,11 @@ pub(super) async fn handle_discovery_task_update(
     };
     match result {
         Ok(()) => {
+            crate::logging::log_event_global(
+                "info",
+                "ops.discovery_task_updated",
+                json!({ "id": id, "enabled": db_req.enabled }),
+            );
             let payload = json!({ "success": true, "data": {} });
             write_http_response(
                 socket,
@@ -477,7 +617,15 @@ pub(super) async fn handle_discovery_task_update(
             )
             .await
         }
-        Err(err) => write_error_response(socket, "UPDATE_FAILED", &format!("{:#}", err)).await,
+        Err(err) => {
+            write_error_response_with_status(
+                socket,
+                "500 Internal Server Error",
+                "UPDATE_FAILED",
+                &err_public(&err),
+            )
+            .await
+        }
     }
 }
 
@@ -495,6 +643,18 @@ pub(super) async fn handle_stats_overview(
         let by_status = crate::db::translations::stats_status_distribution(&conn);
         let daily = crate::db::translations::stats_daily(&conn, 30);
         (by_domain, by_status, daily)
+    };
+    let (by_domain, by_status, daily) = match (by_domain, by_status, daily) {
+        (Ok(by_domain), Ok(by_status), Ok(daily)) => (by_domain, by_status, daily),
+        _ => {
+            return write_error_response_with_status(
+                socket,
+                "500 Internal Server Error",
+                "TRANSLATION_STATS_READ_FAILED",
+                "Saved translation statistics could not be read; original evidence retained",
+            )
+            .await
+        }
     };
     let payload = json!({
         "success": true,

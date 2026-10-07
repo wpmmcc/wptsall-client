@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { FileTestModalState } from '../types';
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../../modal-a11y';
 
   export let testFileModal: FileTestModalState;
   export let testFileFieldId: (field: string) => string;
@@ -16,9 +17,11 @@
 {#if testFileModal.open}
   <div
     class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-    role="button"
+    role="dialog"
+    aria-modal="true"
     tabindex="0"
     aria-label={$_('file_test.close_modal')}
+    use:modalA11y={{ onClose: () => { if (!testFileModal.loading) onClose(); } }}
     onclick={(e) => {
       if (e.target === e.currentTarget && !testFileModal.loading) onClose();
     }}

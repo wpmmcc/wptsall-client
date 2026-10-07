@@ -155,6 +155,7 @@
   let authFields = $state<{ key: string; value: string }[]>([]);
   let editableParamPaths = $state<string[]>([]);
   let overrideRequestUrl = $state('');
+  let languageMapText = $state('');
   let overrideRequestHeadersJson = $state('');
   let overrideRequestBodyJson = $state('');
   let overrideMaxInputChars = $state('');
@@ -273,6 +274,11 @@
 
     editableParamPaths = [];
     overrideRequestUrl = existing?.request_overrides?.url ?? '';
+    languageMapText = existing?.language_map
+      ? Object.entries(existing.language_map)
+          .map(([k, v]) => `${k}=${v}`)
+          .join('\n')
+      : '';
     overrideRequestHeadersJson = existing?.request_overrides?.headers
       ? JSON.stringify(existing.request_overrides.headers, null, 2)
       : '';
@@ -440,12 +446,25 @@
       }
     }
 
+    const language_map: Record<string, string> = {};
+    for (const rawLine of languageMapText.split('\n')) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      const eq = line.indexOf('=');
+      if (eq <= 0 || eq === line.length - 1) {
+        showToast('error', $_('my_components.language_map_invalid'));
+        return;
+      }
+      language_map[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    }
+
     const r = await upsertBinding({
       component_id: authModalComp.id,
       auth,
       key_ids: authPoolKeyIds,
       oauth_ids: authPoolOAuthIds,
       auth_strategy: authPoolStrategy,
+      language_map,
       constraints_override:
         Object.keys(constraints_override).length > 0 ? constraints_override : undefined,
       request_overrides:
@@ -956,7 +975,7 @@
               <span class="text-xs px-2 py-0.5 rounded-full shrink-0 bg-emerald-50 text-emerald-600">LLM Builder</span>
             {/if}
             <span class="text-xs px-2 py-0.5 rounded-full shrink-0 {comp.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-rose-50 text-rose-700'}">{comp.enabled ? $_('common.enabled') : $_('common.disabled')}</span>
-            <span class="text-xs text-gray-400 shrink-0">{Object.keys(comp.versions).length} {$_('my_components.versions_count')}</span>
+            <span class="text-xs text-gray-400 shrink-0">{$_('my_components.versions_count', { values: { count: Object.keys(comp.versions).length } })}</span>
             {#if poolSummary.keys > 0}
               <span class="text-xs px-2 py-0.5 bg-blue-50 text-blue-600 rounded-full shrink-0 font-mono">Key×{poolSummary.keys}</span>
             {/if}
@@ -1107,6 +1126,7 @@
   bind:overrideRequestUrl
   bind:overrideRequestHeadersJson
   bind:overrideRequestBodyJson
+  bind:languageMapText
   bind:overrideMaxInputChars
   bind:overrideRateLimitQps
   bind:overrideMaxConcurrentRequests

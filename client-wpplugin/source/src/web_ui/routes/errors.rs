@@ -45,6 +45,19 @@ pub(super) async fn write_error_response(
     write_error_response_with_status(socket, "400 Bad Request", code, message).await
 }
 
+/// S6 (07 audit, batch G): raw anyhow chains (`&format!("{:#}", err)`) used to
+/// travel straight into HTTP error bodies, leaking internal URLs, file paths
+/// and upstream response fragments to anything that can reach the endpoint
+/// (incl. drive-by pages via the S1 class). Outward error envelopes now carry
+/// only the stable code + a generic sentence; the full chain goes to the
+/// client's stderr/log for local debugging. Operational surfaces that are the
+/// LOCAL user's own data (review-table per-item errors, worker-run snapshots
+/// via `snippet`) intentionally keep bounded detail.
+pub(super) fn err_public(err: &anyhow::Error) -> String {
+    eprintln!("[webui] request failed: {err:#}");
+    "request failed; see client logs for detail".to_string()
+}
+
 pub(super) async fn write_not_found_response(
     socket: &mut TcpStream,
     code: &str,

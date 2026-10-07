@@ -24,6 +24,7 @@
     ServerTemplateModalData,
   } from './types';
   import { _ } from 'svelte-i18n';
+  import { modalA11y } from '../modal-a11y';
 
   let serverComps = $state<ServerComp[]>([]);
   let serverCompsLoading = $state(false);
@@ -412,9 +413,11 @@
 {#if showTemplateModal}
   <div
     class="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4"
-    role="button"
+    role="dialog"
+    aria-modal="true"
     tabindex="0"
     aria-label={$_('server_templates.close_modal')}
+    use:modalA11y={{ onClose: () => { showTemplateModal = false; } }}
     onclick={(e) => {
       if (e.target === e.currentTarget) showTemplateModal = false;
     }}

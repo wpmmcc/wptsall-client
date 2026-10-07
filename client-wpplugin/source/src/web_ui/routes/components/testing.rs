@@ -91,7 +91,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_test(
         }
     };
 
-    let local_components_doc = load_local_components_runtime_doc();
+    let local_components_doc = load_local_components_runtime_doc()?;
     let local_component = local_components_doc.components.get(&component_key).cloned();
     let response_template_id = local_component
         .as_ref()
@@ -182,11 +182,21 @@ pub(in crate::web_ui::routes) async fn handle_local_component_test(
             for (k, v) in &binding.auth {
                 auth_values.insert(format!("auth.{}", k), v.clone());
             }
+            // Template constraints supply vendor-code defaults (e.g. DeepL
+            // upper-case targets); binding-level entries override them.
+            let mut language_map = template
+                .constraints
+                .as_ref()
+                .map(|c| c.language_map.clone())
+                .unwrap_or_default();
+            for (code, mapped) in &binding.language_map {
+                language_map.insert(code.clone(), mapped.clone());
+            }
             crate::types::ComponentRuntime {
                 template,
                 auth_values,
                 supported_business_lines: vec![],
-                language_map: binding.language_map.clone(),
+                language_map,
                 supported_content_formats: vec![],
                 supported_formats: vec![],
                 key_pool: None,
@@ -367,7 +377,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_test_file(
         .unwrap_or("zh-CN")
         .to_string();
 
-    let doc = load_local_components_runtime_doc();
+    let doc = load_local_components_runtime_doc()?;
     let Some(comp) = doc.components.get(&component_id) else {
         return write_not_found_response(
             socket,
@@ -432,7 +442,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_test_file(
         crate::component_rt::loader::apply_component_instance_overrides_to_template(
             &mut template,
             comp.component_overrides.as_ref(),
-        );
+        )?;
         crate::component_rt::loader::apply_binding_overrides_to_template(
             &mut template,
             binding_entry.as_ref(),
@@ -446,11 +456,26 @@ pub(in crate::web_ui::routes) async fn handle_local_component_test_file(
             template.constraints.as_ref(),
         );
 
+        // Template constraints supply vendor-code defaults (e.g. DeepL
+        // upper-case targets); binding-level entries override them.
+        let mut language_map = template
+            .constraints
+            .as_ref()
+            .map(|c| c.language_map.clone())
+            .unwrap_or_default();
+        for (code, mapped) in binding_entry
+            .as_ref()
+            .map(|e| e.language_map.clone())
+            .unwrap_or_default()
+        {
+            language_map.insert(code, mapped);
+        }
+
         let runtime = crate::types::ComponentRuntime {
             template,
             auth_values,
             supported_business_lines: vec![],
-            language_map: HashMap::new(),
+            language_map,
             supported_content_formats: vec![],
             supported_formats: vec![],
             key_pool: None,
@@ -566,7 +591,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_quick_test(
         .unwrap_or("zh_CN")
         .to_string();
 
-    let doc = load_local_components_runtime_doc();
+    let doc = load_local_components_runtime_doc()?;
     let Some(comp) = doc.components.get(comp_id) else {
         return write_not_found_response(socket, "NOT_FOUND", "component not found").await;
     };
@@ -640,7 +665,7 @@ pub(in crate::web_ui::routes) async fn handle_local_component_quick_test(
         crate::component_rt::loader::apply_component_instance_overrides_to_template(
             &mut template,
             comp.component_overrides.as_ref(),
-        );
+        )?;
         let ephemeral = crate::types::ComponentInstanceOverrides {
             request_overrides,
             ..Default::default()
@@ -648,7 +673,11 @@ pub(in crate::web_ui::routes) async fn handle_local_component_quick_test(
         crate::component_rt::loader::apply_component_instance_overrides_to_template(
             &mut template,
             Some(&ephemeral),
-        );
+        )?;
+        crate::component_rt::loader::apply_version_config_overrides_to_template(
+            &mut template,
+            &serde_json::from_value(config_overrides.clone())?,
+        )?;
         if let Some(path) = response_path_override {
             if crate::component_rt::loader::template_allows_editable_path(
                 &template,
@@ -667,10 +696,15 @@ pub(in crate::web_ui::routes) async fn handle_local_component_quick_test(
         }
 
         let runtime = crate::types::ComponentRuntime {
+            // Template-level vendor-code defaults (e.g. DeepL upper-case).
+            language_map: template
+                .constraints
+                .as_ref()
+                .map(|c| c.language_map.clone())
+                .unwrap_or_default(),
             template,
             auth_values,
             supported_business_lines: vec![],
-            language_map: HashMap::new(),
             supported_content_formats: vec![],
             supported_formats: vec![],
             key_pool: None,
@@ -701,6 +735,11 @@ pub(in crate::web_ui::routes) async fn handle_local_component_quick_test(
 
     match result {
         Ok(translated_text) => {
+            crate::logging::log_event_global(
+                "info",
+                "component.quick_tested",
+                json!({ "component_id": comp_id, "ok": true, "elapsed_ms": elapsed_ms }),
+            );
             let payload = json!({
                 "success": true,
                 "data": {
@@ -721,6 +760,11 @@ pub(in crate::web_ui::routes) async fn handle_local_component_quick_test(
         Err(err) => {
             let message = format!("{:#}", err);
             let (code, hint) = classify_quick_test_error(&message);
+            crate::logging::log_event_global(
+                "warn",
+                "component.quick_tested",
+                json!({ "component_id": comp_id, "ok": false, "code": code, "elapsed_ms": elapsed_ms }),
+            );
             let payload = json!({
                 "success": false,
                 "error": { "code": code, "message": message, "hint": hint },
@@ -789,7 +833,14 @@ fn build_quick_test_request_overrides(
             body.insert("model".to_string(), json!(model.trim()));
         }
     }
-    for key in ["q", "source", "target", "text", "source_lang", "target_lang"] {
+    for key in [
+        "q",
+        "source",
+        "target",
+        "text",
+        "source_lang",
+        "target_lang",
+    ] {
         let path = format!("request.body.{key}");
         if let Some(v) = config.get(&path).and_then(|v| v.as_str()) {
             if !v.trim().is_empty() {

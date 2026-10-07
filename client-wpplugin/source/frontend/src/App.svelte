@@ -14,6 +14,7 @@
   import Logs from './pages/Logs.svelte';
   import History from './pages/History.svelte';
   import Settings from './pages/Settings.svelte';
+  import StoragePaused from './lib/components/StoragePaused.svelte';
   import Products from './pages/Products.svelte';
   import { Menu, X } from 'lucide-svelte';
   import { _ } from 'svelte-i18n';
@@ -22,6 +23,7 @@
   let currentPage = $state('overview');
   let currentItemId = $state(0);
   let mobileOpen = $state(false);
+  let tasksInitialTab = $state<'jobs' | 'discovery' | 'pending_review' | 'sync_pairs'>('jobs');
 
   // P0-LF-04: Products is a legacy server-control-plane page; it renders only
   // when the backend reports legacy mode (its Sidebar entry is gated the same way).
@@ -43,10 +45,28 @@
   }
 
   function handleNavigate(page: string) {
+    if (page !== 'tasks') tasksInitialTab = 'jobs';
     currentPage = page;
     mobileOpen = false;
   }
+
+  function openPendingReview() {
+    tasksInitialTab = 'pending_review';
+    currentPage = 'tasks';
+    mobileOpen = false;
+  }
 </script>
+
+<!-- S12（批 G）：WPTSALL_ALLOW_INSECURE_TLS 开启时的醒目警示横幅。 -->
+{#if $status?.allow_insecure_tls}
+  <div
+    role="alert"
+    data-testid="insecure-tls-banner"
+    class="w-full border-b border-amber-400 bg-amber-100 px-4 py-2 text-center text-sm font-medium text-amber-900"
+  >
+    {$_('security.insecure_tls_banner')}
+  </div>
+{/if}
 
 <!-- 主界面：默认进入本地控制面；官网 OAuth 不再是运行时前置条件。 -->
 <div class="relative flex min-h-screen bg-white">
@@ -83,9 +103,11 @@
 
     <!-- 主内容 -->
     <main class="flex-1 overflow-auto">
-      <div class="max-w-5xl mx-auto px-6 py-6">
-        {#if currentPage === 'overview'}
-          <Overview />
+      <div class="max-w-5xl mx-auto px-6 pt-20 pb-6 lg:pt-6">
+        {#if $status?.storage_paused && $status.database_available === false}
+          <StoragePaused />
+        {:else if currentPage === 'overview'}
+          <Overview onOpenPendingReview={openPendingReview} />
         {:else if currentPage === 'sites'}
           <Sites />
         {:else if currentPage === 'components'}
@@ -93,7 +115,10 @@
         {:else if currentPage === 'apikeys'}
           <ApiKeys />
         {:else if currentPage === 'tasks'}
-          <Tasks onReviewItem={(id) => { currentItemId = id; currentPage = 'review'; }} />
+          <Tasks
+            initialTab={tasksInitialTab}
+            onReviewItem={(id) => { currentItemId = id; currentPage = 'review'; }}
+          />
         {:else if currentPage === 'review'}
           <TranslationReview itemId={currentItemId} onBack={() => currentPage = 'tasks'} />
         {:else if currentPage === 'logs'}

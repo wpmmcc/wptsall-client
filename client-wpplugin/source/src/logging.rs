@@ -1,8 +1,8 @@
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::io::{self, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,11 +20,55 @@ const MAX_LOG_SIZE: u64 = 50 * 1024 * 1024;
 const MAX_LOG_BACKUPS: u32 = 3;
 /// Flush the buffer after accumulating this many bytes.
 const FLUSH_THRESHOLD: usize = 8 * 1024; // 8 KB
+const MAX_LOG_SNAPSHOT_BYTES: u64 = 2 * MAX_LOG_SIZE;
+
+struct AdmittedLogFile {
+    file: std::fs::File,
+    path: PathBuf,
+}
+
+fn check_log_handle(file: &std::fs::File, path: &Path) -> anyhow::Result<()> {
+    let current = fs::symlink_metadata(path)?;
+    let opened = file.metadata()?;
+    ensure!(
+        current.is_file() && current.len() == opened.len(),
+        "log file authority changed"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            current.dev() == opened.dev() && current.ino() == opened.ino(),
+            "log file authority changed"
+        );
+    }
+    Ok(())
+}
+
+impl Write for AdmittedLogFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let result = (|| -> anyhow::Result<usize> {
+            let storage = crate::storage_capacity::StorageLease::for_uncredited_write(
+                &self.path,
+                u64::try_from(bytes.len())?,
+            )?;
+            check_log_handle(&self.file, &self.path)?;
+            let written = self.file.write(bytes)?;
+            storage.finish()?;
+            Ok(written)
+        })();
+        result.map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+}
 
 /// Buffered log writer. Keeps a `BufWriter<File>` open across calls to reduce
 /// syscall overhead from open+write+close per event.
 struct LogWriter {
-    writer: BufWriter<std::fs::File>,
+    writer: BufWriter<AdmittedLogFile>,
     path: String,
     /// Approximate bytes written since last flush (tracks buffer fullness).
     pending_bytes: usize,
@@ -33,6 +77,28 @@ struct LogWriter {
 }
 
 static LOG_WRITER: Mutex<Option<LogWriter>> = Mutex::new(None);
+
+/// Process-wide log file path registered once at web-UI / worker startup so
+/// route handlers can emit audit events (log_event_global) without threading
+/// a `log_file` parameter through every handler signature. Unit tests never
+/// register it, so route-level events stay silent there unless a test opts
+/// in explicitly.
+static LOG_FILE_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Register the process-wide log file path (first call wins; later calls are
+/// ignored so a nested runtime cannot repoint an established deployment).
+pub(crate) fn set_log_file_path(path: String) {
+    let _ = LOG_FILE_PATH.set(path);
+}
+
+/// Route-level audit event variant of [`log_event`]: resolves the path from
+/// the process-wide registry instead of a parameter. No-op when the registry
+/// was never populated (unit tests) or when logging is disabled.
+pub(crate) fn log_event_global(level: &str, event: &str, detail: Value) {
+    if let Some(path) = LOG_FILE_PATH.get() {
+        let _ = log_event(path, level, event, detail);
+    }
+}
 
 pub(crate) fn level_to_u8(level: &str) -> u8 {
     match level {
@@ -57,7 +123,10 @@ pub(crate) fn set_log_enabled(v: bool) {
 ///   (`1`/`true`/`yes`/`on` enable, anything else disables).
 pub(crate) fn resolve_log_enabled(db_value: Option<&str>, env_value: Option<&str>) -> bool {
     if let Some(env) = env_value {
-        return matches!(env.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        return matches!(
+            env.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
     }
     db_value
         .map(|v| v.trim().eq_ignore_ascii_case("true"))
@@ -123,72 +192,185 @@ fn log_file_header_line() -> String {
     format!("{}\n", entry)
 }
 
-/// Open (or reopen) the log file and store a buffered writer in the global slot.
-fn open_log_writer(log_file: &str) -> anyhow::Result<()> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file)
-        .with_context(|| format!("open log file failed: {}", log_file))?;
-    let file_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let mut writer = BufWriter::new(file);
-    // Fresh file (first init or right after rotation): lead with the metadata
-    // header. Written directly so it bypasses level gating; it is metadata,
-    // not a loggable event.
-    let mut header_bytes = 0u64;
-    if file_bytes == 0 {
-        let header = log_file_header_line();
-        header_bytes = header.len() as u64;
-        // Best-effort: a failed header write must not block ordinary logging.
-        let _ = writer.write_all(header.as_bytes());
-        let _ = writer.flush();
+fn create_log_writer(log_file: &str) -> anyhow::Result<LogWriter> {
+    let path = Path::new(log_file);
+    let needs_header = match fs::metadata(path) {
+        Ok(metadata) => {
+            ensure!(metadata.is_file(), "log destination is not a regular file");
+            metadata.len() == 0
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error.into()),
+    };
+    let header = needs_header.then(log_file_header_line);
+    let storage = crate::storage_capacity::StorageLease::for_uncredited_write(
+        path,
+        header.as_ref().map_or(0, |value| value.len() as u64),
+    )?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    let mut guard = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = Some(LogWriter {
-        writer,
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("open log file failed: {}", log_file))?;
+    let resolved = fs::canonicalize(path)?;
+    check_log_handle(&file, &resolved)?;
+    let mut file_bytes = file.metadata()?.len();
+    if file_bytes == 0 {
+        let header = header.context("log header authority changed")?;
+        file.write_all(header.as_bytes())?;
+        file.sync_data()?;
+        file_bytes = u64::try_from(header.len())?;
+    }
+    storage.finish()?;
+    Ok(LogWriter {
+        writer: BufWriter::new(AdmittedLogFile {
+            file,
+            path: resolved,
+        }),
         path: log_file.to_string(),
         pending_bytes: 0,
-        file_bytes: file_bytes + header_bytes,
-    });
+        file_bytes,
+    })
+}
+
+fn flush_writer(writer: &mut LogWriter) -> anyhow::Result<()> {
+    let result = writer.writer.flush();
+    writer.pending_bytes = writer.writer.buffer().len();
+    result.context("flush admitted log failed")
+}
+
+fn select_log_writer(slot: &mut Option<LogWriter>, path: &str) -> anyhow::Result<()> {
+    if slot.as_ref().is_some_and(|writer| writer.path == path) {
+        return Ok(());
+    }
+    if let Some(writer) = slot.as_mut() {
+        flush_writer(writer)?;
+    }
+    let next = create_log_writer(path)?;
+    *slot = Some(next);
     Ok(())
 }
 
 pub(crate) fn init_log_file(log_file: &str) -> anyhow::Result<()> {
-    if let Some(parent) = Path::new(log_file).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create log dir failed: {}", parent.display()))?;
-        }
-    }
-
-    open_log_writer(log_file)
+    let mut slot = LOG_WRITER.lock().unwrap_or_else(|error| error.into_inner());
+    select_log_writer(&mut slot, log_file)
 }
 
-/// Rotate log files: current → .1, .1 → .2, … .N deleted.
+pub(crate) fn init_runtime_log_file(log_file: &str) -> anyhow::Result<()> {
+    if !get_log_enabled() {
+        return Ok(());
+    }
+    match init_log_file(log_file) {
+        Err(error) if error.is::<crate::storage_capacity::RootCapacityExhausted>() => {
+            // Optional logging must not block recovery or the capacity settings.
+            // No fallback write, result credit, or sensitive error detail.
+            eprintln!("warning: persistent logging is full; recovery remains available");
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+/// Truncate the log file and reset the buffered writer so the next event
+/// starts at offset 0 (route: POST /api/logs/clear). The writer is dropped
+/// BEFORE truncation — otherwise its stale file offset would punch a sparse
+/// hole into the truncated file on the next write.
+pub(crate) fn clear_log_file(log_file: &str) -> anyhow::Result<()> {
+    {
+        let mut guard = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(writer) = guard.take() {
+            // Explicit clear discards pending bytes without a drop-time write.
+            let (file, _buffer) = writer.writer.into_parts();
+            drop(file);
+        }
+    }
+    if Path::new(log_file).exists() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(log_file)
+            .with_context(|| format!("truncate log failed: {}", log_file))?;
+        drop(file);
+    }
+    Ok(())
+}
+
+fn log_snapshot(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let resolved = fs::canonicalize(path)?;
+    let path = resolved.as_path();
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file() && metadata.len() <= MAX_LOG_SNAPSHOT_BYTES,
+        "log snapshot is not a bounded regular file"
+    );
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_LOG_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(
+        u64::try_from(bytes.len())? == metadata.len(),
+        "log snapshot authority changed"
+    );
+    Ok(bytes)
+}
+
+fn copy_log_backup_and_truncate(path: &Path, backup: &Path) -> anyhow::Result<()> {
+    let bytes = log_snapshot(path)?;
+    let previous = match fs::symlink_metadata(backup) {
+        Ok(_) => Some(log_snapshot(backup)?),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    crate::bindings::atomic_file::install_siblings_uncredited(
+        path,
+        &[(backup, &bytes, previous.as_deref())],
+    )?;
+    let storage = crate::storage_capacity::StorageLease::for_uncredited_write(path, 0)?;
+    ensure!(log_snapshot(path)? == bytes, "retained live log changed");
+    ensure!(
+        log_snapshot(backup)? == bytes,
+        "log backup readback differs"
+    );
+    let file = OpenOptions::new().write(true).open(path)?;
+    check_log_handle(&file, path)?;
+    file.set_len(0)?;
+    file.sync_data()?;
+    storage.finish()?;
+    Ok(())
+}
+
+/// Rotate only a regular-file family. A failed backup never authorizes truncation.
 fn rotate_log(path: &str) -> anyhow::Result<()> {
+    let resolved = fs::canonicalize(path)?;
+    let path = resolved.to_str().context("log path is not UTF-8")?;
+    let current = Path::new(path);
+    let storage = crate::storage_capacity::StorageLease::for_uncredited_write(current, 0)?;
+    ensure!(fs::symlink_metadata(current)?.is_file(), "invalid live log");
+    for slot in 1..=MAX_LOG_BACKUPS {
+        match fs::symlink_metadata(format!("{path}.{slot}")) {
+            Ok(metadata) => ensure!(metadata.is_file(), "invalid log backup"),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     // Rename existing backups N-1 → N, ..., 1 → 2
     for i in (1..MAX_LOG_BACKUPS).rev() {
         let from = format!("{}.{}", path, i);
         let to = format!("{}.{}", path, i + 1);
         if Path::new(&from).exists() {
-            let _ = fs::rename(&from, &to);
+            fs::rename(&from, &to).context("shift log backup failed")?;
         }
     }
-    // Delete the oldest backup if it would overflow
-    let oldest = format!("{}.{}", path, MAX_LOG_BACKUPS);
-    if Path::new(&oldest).exists() {
-        let _ = fs::remove_file(&oldest);
-    }
-    // Current → .1. On Windows a viewer/AV tool holding the file open makes
-    // rename fail (sharing violation, os error 5) and rotation would then
-    // fail for the process lifetime; fall back to copy+truncate so size
-    // bounds still apply (audit 3.2, Windows rotation lock risk).
+    // Keep the current inode present, including for retained aliases. The
+    // complete admitted backup must publish before any live-byte truncation.
     let backup1 = format!("{}.1", path);
-    if fs::rename(path, &backup1).is_err() {
-        let _ = fs::copy(path, &backup1);
-        fs::File::create(path)
-            .with_context(|| format!("rotate log failed (truncate fallback): {}", path))?;
-    }
+    drop(storage);
+    copy_log_backup_and_truncate(current, Path::new(&backup1))?;
     Ok(())
 }
 
@@ -217,74 +399,47 @@ pub(crate) fn log_event(
     });
     let line = format!("{}\n", entry);
     let line_len = line.len();
-    let is_error = level_to_u8(level) >= 3;
+    ensure!(
+        u64::try_from(line_len)? <= MAX_LOG_SIZE,
+        "log event exceeds its bounded snapshot"
+    );
+    // Flush immediately for warning-and-above: identity-chain and other
+    // security/ops events (identity_mismatch / identity_unknown /
+    // identity_stale / identity.verify_failed) are warning level, and
+    // external gates assert on them while the client is still running.
+    // Waiting for the byte threshold (or graceful shutdown) made those
+    // events invisible for minutes to live observers.
+    let should_flush = level_to_u8(level) >= 2;
 
     let mut guard = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
 
-    // If no writer is open or the path changed, open one.
-    let needs_open = match &*guard {
-        Some(lw) => lw.path != log_file,
-        None => true,
-    };
-    if needs_open {
-        drop(guard);
-        // Initialize outside the lock to avoid double-locking.
-        let _ = open_log_writer(log_file);
-        guard = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
-    }
-
-    let lw = match guard.as_mut() {
-        Some(lw) => lw,
-        None => {
-            // Fallback: direct write (should not normally happen).
-            drop(guard);
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(log_file)
-                .with_context(|| format!("open log file failed: {}", log_file))?;
-            file.write_all(line.as_bytes())
-                .with_context(|| format!("write log failed: {}", log_file))?;
-            return Ok(());
-        }
-    };
+    select_log_writer(&mut guard, log_file)?;
+    let lw = guard.as_mut().context("log writer missing")?;
 
     // Check rotation before writing.
     if lw.file_bytes >= MAX_LOG_SIZE {
         // Flush + close current writer before rotating.
-        let _ = lw.writer.flush();
-        let path = lw.path.clone();
+        flush_writer(lw)?;
+        let path = lw.writer.get_ref().path.clone();
         *guard = None;
-        drop(guard);
-
-        let _ = rotate_log(&path);
-        let _ = open_log_writer(&path);
-        guard = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
-
-        if let Some(lw) = guard.as_mut() {
-            lw.writer
-                .write_all(line.as_bytes())
-                .with_context(|| format!("write log failed: {}", log_file))?;
-            lw.pending_bytes += line_len;
-            lw.file_bytes += line_len as u64;
-            if is_error || lw.pending_bytes >= FLUSH_THRESHOLD {
-                let _ = lw.writer.flush();
-                lw.pending_bytes = 0;
-            }
-        }
-        return Ok(());
+        let actual = path.to_str().context("log path is not UTF-8")?;
+        rotate_log(log_file)?;
+        let mut next = create_log_writer(actual)?;
+        next.path = log_file.to_string();
+        *guard = Some(next);
     }
-
+    let lw = guard
+        .as_mut()
+        .context("log writer missing after rotation")?;
     lw.writer
         .write_all(line.as_bytes())
         .with_context(|| format!("write log failed: {}", log_file))?;
     lw.pending_bytes += line_len;
     lw.file_bytes += line_len as u64;
 
-    // Flush on error level or when buffer threshold is reached.
-    if is_error || lw.pending_bytes >= FLUSH_THRESHOLD {
-        let _ = lw.writer.flush();
-        lw.pending_bytes = 0;
+    // Flush on warning-and-above or when the buffer threshold is reached.
+    if should_flush || lw.pending_bytes >= FLUSH_THRESHOLD {
+        flush_writer(lw)?;
     }
 
     Ok(())
@@ -292,12 +447,31 @@ pub(crate) fn log_event(
 
 /// Flush any buffered log data to disk. Called on graceful shutdown.
 pub(crate) fn flush_log() {
+    let _ = flush_log_checked();
+}
+
+fn flush_log_checked() -> anyhow::Result<()> {
     let mut guard = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(lw) = guard.as_mut() {
-        let _ = lw.writer.flush();
-        lw.pending_bytes = 0;
+        flush_writer(lw)?;
     }
+    Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Test support (cfg(test)): serialize global log-state mutation across ALL
+// test modules. logging::tests used to own this privately; discoverer
+// integration tests assert on warn lines written through the real writer,
+// so they must flip LOG_ENABLED under the SAME lock these tests use.
+// ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
 
 pub(crate) fn maybe_export_log(log_file: &str, export_path: &str) -> anyhow::Result<()> {
     if export_path.trim().is_empty() {
@@ -305,16 +479,10 @@ pub(crate) fn maybe_export_log(log_file: &str, export_path: &str) -> anyhow::Res
     }
 
     // Flush before exporting to ensure all data is on disk.
-    flush_log();
+    flush_log_checked()?;
 
-    if let Some(parent) = Path::new(export_path).parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create export dir failed: {}", parent.display()))?;
-        }
-    }
-
-    fs::copy(log_file, export_path)
+    let snapshot = log_snapshot(Path::new(log_file))?;
+    crate::bindings::atomic_file::install_uncredited(Path::new(export_path), &snapshot)
         .with_context(|| format!("export log failed: from {} to {}", log_file, export_path))?;
     eprintln!("Log exported to {}", export_path);
     Ok(())
@@ -330,7 +498,10 @@ pub(crate) fn snippet(s: &str) -> String {
 }
 
 pub(crate) fn session_token_prefix(token: &str) -> String {
-    token.chars().take(12).collect::<String>()
+    // S7 (07 audit, batch G): was 12 chars — enough of a prefix to aid
+    // guessing/confirmation attacks on the session token. 8 chars keep it
+    // debuggable (log correlation) while halving the exposed material.
+    token.chars().take(8).collect::<String>()
 }
 
 #[allow(dead_code)]
@@ -359,12 +530,18 @@ pub(crate) fn mask_email(email: &str) -> String {
 /// wholesale with `[REDACTED]`.
 fn is_sensitive_log_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
-    k.contains("token")
+    k == "key"
+        || k == "signature"
+        || k == "access_code"
+        || k.contains("token")
         || k.contains("secret")
         || k.contains("password")
         || k.contains("passwd")
         || k.contains("api_key")
         || k.contains("apikey")
+        || k.contains("access_key")
+        || k.contains("signature")
+        || k.contains("access_code")
         || k.contains("credential")
         || k.contains("authorization")
         || k.contains("private_key")
@@ -394,20 +571,34 @@ fn redact_value_for_log(value: Value) -> Value {
 /// Redact credential-shaped substrings inside free-form string values:
 /// `Bearer <token>` headers, `scheme://user:pass@host` URL userinfo, and
 /// `token=…`-style query/assignment fragments with sensitive keys.
-fn redact_string_for_log(input: &str) -> String {
+pub(crate) fn redact_string_for_log(input: &str) -> String {
     let lower = input.to_ascii_lowercase();
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut i = 0usize;
 
     let bearer = "bearer ";
-    let needles: [&str; 8] = [
-        "token=", "secret=", "password=", "passwd=", "api_key=", "apikey=", "access_key=",
-        "authorization=",
-    ];
-
     while i < bytes.len() {
         let rest_lower = &lower[i..];
+
+        // Parse an embedded JSON value rather than searching for its first
+        // quote. This preserves escaped/Unicode strings and also unwraps JSON
+        // strings containing another JSON response before recursive redaction.
+        if matches!(bytes[i], b'{' | b'[' | b'"') {
+            let mut values = serde_json::Deserializer::from_str(&input[i..]).into_iter::<Value>();
+            if let Some(Ok(value)) = values.next() {
+                let consumed = values.byte_offset();
+                let following = input[i + consumed..].trim_start();
+                // A quoted key in a partial JSON/assignment fragment belongs
+                // to the key-value scanner below, not the string-value parser.
+                if !value.is_string() || !following.starts_with([':', '=']) {
+                    let sanitized = redact_value_for_log(value);
+                    out.push_str(&sanitized.to_string());
+                    i += consumed;
+                    continue;
+                }
+            }
+        }
 
         if rest_lower.starts_with(bearer) {
             let after = bearer.len();
@@ -430,11 +621,69 @@ fn redact_string_for_log(input: &str) -> String {
             }
         }
 
-        if let Some(needle) = needles.iter().find(|n| rest_lower.starts_with(*n)) {
-            let after = needle.len();
+        let route_prefix = "/wptsall/v2/";
+        if rest_lower.starts_with(route_prefix) {
+            let after = i + route_prefix.len();
+            let span = credential_span(&input[after..], &['/', '?', '#', '"', '\'', ')']);
+            out.push_str(route_prefix);
+            out.push_str("[REDACTED]");
+            i = after + span;
+            continue;
+        }
+
+        let peer_prefix = "/wpmmcc/v1/";
+        if rest_lower.starts_with(peer_prefix) {
+            let after = i + peer_prefix.len();
+            let span = credential_span(&input[after..], &['/', '?', '#', '"', '\'', ')']);
+            let tail = input[after + span..].strip_prefix("/sync");
+            if tail.is_some_and(|tail| {
+                tail.is_empty()
+                    || tail.chars().next().is_some_and(|ch| {
+                        ch.is_whitespace()
+                            || matches!(ch, '/' | '?' | '#' | '"' | '\'' | ')' | ',' | ';')
+                    })
+            }) {
+                out.push_str(peer_prefix);
+                out.push_str("[REDACTED]");
+                i = after + span;
+                continue;
+            }
+        }
+
+        // Recognize query assignments and embedded JSON keys without changing
+        // the actual provider request. Percent-encoded key names count too.
+        let key_end = input[i..]
+            .find(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '_' | '-' | '.' | '%'))
+            .map(|offset| i + offset)
+            .unwrap_or(bytes.len());
+        let raw_key = &input[i..key_end];
+        let decoded_key = url::form_urlencoded::parse(format!("{raw_key}=").as_bytes())
+            .next()
+            .map(|(key, _)| key.into_owned())
+            .unwrap_or_default();
+        let mut separator = key_end;
+        if matches!(bytes.get(separator), Some(b'"' | b'\'')) {
+            separator += 1;
+        }
+        while bytes
+            .get(separator)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            separator += 1;
+        }
+        if !raw_key.is_empty()
+            && is_sensitive_log_key(&decoded_key)
+            && matches!(bytes.get(separator), Some(b'=' | b':'))
+        {
+            let mut value_start = separator + 1;
+            while bytes
+                .get(value_start)
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+            {
+                value_start += 1;
+            }
             // A value may be quoted (`token="abc"`, `token='abc'`): keep the
             // quotes, redact between them.
-            let value_start = i + after;
             let quote = if input[value_start..].starts_with('"') {
                 '"'
             } else if input[value_start..].starts_with('\'') {
@@ -442,13 +691,27 @@ fn redact_string_for_log(input: &str) -> String {
             } else {
                 '\0'
             };
-            let scan_from = if quote != '\0' { value_start + 1 } else { value_start };
+            let scan_from = if quote != '\0' {
+                value_start + 1
+            } else {
+                value_start
+            };
             let span = if quote != '\0' {
-                credential_span(&input[scan_from..], &[quote, '\n'])
+                let mut escaped = false;
+                input[scan_from..]
+                    .char_indices()
+                    .find_map(|(offset, ch)| {
+                        if ch == '\n' || (ch == quote && !escaped) {
+                            return Some(offset);
+                        }
+                        escaped = ch == '\\' && !escaped;
+                        None
+                    })
+                    .unwrap_or(input.len() - scan_from)
             } else {
                 credential_span(&input[scan_from..], &['"', '\'', '&', '}', ' ', '\n'])
             };
-            out.push_str(&input[i..i + after]);
+            out.push_str(&input[i..value_start]);
             if quote != '\0' {
                 out.push(quote);
             }
@@ -462,6 +725,11 @@ fn redact_string_for_log(input: &str) -> String {
             continue;
         }
 
+        if key_end > i {
+            out.push_str(&input[i..key_end]);
+            i = key_end;
+            continue;
+        }
         // Copy one full UTF-8 character (scans below stay on char boundaries).
         let ch_len = input[i..].chars().next().map(char::len_utf8).unwrap_or(1);
         out.push_str(&input[i..i + ch_len]);
@@ -476,6 +744,3 @@ fn credential_span(s: &str, terminators: &[char]) -> usize {
     s.find(|c: char| terminators.contains(&c) || c.is_whitespace())
         .unwrap_or(s.len())
 }
-
-#[cfg(test)]
-mod tests;

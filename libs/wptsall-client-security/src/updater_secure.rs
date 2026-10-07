@@ -23,7 +23,8 @@ pub struct VerifiedArtifact {
 }
 
 fn security_skip_allowed() -> bool {
-    client_runtime_core::env_helpers::env_bool("WPTSALL_SKIP_SECURITY", false)
+    // S11 (batch G): SKIP_SECURITY is a debug-only valve by guide-16 contract.
+    crate::bypass::debug_only_valve("WPTSALL_SKIP_SECURITY")
 }
 
 /// Download + minisign (+ optional signed SHA256SUMS) without extracting.
@@ -164,8 +165,8 @@ pub async fn fetch_verified_releases_data(
         .ok_or_else(|| anyhow::anyhow!("missing data field in releases response"))?;
 
     // Production (no SKIP_SECURITY): require signed manifest unless ALLOW_UNSIGNED_MANIFEST=1.
-    let allow_unsigned =
-        client_runtime_core::env_helpers::env_bool("WPTSALL_ALLOW_UNSIGNED_MANIFEST", false);
+    // S11 (batch G): both valves are debug-only by guide-16 contract.
+    let allow_unsigned = crate::bypass::debug_only_valve("WPTSALL_ALLOW_UNSIGNED_MANIFEST");
     let require_sig = !security_skip_allowed() && !allow_unsigned;
 
     let sig_url = format!("{releases_url}.minisig");

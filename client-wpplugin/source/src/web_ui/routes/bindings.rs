@@ -6,27 +6,61 @@ use tokio::sync::Mutex;
 
 use crate::auth::wp_request_with_transport;
 use crate::bindings::{
-    build_wp_base_url, load_vendor_keys, load_vendor_oauth, normalize_domain_base,
-    parse_business_line_key, parse_rule_component_slot_binding_key, parse_task_type_binding_key,
+    build_verify_base_url, format_rfc3339_utc, load_vendor_keys, load_vendor_oauth,
+    normalize_api_base_url_key, normalize_domain_base, now_unix, parse_business_line_key,
+    parse_rule_component_slot_binding_key, parse_task_type_binding_key,
 };
 use crate::logging::{session_token_prefix, unix_ts};
 use crate::types::*;
 use crate::web_ui::{fetch_components_for_session, local_sites_from_domain_token_bindings};
 
 use super::errors::{
-    find_passthrough_http_error, maybe_write_upstream_api_error, write_error_response,
+    err_public, find_passthrough_http_error, maybe_write_upstream_api_error, write_error_response,
     write_error_response_with_status,
 };
 use super::http::write_http_response;
 use super::{
     component_exists_in_local_doc, find_server_component_by_template_id,
     load_local_components_runtime_doc, local_component_capability_id, normalized_vendor_id,
-    resolve_effective_route_secret_for_domain, save_component_bindings_runtime_doc,
-    save_domain_token_bindings_runtime_doc, save_local_components_runtime_doc,
-    save_rule_component_bindings_runtime_doc, save_task_type_component_bindings_runtime_doc,
+    resolve_effective_route_secret_for_domain, save_local_components_runtime_doc,
     validate_component_binding_vendor_alignment, validate_local_component_runtime_ready_for_task,
     validate_server_component_api_version, vendor_keys_path, vendor_oauth_path,
 };
+
+async fn save_bindings_or_error<T: Sync>(
+    socket: &mut TcpStream,
+    state: &Arc<Mutex<WebUiState>>,
+    path: &str,
+    doc: &T,
+    db_save: fn(&rusqlite::Connection, &T) -> anyhow::Result<()>,
+    file_save: fn(&str, &T) -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    let db = Arc::clone(&state.lock().await.db);
+    let result = {
+        let conn = db.lock().await;
+        db_save(&conn, doc)
+    };
+    // The agent already owns its canonical DB connection. Do not re-open a
+    // second runtime DB or write a file before the guarded DB save succeeds.
+    let result = result.and_then(|()| {
+        if super::web_ui_sqlite_storage_enabled() {
+            Ok(())
+        } else {
+            file_save(path, doc)
+        }
+    });
+    if result.is_err() {
+        write_error_response_with_status(
+            socket,
+            "500 Internal Server Error",
+            "BINDINGS_SAVE_FAILED",
+            "Could not save bindings. Check local storage and encryption settings.",
+        )
+        .await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
 
 pub(super) async fn handle_bindings_upsert(
     socket: &mut TcpStream,
@@ -57,6 +91,8 @@ pub(super) async fn handle_bindings_upsert(
     let constraints_override = req.constraints_override;
     let request_overrides = req.request_overrides;
     let default_values_override = req.default_values_override;
+    // None preserves the stored map; Some(map) replaces it (empty = clear).
+    let language_map = req.language_map;
     let binding_constraints_override = constraints_override.clone();
     let binding_request_overrides = request_overrides.clone();
     let binding_default_values_override = default_values_override.clone();
@@ -65,7 +101,7 @@ pub(super) async fn handle_bindings_upsert(
     // against local data; the server component cache and
     // `fetch_components_for_session` are never consulted.
     if !crate::config::server_control_plane_enabled()
-        && !load_local_components_runtime_doc()
+        && !load_local_components_runtime_doc()?
             .components
             .contains_key(&component_id)
     {
@@ -80,7 +116,7 @@ pub(super) async fn handle_bindings_upsert(
     let local_mode = !crate::config::server_control_plane_enabled();
     let requires_vendor_alignment = !key_ids.is_empty() || !oauth_ids.is_empty();
     let component_vendor_id = if requires_vendor_alignment {
-        let local_doc = load_local_components_runtime_doc();
+        let local_doc = load_local_components_runtime_doc()?;
         if let Some(component) = local_doc.components.get(&component_id) {
             normalized_vendor_id(&component.vendor_id)
         } else if local_mode {
@@ -132,7 +168,11 @@ pub(super) async fn handle_bindings_upsert(
             socket,
             "422 Unprocessable Entity",
             "INVALID_COMPONENT_AUTH_POOL",
-            &format!("{:#}", err),
+            // S6 carve-out: pool validation errors are USER-ACTIONABLE input
+            // validation (the message names request-derived component/key
+            // vendors, never infrastructure detail) - the top-level message
+            // keeps that contract without the full chain.
+            &err.to_string(),
         )
         .await;
     }
@@ -152,7 +192,7 @@ pub(super) async fn handle_bindings_upsert(
             template_id: existing.template_id,
             r#type: existing.r#type,
             name: existing.name,
-            language_map: existing.language_map,
+            language_map: language_map.unwrap_or(existing.language_map),
             constraints_override: binding_constraints_override.or(existing.constraints_override),
             request_overrides: binding_request_overrides.or(existing.request_overrides),
             default_values_override: binding_default_values_override
@@ -161,30 +201,52 @@ pub(super) async fn handle_bindings_upsert(
     );
     let saved_entry = bindings_doc.components.get(&component_id).cloned();
 
-    let mut local_components_doc = load_local_components_runtime_doc();
+    let mut local_components_doc = load_local_components_runtime_doc()?;
     let mut local_component_synced = false;
     if let Some(comp) = local_components_doc.components.get_mut(&component_id) {
         comp.component_overrides = Some(ComponentInstanceOverrides {
+            http_limits_overrides: comp
+                .component_overrides
+                .as_ref()
+                .and_then(|value| value.http_limits_overrides.clone()),
             constraints_override: constraints_override.clone(),
             request_overrides: request_overrides.clone(),
             default_values_override: default_values_override.clone(),
         });
         comp.updated_at = Some(format!("{}", unix_ts()));
-        save_local_components_runtime_doc(&local_components_doc)?;
         local_component_synced = true;
     }
-    save_component_bindings_runtime_doc(&path, &bindings_doc)?;
+    if !save_bindings_or_error(
+        socket,
+        state,
+        &path,
+        &bindings_doc,
+        crate::db::bindings::save_component_bindings_doc,
+        crate::bindings::save_component_bindings,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    if local_component_synced {
+        save_local_components_runtime_doc(&local_components_doc)?;
+    }
     {
         let mut guard = state.lock().await;
-        {
-            let db = guard.db.lock().await;
-            let _ = crate::db::bindings::save_component_bindings_doc(&db, &bindings_doc);
-        }
         guard.component_bindings = bindings_doc;
         guard.last_error.clear();
         guard.last_event = "bindings.upserted".to_string();
         guard.updated_at = unix_ts();
     }
+    // Binding changes can make previously structural-skipped content
+    // servable again: clear the permanent skips so the next cycle
+    // re-attempts it (worst case the classifier re-skips it once).
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "info",
+        "binding.component_upserted",
+        json!({ "component_id": component_id }),
+    );
     let payload = json!({
         "success": true,
         "data": {
@@ -229,26 +291,41 @@ pub(super) async fn handle_bindings_delete(
     };
     let removed = bindings_doc.components.remove(&component_id).is_some();
 
-    let mut local_components_doc = load_local_components_runtime_doc();
+    let mut local_components_doc = load_local_components_runtime_doc()?;
     let mut local_component_synced = false;
     if let Some(comp) = local_components_doc.components.get_mut(&component_id) {
         comp.component_overrides = None;
         comp.updated_at = Some(format!("{}", unix_ts()));
-        save_local_components_runtime_doc(&local_components_doc)?;
         local_component_synced = true;
     }
-    save_component_bindings_runtime_doc(&path, &bindings_doc)?;
+    if !save_bindings_or_error(
+        socket,
+        state,
+        &path,
+        &bindings_doc,
+        crate::db::bindings::save_component_bindings_doc,
+        crate::bindings::save_component_bindings,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    if local_component_synced {
+        save_local_components_runtime_doc(&local_components_doc)?;
+    }
     {
         let mut guard = state.lock().await;
-        {
-            let db = guard.db.lock().await;
-            let _ = crate::db::bindings::save_component_bindings_doc(&db, &bindings_doc);
-        }
         guard.component_bindings = bindings_doc;
         guard.last_error.clear();
         guard.last_event = "bindings.deleted".to_string();
         guard.updated_at = unix_ts();
     }
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "info",
+        "binding.component_deleted",
+        json!({ "component_id": component_id, "deleted": removed }),
+    );
     let payload = json!({
         "success": true,
         "data": {
@@ -351,18 +428,31 @@ pub(super) async fn handle_task_type_components_upsert(
             },
         );
     }
-    save_task_type_component_bindings_runtime_doc(&path, &bindings_doc)?;
+    if !save_bindings_or_error(
+        socket,
+        state,
+        &path,
+        &bindings_doc,
+        crate::db::bindings::save_task_type_component_bindings_doc,
+        crate::bindings::save_task_type_component_bindings,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     {
         let mut guard = state.lock().await;
-        {
-            let db = guard.db.lock().await;
-            let _ = crate::db::bindings::save_task_type_component_bindings_doc(&db, &bindings_doc);
-        }
         guard.task_type_component_bindings = bindings_doc;
         guard.last_error.clear();
         guard.last_event = "task_type_components.upserted".to_string();
         guard.updated_at = unix_ts();
     }
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "info",
+        "binding.task_type_upserted",
+        json!({ "task_type": task_type, "business_line": business_line, "component_id": component_id }),
+    );
     let payload = json!({
         "success": true,
         "data": {
@@ -386,7 +476,7 @@ async fn validate_task_type_component_target(
     business_line: Option<&str>,
     component_id: &str,
 ) -> anyhow::Result<()> {
-    let local_doc = load_local_components_runtime_doc();
+    let local_doc = load_local_components_runtime_doc()?;
     if let Some(component) = local_doc.components.get(component_id) {
         let capability_id = local_component_capability_id(&component.kind);
         if capability_id != task_type {
@@ -520,18 +610,31 @@ pub(super) async fn handle_task_type_components_delete(
     } else {
         bindings_doc.task_types.remove(&task_type).is_some()
     };
-    save_task_type_component_bindings_runtime_doc(&path, &bindings_doc)?;
+    if !save_bindings_or_error(
+        socket,
+        state,
+        &path,
+        &bindings_doc,
+        crate::db::bindings::save_task_type_component_bindings_doc,
+        crate::bindings::save_task_type_component_bindings,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     {
         let mut guard = state.lock().await;
-        {
-            let db = guard.db.lock().await;
-            let _ = crate::db::bindings::save_task_type_component_bindings_doc(&db, &bindings_doc);
-        }
         guard.task_type_component_bindings = bindings_doc;
         guard.last_error.clear();
         guard.last_event = "task_type_components.deleted".to_string();
         guard.updated_at = unix_ts();
     }
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "info",
+        "binding.task_type_deleted",
+        json!({ "task_type": task_type, "business_line": business_line, "deleted": removed }),
+    );
     let payload = json!({
         "success": true,
         "data": {
@@ -641,7 +744,7 @@ pub(super) async fn handle_rule_component_bindings_upsert(
         return write_error_response(socket, "INVALID_COMPONENT_ID", "component_id is required")
             .await;
     }
-    let local_doc = load_local_components_runtime_doc();
+    let local_doc = load_local_components_runtime_doc()?;
     if !component_exists_in_local_doc(&local_doc, &component_id) {
         return write_error_response(
             socket,
@@ -699,18 +802,31 @@ pub(super) async fn handle_rule_component_bindings_upsert(
         }
     }
 
-    save_rule_component_bindings_runtime_doc(&path, &bindings_doc)?;
+    if !save_bindings_or_error(
+        socket,
+        state,
+        &path,
+        &bindings_doc,
+        crate::db::bindings::save_rule_component_bindings_doc,
+        crate::bindings::save_rule_component_bindings,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     {
         let mut guard = state.lock().await;
-        {
-            let db = guard.db.lock().await;
-            let _ = crate::db::bindings::save_rule_component_bindings_doc(&db, &bindings_doc);
-        }
         guard.rule_component_bindings = bindings_doc;
         guard.last_error.clear();
         guard.last_event = "rule_component_bindings.upserted".to_string();
         guard.updated_at = unix_ts();
     }
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "info",
+        "binding.rule_upserted",
+        json!({ "scope": scope, "scope_key": scope_key, "slot_key": slot_key, "component_id": component_id }),
+    );
 
     let payload = json!({
         "success": true,
@@ -819,18 +935,31 @@ pub(super) async fn handle_rule_component_bindings_delete(
         _ => false,
     };
 
-    save_rule_component_bindings_runtime_doc(&path, &bindings_doc)?;
+    if !save_bindings_or_error(
+        socket,
+        state,
+        &path,
+        &bindings_doc,
+        crate::db::bindings::save_rule_component_bindings_doc,
+        crate::bindings::save_rule_component_bindings,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     {
         let mut guard = state.lock().await;
-        {
-            let db = guard.db.lock().await;
-            let _ = crate::db::bindings::save_rule_component_bindings_doc(&db, &bindings_doc);
-        }
         guard.rule_component_bindings = bindings_doc;
         guard.last_error.clear();
         guard.last_event = "rule_component_bindings.deleted".to_string();
         guard.updated_at = unix_ts();
     }
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "info",
+        "binding.rule_deleted",
+        json!({ "scope": scope, "scope_key": scope_key, "slot_key": slot_key, "deleted": removed }),
+    );
 
     let payload = json!({
         "success": true,
@@ -902,6 +1031,29 @@ pub(super) async fn handle_domain_tokens_upsert(
     } else {
         route_secret
     };
+    let (final_plugin_identity, final_identity_verified_at, final_identity_capabilities) = {
+        let requested_identity = req
+            .plugin_identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(PluginIdentity::from_wire_str);
+        if let Some(identity) = requested_identity {
+            (
+                Some(identity),
+                existing_entry.and_then(|entry| entry.identity_verified_at.clone()),
+                existing_entry.and_then(|entry| entry.identity_capabilities.clone()),
+            )
+        } else if let Some(existing) = existing_entry {
+            (
+                existing.plugin_identity,
+                existing.identity_verified_at.clone(),
+                existing.identity_capabilities.clone(),
+            )
+        } else {
+            (None, None, None)
+        }
+    };
     if !existing_domain_key.is_empty() && existing_domain_key != domain_key {
         bindings_doc.domains.remove(&existing_domain_key);
     }
@@ -910,28 +1062,46 @@ pub(super) async fn handle_domain_tokens_upsert(
         DomainTokenBindingEntry {
             wp_client_token: token.clone(),
             route_secret: final_route_secret.clone(),
+            plugin_identity: final_plugin_identity,
+            identity_verified_at: final_identity_verified_at.clone(),
+            identity_capabilities: final_identity_capabilities,
         },
     );
-    save_domain_token_bindings_runtime_doc(&path, &bindings_doc)?;
+    if !save_bindings_or_error(
+        socket,
+        state,
+        &path,
+        &bindings_doc,
+        crate::db::bindings::save_domain_token_bindings_doc,
+        crate::bindings::save_domain_token_bindings,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     {
         let mut guard = state.lock().await;
-        {
-            let db = guard.db.lock().await;
-            let _ = crate::db::bindings::save_domain_token_bindings_doc(&db, &bindings_doc);
-        }
         guard.domain_token_bindings = bindings_doc.clone();
         guard.domains = local_sites_from_domain_token_bindings(&bindings_doc);
         guard.last_error.clear();
         guard.last_event = "domain_tokens.upserted".to_string();
         guard.updated_at = unix_ts();
     }
+    crate::task_engine::backoff::clear_structural_all();
+    crate::logging::log_event_global(
+        "info",
+        "credential.domain_token_upserted",
+        json!({ "domain": domain_key }),
+    );
     let payload = json!({
         "success": true,
         "data": {
             "api_base_url": domain_key,
             "token_prefix": session_token_prefix(&token),
             "token_len": token.len(),
-            "route_secret_set": !final_route_secret.is_empty()
+            "route_secret_set": !final_route_secret.is_empty(),
+            "plugin_identity": final_plugin_identity.map(|id| id.as_wire_str()),
+            "identity_verified_at": final_identity_verified_at,
         }
     });
     write_http_response(
@@ -963,18 +1133,44 @@ pub(super) async fn handle_domain_tokens_delete(
         )
     };
     let removed = bindings_doc.domains.remove(&domain_key).is_some();
-    save_domain_token_bindings_runtime_doc(&path, &bindings_doc)?;
+    if !save_bindings_or_error(
+        socket,
+        state,
+        &path,
+        &bindings_doc,
+        crate::db::bindings::save_domain_token_bindings_doc,
+        crate::bindings::save_domain_token_bindings,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     {
         let mut guard = state.lock().await;
-        {
-            let db = guard.db.lock().await;
-            let _ = crate::db::bindings::save_domain_token_bindings_doc(&db, &bindings_doc);
-        }
         guard.domain_token_bindings = bindings_doc.clone();
         guard.domains = local_sites_from_domain_token_bindings(&bindings_doc);
         guard.last_error.clear();
         guard.last_event = "domain_tokens.deleted".to_string();
         guard.updated_at = unix_ts();
+    }
+    crate::task_engine::backoff::clear_structural_all();
+    // FL-4 (Wave-2): an idempotent delete that finds nothing is SUCCESS
+    // semantics — the end state matches the request — so the no-op case is
+    // info-level (spec afterAll cleanup hits this routinely and the old
+    // unconditional warn was pure radar/log noise). A REAL credential
+    // removal stays warn-level.
+    if removed {
+        crate::logging::log_event_global(
+            "warn",
+            "credential.domain_token_deleted",
+            json!({ "domain": domain_key, "deleted": true }),
+        );
+    } else {
+        crate::logging::log_event_global(
+            "info",
+            "credential.domain_token_delete_noop",
+            json!({ "domain": domain_key }),
+        );
     }
     let payload = json!({
         "success": true,
@@ -1051,17 +1247,18 @@ pub(super) async fn handle_domain_tokens_test(
                 return write_error_response(
                     socket,
                     "ROUTE_SECRET_RESOLUTION_FAILED",
-                    &format!("{:#}", err),
+                    &err_public(&err),
                 )
                 .await;
             }
         };
 
-    let wp_base = match route_secret
+    let secret_str = match route_secret
         .as_deref()
-        .and_then(|s| build_wp_base_url(&domain_key, s))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
     {
-        Some(url) => url,
+        Some(s) => s,
         None => {
             return write_error_response(
                 socket,
@@ -1072,7 +1269,18 @@ pub(super) async fn handle_domain_tokens_test(
         }
     };
 
-    let validate_url = format!("{}/validate-token", wp_base);
+    let legacy_key = normalize_api_base_url_key(&domain_key);
+    let existing_entry = domain_token_bindings
+        .domains
+        .get(&domain_key)
+        .or_else(|| domain_token_bindings.domains.get(&legacy_key));
+    let stored_identity = existing_entry.and_then(|entry| entry.plugin_identity);
+    let requested_identity = req
+        .get("plugin_identity")
+        .and_then(Value::as_str)
+        .and_then(PluginIdentity::from_wire_str);
+    let preferred_identity = requested_identity.or(stored_identity);
+
     let validate_route_missing = |err: &anyhow::Error| {
         matches!(
             find_passthrough_http_error(err),
@@ -1083,24 +1291,219 @@ pub(super) async fn handle_domain_tokens_test(
     let worker_id = if device_id.trim().is_empty() {
         "web-ui-test".to_string()
     } else {
-        device_id
+        device_id.clone()
     };
 
-    match wp_request_with_transport(
-        &client,
-        reqwest::Method::GET,
-        &validate_url,
-        &token,
-        worker_id.as_str(),
-        &json!({}),
-        route_secret.as_deref(),
-    )
-    .await
-    {
-        Ok(resp_value) => {
+    // 1. Probe ATS endpoints: validate-token -> ping -> site-relations
+    let probe_ats = || async {
+        let wp_base = build_verify_base_url(&domain_key, secret_str, &PluginIdentity::WpmmccAts)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/wp-json/wptsall/v2/{}/client",
+                    domain_key.trim_end_matches('/'),
+                    secret_str
+                )
+            });
+        let validate_url = format!("{}/validate-token", wp_base);
+        match wp_request_with_transport(
+            &client,
+            reqwest::Method::GET,
+            &validate_url,
+            &token,
+            worker_id.as_str(),
+            device_id.as_str(),
+            &json!({}),
+            Some(secret_str),
+        )
+        .await
+        {
+            Ok(resp_value) => Ok((PluginIdentity::WpmmccAts, resp_value, "validate_token")),
+            Err(validate_err) => {
+                if !validate_route_missing(&validate_err) {
+                    return Err(validate_err);
+                }
+                let ping_url = format!("{}/ping", wp_base);
+                match wp_request_with_transport(
+                    &client,
+                    reqwest::Method::GET,
+                    &ping_url,
+                    &token,
+                    worker_id.as_str(),
+                    device_id.as_str(),
+                    &json!({}),
+                    Some(secret_str),
+                )
+                .await
+                {
+                    Ok(ping_value) => Ok((PluginIdentity::WpmmccAts, ping_value, "ping")),
+                    Err(ping_err) => {
+                        if !validate_route_missing(&ping_err) {
+                            return Err(ping_err);
+                        }
+                        let relations_url = format!("{}/site-relations", wp_base);
+                        match wp_request_with_transport(
+                            &client,
+                            reqwest::Method::GET,
+                            &relations_url,
+                            &token,
+                            worker_id.as_str(),
+                            device_id.as_str(),
+                            &json!({}),
+                            Some(secret_str),
+                        )
+                        .await
+                        {
+                            Ok(rel_value) => {
+                                Ok((PluginIdentity::WpmmccAts, rel_value, "site_relations"))
+                            }
+                            Err(rel_err) => Err(rel_err),
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    // 2. Probe WPMMCC endpoints: /sync/ping
+    let probe_wpmmcc = || async {
+        let wp_base = build_verify_base_url(&domain_key, secret_str, &PluginIdentity::Wpmmcc)
+            .unwrap_or_else(|| {
+                format!(
+                    "{}/wp-json/wpmmcc/v1/{}/sync",
+                    domain_key.trim_end_matches('/'),
+                    secret_str
+                )
+            });
+        let ping_url = format!("{}/ping", wp_base);
+        match wp_request_with_transport(
+            &client,
+            reqwest::Method::GET,
+            &ping_url,
+            &token,
+            worker_id.as_str(),
+            device_id.as_str(),
+            &json!({}),
+            Some(secret_str),
+        )
+        .await
+        {
+            Ok(ping_value) => {
+                let id = ping_value
+                    .get("data")
+                    .and_then(|d| d.get("plugin_identity"))
+                    .and_then(Value::as_str)
+                    .and_then(PluginIdentity::from_wire_str)
+                    .unwrap_or(PluginIdentity::Wpmmcc);
+                Ok((id, ping_value, "wpmmcc_ping"))
+            }
+            Err(err) => Err(err),
+        }
+    };
+
+    // Execute probe with adaptive fallback
+    let probe_result = match preferred_identity {
+        Some(PluginIdentity::Wpmmcc) => match probe_wpmmcc().await {
+            Ok(res) => Ok(res),
+            Err(wpmmcc_err) => {
+                if validate_route_missing(&wpmmcc_err) {
+                    probe_ats().await.map_err(|ats_err| {
+                        anyhow!(
+                            "WPMMCC ping error: {}; ATS fallback error: {}",
+                            wpmmcc_err,
+                            ats_err
+                        )
+                    })
+                } else {
+                    Err(wpmmcc_err)
+                }
+            }
+        },
+        _ => match probe_ats().await {
+            Ok(res) => Ok(res),
+            Err(ats_err) => {
+                if validate_route_missing(&ats_err) {
+                    probe_wpmmcc().await.map_err(|wpmmcc_err| {
+                        anyhow!(
+                            "ATS error: {}; WPMMCC fallback error: {}",
+                            ats_err,
+                            wpmmcc_err
+                        )
+                    })
+                } else {
+                    Err(ats_err)
+                }
+            }
+        },
+    };
+
+    match probe_result {
+        Ok((verified_identity, resp_value, via)) => {
+            let capabilities = resp_value.get("data").map(|data| IdentityCapabilities {
+                plugin_version: data
+                    .get("plugin_version")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                protocol_min: data
+                    .get("protocol_min")
+                    .and_then(Value::as_i64)
+                    .and_then(|v| u32::try_from(v).ok()),
+                protocol_current: data
+                    .get("protocol_current")
+                    .and_then(Value::as_i64)
+                    .and_then(|v| u32::try_from(v).ok()),
+            });
+
+            let verified_at = format_rfc3339_utc(now_unix());
+            let (path, mut bindings_doc) = {
+                let guard = state.lock().await;
+                (
+                    guard.domain_token_bindings_path.clone(),
+                    guard.domain_token_bindings.clone(),
+                )
+            };
+            let legacy_key = normalize_api_base_url_key(&domain_key);
+            let entry_mut = if bindings_doc.domains.contains_key(&domain_key) {
+                bindings_doc.domains.get_mut(&domain_key)
+            } else {
+                bindings_doc.domains.get_mut(&legacy_key)
+            };
+            if let Some(entry) = entry_mut {
+                entry.plugin_identity = Some(verified_identity);
+                entry.identity_verified_at = Some(verified_at.clone());
+                if let Some(caps) = &capabilities {
+                    if !caps.plugin_version.is_empty() || caps.protocol_current.is_some() {
+                        entry.identity_capabilities = Some(caps.clone());
+                    }
+                }
+                if save_bindings_or_error(
+                    socket,
+                    state,
+                    &path,
+                    &bindings_doc,
+                    crate::db::bindings::save_domain_token_bindings_doc,
+                    crate::bindings::save_domain_token_bindings,
+                )
+                .await?
+                {
+                    let mut guard = state.lock().await;
+                    guard.domain_token_bindings = bindings_doc.clone();
+                    guard.domains = local_sites_from_domain_token_bindings(&bindings_doc);
+                    guard.last_event = "domain_tokens.identity_verified".to_string();
+                    guard.updated_at = unix_ts();
+                } else {
+                    return Ok(());
+                }
+            }
+
             let payload = json!({
                 "success": true,
-                "data": resp_value
+                "data": {
+                    "plugin_identity": verified_identity.as_wire_str(),
+                    "identity_verified_at": verified_at,
+                    "validated_via": via,
+                    "response": resp_value
+                }
             });
             write_http_response(
                 socket,
@@ -1110,122 +1513,24 @@ pub(super) async fn handle_domain_tokens_test(
             )
             .await
         }
-        Err(validate_err) => {
-            let ping_err = if validate_route_missing(&validate_err) {
-                let ping_url = format!("{}/ping", wp_base);
-                match wp_request_with_transport(
-                    &client,
-                    reqwest::Method::GET,
-                    &ping_url,
-                    &token,
-                    "web-ui-test",
-                    &json!({}),
-                    route_secret.as_deref(),
-                )
-                .await
-                {
-                    Ok(ping_value) => {
-                        let payload = json!({
-                            "success": true,
-                            "data": {
-                                "validated_via": "ping",
-                                "validate_token_error": format!("{}", validate_err),
-                                "ping": ping_value
-                            }
-                        });
-                        return write_http_response(
-                            socket,
-                            "200 OK",
-                            "application/json",
-                            &serde_json::to_vec(&payload)?,
-                        )
-                        .await;
-                    }
-                    Err(err) => Some(err),
+        Err(err) => {
+            if let Some(response) = maybe_write_upstream_api_error(socket, &err).await {
+                return response;
+            }
+            let payload = json!({
+                "success": false,
+                "error": {
+                    "code": "CONNECTION_FAILED",
+                    "message": format!("Failed to connect to WP site: {:#}", err)
                 }
-            } else {
-                None
-            };
-
-            let relations_url = format!("{}/site-relations", wp_base);
-            match wp_request_with_transport(
-                &client,
-                reqwest::Method::GET,
-                &relations_url,
-                &token,
-                "web-ui-test",
-                &json!({}),
-                route_secret.as_deref(),
+            });
+            write_http_response(
+                socket,
+                "200 OK",
+                "application/json",
+                &serde_json::to_vec(&payload)?,
             )
             .await
-            {
-                Ok(relations_value) => {
-                    let payload = json!({
-                        "success": true,
-                        "data": {
-                            "validated_via": "site_relations",
-                            "validate_token_error": format!("{}", validate_err),
-                            "ping_error": ping_err.as_ref().map(|err| format!("{}", err)),
-                            "site_relations": relations_value
-                        }
-                    });
-                    return write_http_response(
-                        socket,
-                        "200 OK",
-                        "application/json",
-                        &serde_json::to_vec(&payload)?,
-                    )
-                    .await;
-                }
-                Err(relations_err) => {
-                    if !validate_route_missing(&validate_err) {
-                        if let Some(response) =
-                            maybe_write_upstream_api_error(socket, &validate_err).await
-                        {
-                            return response;
-                        }
-                    }
-                    if let Some(err) = ping_err.as_ref() {
-                        if let Some(response) = maybe_write_upstream_api_error(socket, err).await {
-                            return response;
-                        }
-                    }
-                    if let Some(response) =
-                        maybe_write_upstream_api_error(socket, &relations_err).await
-                    {
-                        return response;
-                    }
-                    if !validate_route_missing(&validate_err) {
-                        if let Some(response) =
-                            maybe_write_upstream_api_error(socket, &validate_err).await
-                        {
-                            return response;
-                        }
-                    }
-                    let payload = json!({
-                        "success": false,
-                        "error": {
-                            "code": "CONNECTION_FAILED",
-                            "message": format!(
-                                "Failed to connect to WP site: validate-token error: {}; ping error: {}; site-relations error: {}",
-                                validate_err,
-                                ping_err
-                                    .as_ref()
-                                    .map(|err| err.to_string())
-                                    .unwrap_or_else(|| "not attempted".to_string()),
-                                relations_err
-                            )
-                        }
-                    });
-                    return write_http_response(
-                        socket,
-                        "200 OK",
-                        "application/json",
-                        &serde_json::to_vec(&payload)?,
-                    )
-                    .await;
-                }
-            }
         }
     }
 }
@@ -1256,11 +1561,11 @@ pub(super) async fn handle_site_connections_import(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim();
-    if "wptsall-site-connection.v1" != schema {
+    if "wptsall-site-connection.v1" != schema && "wpmmcc-site-connection.v1" != schema {
         return write_error_response(
             socket,
             "INVALID_SITE_CONNECTION_PACK",
-            "site_connection_pack schema must be wptsall-site-connection.v1",
+            "site_connection_pack schema must be wptsall-site-connection.v1 or wpmmcc-site-connection.v1",
         )
         .await;
     }
@@ -1302,6 +1607,14 @@ pub(super) async fn handle_site_connections_import(
         route_secret = extract_route_secret_from_client_base(&wp_client_base).unwrap_or_default();
     }
 
+    let direct_token = req
+        .get("wp_client_token")
+        .or_else(|| pack_obj.get("wp_client_token"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
     let pairing_code = req
         .get("pairing_code")
         .or_else(|| pack_obj.get("pairing_code"))
@@ -1309,9 +1622,16 @@ pub(super) async fn handle_site_connections_import(
         .unwrap_or_default()
         .trim()
         .to_string();
-    if pairing_code.is_empty() {
-        return write_error_response(socket, "INVALID_PAIRING_CODE", "pairing_code is required")
-            .await;
+
+    if direct_token.is_empty() && pairing_code.is_empty() {
+        return write_error_response(
+            socket,
+            "INVALID_PAIRING_CODE",
+            // CLIENT-P3-01 (3.8flash C5): point the user at the two ways out
+            // instead of a bare field-name rejection.
+            "pairing_code or wp_client_token is required — paste the pairing code from the WP site, or re-export the connection pack with token issuance enabled",
+        )
+        .await;
     }
 
     let pack_device_id = pack_obj
@@ -1341,98 +1661,129 @@ pub(super) async fn handle_site_connections_import(
         .await;
     }
 
-    let claim_url = if !wp_client_base.is_empty() {
-        format!("{}/pairing/claim", wp_client_base.trim_end_matches('/'))
-    } else if !route_secret.is_empty() {
-        format!(
-            "{}/wp-json/wptsall/v2/{}/client/pairing/claim",
-            site_url.trim_end_matches('/'),
-            route_secret
-        )
+    let (token, claimed_identity, claim_expires_at, claim_scopes) = if !direct_token.is_empty() {
+        let exp = pack_obj
+            .get("expires_at")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let scp = pack_obj.get("scopes").cloned().unwrap_or_else(|| json!([]));
+        (direct_token.clone(), None, exp, scp)
     } else {
-        return write_error_response(
-            socket,
-            "INVALID_ROUTE_SECRET",
-            "route_secret or wp_client_base is required",
-        )
-        .await;
-    };
+        let claim_url = if !wp_client_base.is_empty() {
+            format!("{}/pairing/claim", wp_client_base.trim_end_matches('/'))
+        } else if !route_secret.is_empty() {
+            format!(
+                "{}/wp-json/wptsall/v2/{}/client/pairing/claim",
+                site_url.trim_end_matches('/'),
+                route_secret
+            )
+        } else {
+            return write_error_response(
+                socket,
+                "INVALID_ROUTE_SECRET",
+                "route_secret or wp_client_base is required",
+            )
+            .await;
+        };
 
-    let client = {
-        let guard = state.lock().await;
-        guard.http_client.clone()
-    };
-    let claim_payload = json!({
-        "schema": "wptsall-pairing-claim.v1",
-        "device_id": client_device_id,
-        "pairing_code": pairing_code,
-        "device_label": device_label,
-    });
-    let response = client
-        .post(&claim_url)
-        .json(&claim_payload)
-        .send()
-        .await
-        .with_context(|| format!("pairing claim request failed: {}", claim_url))?;
-    let status = response.status();
-    let claim_text = response
-        .text()
-        .await
-        .with_context(|| format!("pairing claim response read failed: {}", claim_url))?;
-    if !status.is_success() {
-        let status_line = format!(
-            "{} {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or("Error")
-        );
-        if let Ok(payload) = serde_json::from_str::<Value>(&claim_text) {
-            let code = payload
-                .get("error")
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_str)
-                .unwrap_or("PAIRING_CLAIM_FAILED");
-            let message = payload
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("message").and_then(Value::as_str))
-                .unwrap_or(&claim_text)
-                .to_string();
-            return write_error_response_with_status(socket, &status_line, code, &message).await;
+        let client = {
+            let guard = state.lock().await;
+            guard.http_client.clone()
+        };
+        let claim_payload = json!({
+            "schema": "wptsall-pairing-claim.v1",
+            "device_id": client_device_id,
+            "pairing_code": pairing_code,
+            "device_label": device_label,
+        });
+        let response = client
+            .post(&claim_url)
+            .json(&claim_payload)
+            .send()
+            .await
+            .with_context(|| format!("pairing claim request failed: {}", claim_url))?;
+        let status = response.status();
+        let claim_text = response
+            .text()
+            .await
+            .with_context(|| format!("pairing claim response read failed: {}", claim_url))?;
+        if !status.is_success() {
+            let status_line = format!(
+                "{} {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("Error")
+            );
+            if let Ok(payload) = serde_json::from_str::<Value>(&claim_text) {
+                let code = payload
+                    .get("error")
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("PAIRING_CLAIM_FAILED");
+                let message = payload
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("message").and_then(Value::as_str))
+                    .unwrap_or(&claim_text)
+                    .to_string();
+                return write_error_response_with_status(socket, &status_line, code, &message)
+                    .await;
+            }
+            return write_error_response_with_status(
+                socket,
+                &status_line,
+                "PAIRING_CLAIM_FAILED",
+                &claim_text,
+            )
+            .await;
         }
-        return write_error_response_with_status(
-            socket,
-            &status_line,
-            "PAIRING_CLAIM_FAILED",
-            &claim_text,
-        )
-        .await;
-    }
 
-    let claim_json: Value = serde_json::from_str(&claim_text)
-        .with_context(|| format!("invalid pairing claim json response from {}", claim_url))?;
-    let data = claim_json
-        .get("data")
-        .or_else(|| claim_json.get("result"))
-        .unwrap_or(&claim_json);
-    let token = data
-        .get("client_token")
-        .or_else(|| data.get("token"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    if token.is_empty() {
-        return write_error_response(
-            socket,
-            "INVALID_CLIENT_TOKEN",
-            "pairing claim response did not include client_token",
-        )
-        .await;
-    }
+        let claim_json: Value = serde_json::from_str(&claim_text)
+            .with_context(|| format!("invalid pairing claim json response from {}", claim_url))?;
+        let data = claim_json
+            .get("data")
+            .or_else(|| claim_json.get("result"))
+            .unwrap_or(&claim_json);
+        let claimed_tok = data
+            .get("client_token")
+            .or_else(|| data.get("token"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if claimed_tok.is_empty() {
+            return write_error_response(
+                socket,
+                "INVALID_CLIENT_TOKEN",
+                "pairing claim response did not include client_token",
+            )
+            .await;
+        }
+        let identity = data
+            .get("plugin_identity")
+            .and_then(Value::as_str)
+            .and_then(PluginIdentity::from_wire_str);
+        let exp = data.get("expires_at").and_then(Value::as_i64).unwrap_or(0);
+        let scp = data.get("scopes").cloned().unwrap_or_else(|| json!([]));
+        (claimed_tok, identity, exp, scp)
+    };
+
     if route_secret.is_empty() {
         route_secret = extract_route_secret_from_client_base(&wp_client_base).unwrap_or_default();
     }
+
+    let plugin_identity = pack_obj
+        .get("plugin_identity")
+        .and_then(Value::as_str)
+        .and_then(PluginIdentity::from_wire_str)
+        .or(claimed_identity)
+        .or_else(|| {
+            if schema == "wpmmcc-site-connection.v1" {
+                Some(PluginIdentity::Wpmmcc)
+            } else {
+                Some(PluginIdentity::WpmmccAts)
+            }
+        });
 
     let domain_key = normalize_domain_base(&site_url);
     let (path, mut bindings_doc) = {
@@ -1447,21 +1798,36 @@ pub(super) async fn handle_site_connections_import(
         DomainTokenBindingEntry {
             wp_client_token: token.clone(),
             route_secret: route_secret.clone(),
+            plugin_identity,
+            identity_verified_at: Some(format_rfc3339_utc(now_unix())),
+            ..Default::default()
         },
     );
-    save_domain_token_bindings_runtime_doc(&path, &bindings_doc)?;
+    if !save_bindings_or_error(
+        socket,
+        state,
+        &path,
+        &bindings_doc,
+        crate::db::bindings::save_domain_token_bindings_doc,
+        crate::bindings::save_domain_token_bindings,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     {
         let mut guard = state.lock().await;
-        {
-            let db = guard.db.lock().await;
-            let _ = crate::db::bindings::save_domain_token_bindings_doc(&db, &bindings_doc);
-        }
         guard.domain_token_bindings = bindings_doc.clone();
         guard.domains = local_sites_from_domain_token_bindings(&bindings_doc);
         guard.last_error.clear();
         guard.last_event = "site_connections.imported".to_string();
         guard.updated_at = unix_ts();
     }
+    crate::logging::log_event_global(
+        "info",
+        "credential.site_connection_imported",
+        json!({ "domain": domain_key, "source": "connection_pack" }),
+    );
 
     let payload = json!({
         "success": true,
@@ -1470,9 +1836,10 @@ pub(super) async fn handle_site_connections_import(
             "token_prefix": session_token_prefix(&token),
             "token_len": token.len(),
             "route_secret_set": !route_secret.is_empty(),
-            "pairing_claimed": true,
-            "expires_at": data.get("expires_at").and_then(Value::as_i64).unwrap_or(0),
-            "scopes": data.get("scopes").cloned().unwrap_or_else(|| json!([]))
+            "pairing_claimed": direct_token.is_empty(),
+            "plugin_identity": plugin_identity.map(|id| id.as_wire_str()),
+            "expires_at": claim_expires_at,
+            "scopes": claim_scopes,
         }
     });
     write_http_response(

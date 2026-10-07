@@ -110,6 +110,53 @@ fn ensure_replace_dir_writable(current_binary: &Path) -> Result<()> {
     }
 }
 
+/// Whether an in-place binary swap must be refused for this macOS install.
+///
+/// OTA-02 defense-in-depth (2026-09-24): replacing the executable inside a
+/// signed `.app` bundle invalidates the bundle signature and puts the app on
+/// the wrong side of Gatekeeper on its next launch. The supported in-repo
+/// desktop shape is UNSIGNED (signature check fails / unavailable), so the
+/// swap is signature-neutral and proceeds; a signed + notarized distribution
+/// must fail closed instead — updates for that shape go through
+/// distribution-side signed installers (Sparkle-style), not self-replace.
+/// An in-place `codesign -s -` re-sign remains rejected: ad-hoc re-signing
+/// silently DOWNGRADES a Developer ID signature, which is worse than the
+/// invalidation it papers over (batch H adjudication).
+///
+/// `signature_valid` is `None` when the signature state is unknown (no
+/// codesign available / unsupported platform); unknown is treated as
+/// unsigned — the swap proceeds, matching today's behavior.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn should_block_macos_swap(app_bundle: bool, signature_valid: Option<bool>) -> bool {
+    app_bundle && signature_valid == Some(true)
+}
+
+/// Verify the current binary's code signature via `codesign --verify`.
+///
+/// Returns `None` when the state cannot be determined (tool missing or the
+/// binary is not inside a bundle context codesign can verify standalone).
+/// Only compiled on macOS; other platforms get `None` via the cfg fallback.
+#[cfg(target_os = "macos")]
+fn macos_signature_valid(current_binary: &Path) -> Option<bool> {
+    let status = std::process::Command::new("/usr/bin/codesign")
+        .arg("--verify")
+        .arg(current_binary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    Some(status.success())
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(not(target_os = "macos"))]
+fn macos_signature_valid(_current_binary: &Path) -> Option<bool> {
+    // Decision core is exercised cross-platform in tests; the probe itself
+    // only exists on Darwin.
+    None
+}
+
 /// Self-replace the running binary with platform-appropriate restart handling.
 ///
 /// `is_desktop` selects the restart mode:
@@ -146,6 +193,58 @@ fn ensure_replace_dir_writable(current_binary: &Path) -> Result<()> {
 /// webui/desktop callers). Permission viability is checked BEFORE spawning
 /// (see [`ensure_replace_dir_writable`]) so an unwritable install directory
 /// fails closed instead of silently keeping the old binary.
+/// S9 (07 audit, batch G) hygiene: the self-replace scripts are assembled
+/// with `format!` into `sh -c` / PowerShell bodies. Paths are quoted, but a
+/// path embedding the quote character itself would break out of its quoting
+/// context. These escapers neutralize that residue (inputs are exe/temp
+/// paths — no remote attack surface per 03 §2-S9; this is hardening hygiene).
+fn sh_dq_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '"' | '$' | '`' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+// Windows-only escaper: on non-Windows targets the sole caller (the
+// self-replace PowerShell branch) is cfg'd out, which would otherwise
+// trip dead_code there.
+#[cfg(target_os = "windows")]
+fn ps_sq_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// PowerShell snippet that runs `body` only when the CURRENT process tree is
+/// NOT SCM-hosted — i.e. the parent process is not services.exe.
+///
+/// OTA-03 defense (2026-09-24): the only supported Windows WebUI deployment
+/// is the Startup-folder shortcut (a normal session process), so the
+/// Start-Process child relaunch is correct for it. If the client is ever
+/// wrapped by the Service Control Manager (NSSM / `sc create`), relaunching
+/// a session child from session 0 both orphans it and bypasses the wrapper's
+/// restart policy — the guard makes the helper log and skip instead, so the
+/// SCM wrapper's own recovery applies. Pure string builder so the contract
+/// is unit-testable on every platform.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn ps_restart_unless_scm_parent(body: &str, log_var: &str) -> String {
+    format!(
+        "$pp = (Get-CimInstance Win32_Process -Filter \"ProcessId=$PID\").ParentProcessId; \
+         $pn = if ($pp) {{ (Get-CimInstance Win32_Process -Filter \"ProcessId=$pp\").Name }} else {{ '' }}; \
+         if ($pn -eq 'services.exe') {{ \
+             'scm parent detected: skipping child relaunch (SCM restart policy applies)' | Out-File -FilePath {log} -Append; \
+         }} else {{ {body} }}"
+        ,
+        body = body,
+        log = log_var,
+    )
+}
+
 pub fn perform_self_replace(
     service_name: &str,
     current_binary: &Path,
@@ -165,12 +264,14 @@ pub fn perform_self_replace(
         // creates `wptsall-client.service`; the desktop has no unit, so
         // stop/start are harmless no-ops there and the restart is a
         // detached relaunch.
-        let cur = current_binary.display();
-        let new = new_binary.display();
-        let cur_dir = current_binary
-            .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
+        let cur = sh_dq_escape(&current_binary.display().to_string());
+        let new = sh_dq_escape(&new_binary.display().to_string());
+        let cur_dir = sh_dq_escape(
+            &current_binary
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| ".".to_string()),
+        );
         // Restart: the systemd user unit when it exists (service installs),
         // otherwise a nohup relaunch with the helper's inherited
         // environment — which is the client's own environment
@@ -216,6 +317,13 @@ pub fn perform_self_replace(
         // to a detached relaunch for raw binaries. Note: replacing a binary
         // inside a signed .app invalidates the bundle signature — distribute
         // desktop updates through signed installers when that matters.
+        // BUG-OTA-02 adjudication (12号批 H, 2026-09-23): in-repo desktop
+        // builds are unsigned, so the swap is signature-neutral today; for
+        // a signed + notarized distribution the fix is distribution-side
+        // (Sparkle-style signed installers). An in-place `codesign -s -`
+        // re-sign was considered and rejected: ad-hoc re-signing silently
+        // DOWNGRADES a Developer ID signature, which is worse than the
+        // invalidation it papers over.
         //
         // Darwin refuses rename(2) onto a running executable with ETXTBSY
         // ("Text file busy"), and the webui process stays alive whenever no
@@ -225,21 +333,34 @@ pub fn perform_self_replace(
         // ⇒ same filesystem ⇒ pure renames), unlink the current one (allowed
         // even while executing — the process keeps its vnode), then rename
         // the staged file into place.
-        let cur = current_binary.display();
-        let new = new_binary.display();
+        let cur = sh_dq_escape(&current_binary.display().to_string());
+        let new = sh_dq_escape(&new_binary.display().to_string());
         let mut app_dir = current_binary.to_path_buf();
         for _ in 0..3 {
             app_dir.pop();
         }
         let app_bundle = app_dir.extension().map(|ext| ext == "app").unwrap_or(false)
             && app_dir.is_dir();
-        let cur_dir = current_binary
-            .parent()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".to_string());
+        // OTA-02 fail-closed guard: a signed bundle must not be corrupted by
+        // an in-place swap (see should_block_macos_swap). Unsigned in-repo
+        // builds pass through unchanged.
+        if should_block_macos_swap(app_bundle, macos_signature_valid(current_binary)) {
+            anyhow::bail!(
+                "refusing self-replace: {} is inside a signature-valid .app bundle — \
+                 an in-place swap would invalidate its signature; distribute this \
+                 update as a signed installer instead",
+                current_binary.display()
+            );
+        }
+        let cur_dir = sh_dq_escape(
+            &current_binary
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| ".".to_string()),
+        );
         let restart = if is_desktop {
             if app_bundle {
-                format!("open \"{}\"", app_dir.display())
+                format!("open \"{}\"", sh_dq_escape(&app_dir.display().to_string()))
             } else {
                 format!("(nohup \"{cur}\" >/dev/null 2>&1 &)")
             }
@@ -286,12 +407,23 @@ pub fn perform_self_replace(
         // restores the old binary if the move keeps failing. Everything is
         // logged to wptsall-update.log next to the binary because the
         // helper's stdout/stderr are discarded.
-        let cur_str = current_binary.to_string_lossy();
-        let new_str = new_binary.to_string_lossy();
+        //
+        // BUG-OTA-03 adjudication (12号批 H, 2026-09-23): the premise
+        // "Windows WebUI service mode" does not exist in-repo — the only
+        // supported Windows WebUI deployment is the Startup-folder shortcut
+        // created by install-webui.ps1 (`--webui`), not an SCM service, so
+        // the Start-Process relaunch with the inherited environment IS the
+        // correct restart for the supported shape. If SCM-wrapped
+        // deployments (NSSM / sc create) ever become supported, the fix is
+        // to detect SCM parentage (session 0 / services.exe parent) and
+        // skip this child relaunch so the wrapper's own restart policy
+        // applies — see the 12号 batch H adjudication table.
+        let cur_str = ps_sq_escape(&current_binary.to_string_lossy());
+        let new_str = ps_sq_escape(&new_binary.to_string_lossy());
         let old_str = format!("{cur_str}.old");
         let old_leaf = current_binary
             .file_name()
-            .map(|leaf| format!("{}.old", leaf.to_string_lossy()))
+            .map(|leaf| ps_sq_escape(&format!("{}.old", leaf.to_string_lossy())))
             .ok_or_else(|| {
                 anyhow::anyhow!("current binary {} has no file name", current_binary.display())
             })?;
@@ -301,15 +433,19 @@ pub fn perform_self_replace(
             .join("wptsall-update.log")
             .to_string_lossy()
             .into_owned();
+        let log_path = ps_sq_escape(&log_path);
 
         // GUI restart must be visible (BUG-UPD-02); the WebUI service restart
         // stays hidden and inherits this process's environment (which carries
         // WPTSALL_WEB_UI=1 from the service/shortcut that started us).
+        // OTA-03: both restarts are guarded against SCM parentage — see
+        // ps_restart_unless_scm_parent.
         let restart = if is_desktop {
             format!("Start-Process -FilePath '{cur_str}'")
         } else {
             format!("Start-Process -FilePath '{cur_str}' -WindowStyle Hidden")
         };
+        let restart = ps_restart_unless_scm_parent(&restart, "$log");
 
         let ps = format!(
             "$ErrorActionPreference = 'Continue'; \
@@ -478,12 +614,42 @@ pub fn apply_ui_bundle(archive: &Path, install_root: &Path, ui_subdir: &str) -> 
     }
 
     let dest_ui = install_root.join("ui").join(ui_subdir);
-    if dest_ui.exists() {
-        std::fs::remove_dir_all(&dest_ui)
-            .with_context(|| format!("remove {}", dest_ui.display()))?;
+    // S10 (07 audit, batch G): the old flow removed dest_ui BEFORE copying,
+    // so a mid-copy failure (disk full / permission / dangling symlink)
+    // left the install root with NO UI. Stage-then-swap instead: copy into a
+    // sibling staging dir, move the old tree aside, rename the staging dir
+    // into place (same-parent rename = atomic-ish on POSIX), and restore the
+    // old tree if the final rename fails.
+    let staging = install_root
+        .join("ui")
+        .join(format!(".{}.staging-{}", ui_subdir, uuid::Uuid::new_v4()));
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(e) = copy_dir_recursive(&src_ui, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&unpack_dir);
+        return Err(e);
     }
-    std::fs::create_dir_all(dest_ui.parent().unwrap_or(install_root))?;
-    copy_dir_recursive(&src_ui, &dest_ui)?;
+    let backup = install_root
+        .join("ui")
+        .join(format!(".{}.old-{}", ui_subdir, uuid::Uuid::new_v4()));
+    let had_old = dest_ui.exists();
+    if had_old {
+        std::fs::rename(&dest_ui, &backup)
+            .with_context(|| format!("move {} aside", dest_ui.display()))?;
+    }
+    if let Err(e) = std::fs::rename(&staging, &dest_ui) {
+        // Roll back: the old tree (if any) goes back, staging is cleaned.
+        if had_old {
+            let _ = std::fs::rename(&backup, &dest_ui);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_dir_all(&unpack_dir);
+        return Err(e).context(format!("swap staged UI into {}", dest_ui.display()));
+    }
+    // New tree is live; the old one is now garbage.
+    if had_old {
+        let _ = std::fs::remove_dir_all(&backup);
+    }
 
     let ver_src = unpack_dir.join("VERSION-WEBUI");
     if ver_src.is_file() {
@@ -571,364 +737,4 @@ pub fn extract_update_binary(path: &Path) -> Result<PathBuf> {
     }
     let _ = std::fs::remove_dir_all(&unpack_dir);
     Ok(dest)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_sha256sums_standard() {
-        let content = "\
-abc123def456  wptsall-client-2.1.0-x86_64-unknown-linux-gnu\n\
-789abc123def  SHA256SUMS\n";
-        assert_eq!(
-            parse_sha256sums(content, "wptsall-client-2.1.0-x86_64-unknown-linux-gnu"),
-            Some("abc123def456".to_string())
-        );
-        assert_eq!(
-            parse_sha256sums(content, "SHA256SUMS"),
-            Some("789abc123def".to_string())
-        );
-        assert_eq!(parse_sha256sums(content, "nonexistent"), None);
-    }
-
-    #[test]
-    fn parse_sha256sums_star_mode() {
-        let content = "abc123 *wptsall-client-2.1.0-x86_64-unknown-linux-gnu\n";
-        assert_eq!(
-            parse_sha256sums(content, "wptsall-client-2.1.0-x86_64-unknown-linux-gnu"),
-            Some("abc123".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_url_replaces_both_placeholders() {
-        let template = "https://example.com/releases/download/client-wpplugin-v{version}/wptsall-client-{version}-{target}";
-        let url = resolve_url(template, "2.1.1");
-        assert_eq!(
-            url,
-            format!(
-                "https://example.com/releases/download/client-wpplugin-v2.1.1/wptsall-client-2.1.1-{}",
-                current_target_triple()
-            )
-        );
-    }
-
-    #[test]
-    fn resolve_url_replaces_platform() {
-        let template = "https://example.com/kits-webui-v{version}/kit-webui-{platform}.tar.gz";
-        let url = resolve_url(template, "2.1.0");
-        assert_eq!(
-            url,
-            format!(
-                "https://example.com/kits-webui-v2.1.0/kit-webui-{}.tar.gz",
-                current_platform()
-            )
-        );
-    }
-
-    #[test]
-    fn apply_ui_bundle_replaces_ui_tree() {
-        let root =
-            std::env::temp_dir().join(format!("wptsall-test-ui-root-{}", uuid::Uuid::new_v4()));
-        let stage = root.join("stage");
-        let ui_src = stage.join("ui/webui");
-        std::fs::create_dir_all(&ui_src).unwrap();
-        std::fs::write(ui_src.join("index.html"), b"<html>new</html>").unwrap();
-        std::fs::write(stage.join("VERSION-WEBUI"), b"9.9.9").unwrap();
-        let tar = root.join("webui-ui-9.9.9.tar.gz");
-        let status = std::process::Command::new("tar")
-            .args(["-czf"])
-            .arg(&tar)
-            .arg("-C")
-            .arg(&stage)
-            .arg(".")
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let install = root.join("install");
-        std::fs::create_dir_all(install.join("ui/webui")).unwrap();
-        std::fs::write(install.join("ui/webui/index.html"), b"<html>old</html>").unwrap();
-
-        apply_ui_bundle(&tar, &install, "webui").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(install.join("ui/webui/index.html")).unwrap(),
-            "<html>new</html>"
-        );
-        assert_eq!(
-            std::fs::read_to_string(install.join("VERSION-WEBUI")).unwrap(),
-            "9.9.9"
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn extract_update_binary_passthrough_raw() {
-        let dir = std::env::temp_dir().join("wptsall-test-extract-raw");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("raw-bin");
-        std::fs::write(&file_path, b"not-gzip").unwrap();
-        let out = extract_update_binary(&file_path).unwrap();
-        assert_eq!(out, file_path);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn extract_update_binary_from_kit_tarball() {
-        let dir =
-            std::env::temp_dir().join(format!("wptsall-test-extract-kit-{}", uuid::Uuid::new_v4()));
-        let stage = dir.join("wptsall-client-webui/bin");
-        std::fs::create_dir_all(&stage).unwrap();
-        let inner = stage.join("wptsall-client");
-        std::fs::write(&inner, b"fake-webui-binary").unwrap();
-        let tar_path = dir.join("kit-webui-linux-x86_64.tar.gz");
-        let status = std::process::Command::new("tar")
-            .args(["-czf"])
-            .arg(&tar_path)
-            .arg("-C")
-            .arg(&dir)
-            .arg("wptsall-client-webui")
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let extracted = extract_update_binary(&tar_path).unwrap();
-        let bytes = std::fs::read(&extracted).unwrap();
-        assert_eq!(bytes, b"fake-webui-binary");
-        let _ = std::fs::remove_file(&extracted);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn resolve_url_empty_template() {
-        assert_eq!(resolve_url("", "1.0.0"), "");
-    }
-
-    #[tokio::test]
-    async fn verify_checksum_correct() {
-        let dir = std::env::temp_dir().join("wptsall-test-checksum-correct");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("test-file");
-        let data = b"hello world";
-        std::fs::write(&file_path, data).unwrap();
-
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let expected = format!("{:x}", hasher.finalize());
-
-        assert!(verify_checksum(&file_path, &expected).await.is_ok());
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn verify_checksum_mismatch() {
-        let dir = std::env::temp_dir().join("wptsall-test-checksum-mismatch");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("test-file");
-        std::fs::write(&file_path, b"hello world").unwrap();
-
-        let result = verify_checksum(&file_path, "deadbeef").await;
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("checksum mismatch"));
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // -----------------------------------------------------------------------
-    // Self-replace permission semantics (2026-09-09). The helper is
-    // fire-and-forget with discarded output, so permission viability must
-    // be proven BEFORE spawning: fail closed on an unwritable install dir,
-    // and pin that the happy path actually swaps + chmods.
-    // -----------------------------------------------------------------------
-
-    #[cfg(unix)]
-    #[test]
-    fn perform_self_replace_fails_closed_on_unwritable_dir() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = std::env::temp_dir()
-            .join(format!("wptsall-test-selfreplace-ro-{}", uuid::Uuid::new_v4()));
-        let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let cur = bin.join("wptsall-client");
-        std::fs::write(&cur, b"old").unwrap();
-        let new = root.join("new-bin");
-        std::fs::write(&new, b"new").unwrap();
-
-        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
-        perms.set_mode(0o555);
-        std::fs::set_permissions(&bin, perms).unwrap();
-
-        let err = perform_self_replace("wptsall-selftest-ro", &cur, &new, false).unwrap_err();
-        assert!(
-            err.to_string().starts_with("install dir not writable:"),
-            "must fail closed with the stable prefix, got: {err}"
-        );
-
-        // Cleanup needs the write bit back.
-        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&bin, perms).unwrap();
-        // Neither file moved.
-        assert_eq!(std::fs::read(&cur).unwrap(), b"old");
-        assert_eq!(std::fs::read(&new).unwrap(), b"new");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn perform_self_replace_swaps_binary_and_marks_executable() {
-        // End-to-end helper round on a writable directory: the detached
-        // helper must actually move the new binary over the old path and
-        // mark it executable (the runner OTA lane asserts the same via
-        // mtime; this pins it at unit level without systemd — the
-        // systemctl calls fail harmlessly under `|| true`).
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = std::env::temp_dir()
-            .join(format!("wptsall-test-selfreplace-ok-{}", uuid::Uuid::new_v4()));
-        let bin = root.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let cur = bin.join("wptsall-client");
-        std::fs::write(&cur, b"old-binary").unwrap();
-        let new = root.join("new-bin");
-        std::fs::write(&new, b"new-binary").unwrap();
-
-        perform_self_replace("wptsall-selftest-ok", &cur, &new, false).unwrap();
-
-        let mut swapped = false;
-        for _ in 0..40 {
-            if std::fs::read(&cur).map(|b| b == b"new-binary").unwrap_or(false) {
-                swapped = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        }
-        assert!(swapped, "helper must move the new binary over the old path");
-
-        let mode = std::fs::metadata(&cur).unwrap().permissions().mode();
-        assert!(mode & 0o111 != 0, "replaced binary must be executable (mode {mode:o})");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    // -----------------------------------------------------------------------
-    // D-1 OTA rollback semantics (plan §7 / roadmap D-1; NEW-T-08). The
-    // secure pipeline (manifest sig → kit sig → sha256) fails closed BEFORE
-    // any disk mutation — already covered by run-ota-secure-suite.sh. These
-    // two tests pin the APPLY stage: fail-closed pre-flight (hard assert)
-    // and the missing mid-apply rollback (known_red pin).
-    // -----------------------------------------------------------------------
-
-    fn make_ui_install_root(tag: &str) -> PathBuf {
-        let root =
-            std::env::temp_dir().join(format!("wptsall-test-ota-{tag}-{}", uuid::Uuid::new_v4()));
-        let ui = root.join("install/ui/webui");
-        std::fs::create_dir_all(&ui).unwrap();
-        std::fs::write(ui.join("index.html"), b"<html>old</html>").unwrap();
-        std::fs::write(root.join("install/VERSION-WEBUI"), b"2.1.0").unwrap();
-        root
-    }
-
-    #[test]
-    fn apply_ui_bundle_corrupt_or_malformed_leaves_existing_ui_intact() {
-        // D-1 hard assert: a corrupt (non-gzip) or malformed (no ui/{subdir})
-        // bundle is rejected BEFORE the existing UI tree is touched.
-        let root = make_ui_install_root("premag");
-        let install = root.join("install");
-        let index = install.join("ui/webui/index.html");
-
-        // Case A: corrupt download — garbage bytes, tar must fail.
-        let corrupt = root.join("corrupt.tar.gz");
-        std::fs::write(&corrupt, b"this is not a gzip archive at all").unwrap();
-        let err = apply_ui_bundle(&corrupt, &install, "webui").unwrap_err();
-        assert!(
-            err.to_string().contains("tar failed"),
-            "corrupt archive must fail unpack, got: {err}"
-        );
-        assert_eq!(std::fs::read(&index).unwrap(), b"<html>old</html>");
-        assert_eq!(
-            std::fs::read(install.join("VERSION-WEBUI")).unwrap(),
-            b"2.1.0"
-        );
-
-        // Case B: well-formed tar.gz that simply has no ui/webui member.
-        let wrong = root.join("wrong-layout.tar.gz");
-        let stage = root.join("wrong-stage/ui/other");
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::write(stage.join("index.html"), b"<html>new</html>").unwrap();
-        let status = std::process::Command::new("tar")
-            .args(["-czf"])
-            .arg(&wrong)
-            .arg("-C")
-            .arg(&root.join("wrong-stage"))
-            .arg("ui")
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let err = apply_ui_bundle(&wrong, &install, "webui").unwrap_err();
-        assert!(
-            err.to_string().contains("UI bundle missing ui/webui"),
-            "malformed layout must be rejected pre-flight, got: {err}"
-        );
-        assert_eq!(std::fs::read(&index).unwrap(), b"<html>old</html>");
-        assert_eq!(
-            std::fs::read(install.join("VERSION-WEBUI")).unwrap(),
-            b"2.1.0"
-        );
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn apply_ui_bundle_mid_copy_failure_has_no_rollback_pin() {
-        // D-1 known_red pin: apply_ui_bundle removes the existing ui/{subdir}
-        // BEFORE copying the new tree, with no backup/restore step. A failure
-        // during the copy phase therefore leaves the install root with NO UI
-        // at all. Deterministic injection: a dangling symlink inside the
-        // bundle makes std::fs::copy fail mid-apply (the same class of
-        // failure as disk-full / permission errors on any real bundle).
-        //
-        // When the product lane adds rollback (e.g. move dest aside first and
-        // restore on copy failure, or unpack to a staging dir and swap),
-        // INVERT this pin: assert the old tree is restored byte-identically.
-        let root = make_ui_install_root("norollback");
-        let install = root.join("install");
-        let old_index = install.join("ui/webui/index.html");
-        assert!(old_index.is_file());
-
-        let stage = root.join("stage/ui/webui");
-        std::fs::create_dir_all(&stage).unwrap();
-        std::os::unix::fs::symlink("no-such-target-xyz", stage.join("broken")).unwrap();
-        let bundle = root.join("bad-midcopy.tar.gz");
-        let status = std::process::Command::new("tar")
-            .args(["-czf"])
-            .arg(&bundle)
-            .arg("-C")
-            .arg(&root.join("stage"))
-            .arg("ui")
-            .status()
-            .unwrap();
-        assert!(status.success());
-
-        let err = apply_ui_bundle(&bundle, &install, "webui");
-        assert!(err.is_err(), "dangling symlink must fail the copy phase");
-
-        // Pin: the old UI tree is already gone — no rollback happened.
-        assert!(
-            !old_index.exists(),
-            "PIN: old UI must still be present after a mid-apply failure once rollback exists"
-        );
-        assert!(
-            !install.join("ui/webui.bak").exists() && !install.join("ui/webui.old").exists(),
-            "PIN: no backup artifact is kept today"
-        );
-
-        std::fs::remove_dir_all(&root).ok();
-    }
 }
