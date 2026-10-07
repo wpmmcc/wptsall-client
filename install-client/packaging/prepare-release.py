@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
@@ -20,6 +21,14 @@ INSTALL = Path(__file__).resolve().parents[1]
 
 def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def signing_metadata(public_key: str) -> dict:
+    raw = base64.b64decode(public_key, validate=True)
+    if len(raw) != 42 or raw[:2] not in (b"Ed", b"ED"):
+        raise ValueError("invalid minisign public key")
+    return {"key_id": f"{int.from_bytes(raw[2:10], 'little'):016X}",
+            "algorithm": "minisign", "public_key_b64": public_key}
 
 
 def prepare(assets: Path, version: str, repository: str, tag: str,
@@ -97,8 +106,7 @@ def prepare(assets: Path, version: str, repository: str, tag: str,
                 "signature_url_template": f"{base}/{signature}.minisig", "mandatory": False,
             }
     data = {"schema_version": 1, "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "products": products, "signing": {
-                "algorithm": "minisign", "public_key_b64": public_key}}
+            "products": products, "signing": signing_metadata(public_key)}
     (assets / "releases.json").write_text(json.dumps({"success": True, "data": data}, indent=2))
     # Sign every published asset, including native packages and package records.
     for path in sorted(assets.iterdir()):

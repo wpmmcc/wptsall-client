@@ -211,9 +211,34 @@ pub fn resolve_releases_url(server_base: &str) -> String {
     DEFAULT_PUBLIC_RELEASES_URL.to_string()
 }
 
-#[allow(dead_code)]
-pub fn default_http_client() -> reqwest::Client {
-    reqwest::Client::new()
+fn ota_redirect_allowed(url: &reqwest::Url, previous: &[reqwest::Url]) -> bool {
+    let loopback = url
+        .host_str()
+        .and_then(|host| host.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok())
+        .is_some_and(|ip| ip.is_loopback());
+    previous.len() < 5
+        && url.username().is_empty()
+        && url.password().is_none()
+        && (url.scheme() == "https"
+            || (url.scheme() == "http"
+                && loopback
+                && previous.iter().all(|prior| prior.scheme() != "https")))
+}
+
+/// Credential-free OTA transport, separate from the no-redirect WordPress client.
+/// HTTPS CDN redirects are bounded; local HTTP fixtures cannot downgrade HTTPS.
+pub fn default_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(900))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if ota_redirect_allowed(attempt.url(), attempt.previous()) {
+                attempt.follow()
+            } else {
+                attempt.error("OTA redirect refused")
+            }
+        }))
+        .build()
 }
 
 /// Fetch releases manifest and decide binary + UI update availability for `axis`.

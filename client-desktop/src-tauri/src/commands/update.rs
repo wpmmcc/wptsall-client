@@ -35,7 +35,7 @@ fn skip_security_allowed() -> bool {
 
 #[tauri::command]
 pub async fn check_for_update() -> Result<UpdateCheckResult, String> {
-    let http = default_http_client();
+    let http = default_http_client().map_err(|_| "OTA transport unavailable".to_string())?;
     check_for_desktop_update(&http, &server_base())
         .await
         .map_err(|e| format!("{e:#}"))
@@ -51,7 +51,7 @@ pub async fn perform_update<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Resu
     }
     let _guard = UpdateGuard;
 
-    let http = default_http_client();
+    let http = default_http_client().map_err(|_| "OTA transport unavailable".to_string())?;
     let check = check_for_desktop_update(&http, &server_base())
         .await
         .map_err(|e| format!("update check failed: {e:#}"))?;

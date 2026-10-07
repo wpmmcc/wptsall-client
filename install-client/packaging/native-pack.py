@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import zipfile
 
 INSTALL = Path(__file__).resolve().parents[1]
@@ -75,6 +76,28 @@ Categories=Utility;
     run("dpkg-deb", "--contents", str(asset))
 
 
+def create_dmg(volume: Path, stage: Path, asset: Path, title: str) -> None:
+    if asset.exists():
+        raise FileExistsError("native package output exists")
+    for attempt in range(3):
+        # Failed images remain in the owned temporary stage, never at the
+        # publication path. Only macOS's transient busy error is retried.
+        candidate = stage / f"image-{attempt}.dmg"
+        result = subprocess.run(
+            ["hdiutil", "create", "-volname", title, "-srcfolder", str(volume),
+             "-format", "UDZO", str(candidate)], capture_output=True, text=True)
+        print(result.stdout, end="")
+        print(result.stderr, end="", file=sys.stderr)
+        if result.returncode == 0:
+            run("hdiutil", "verify", str(candidate))
+            with asset.open("xb") as destination, candidate.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+            return
+        if "Resource busy" not in result.stderr or attempt == 2:
+            result.check_returncode()
+        time.sleep(2 * (attempt + 1))
+
+
 def dmg(tree: Path, stage: Path, asset: Path, product: str, version: str, auth: Path) -> None:
     title = f"WPTSALL {product.capitalize()}"
     volume = stage / "volume"
@@ -108,9 +131,16 @@ exec "$HERE/../Resources/kit/bin/wptsall-client" "$@"
         }, stream)
     shutil.copy2(auth, volume / auth.name)
     (volume / "Applications").symlink_to("/Applications", target_is_directory=True)
-    run("hdiutil", "create", "-volname", title, "-srcfolder", str(volume),
-        "-format", "UDZO", str(asset))
-    run("hdiutil", "verify", str(asset))
+    create_dmg(volume, stage, asset, title)
+
+
+def nsis_path(path: Path | str) -> str:
+    # Native Windows NSIS uses backslash paths for File/OutFile. Converting
+    # drive paths to forward slashes breaks its file enumeration.
+    value = str(path)
+    if '"' in value or "$" in value or "\n" in value or "\r" in value:
+        raise ValueError("unsupported NSIS package path")
+    return value
 
 
 def nsis(tree: Path, stage: Path, asset: Path, product: str, version: str) -> None:
@@ -118,18 +148,13 @@ def nsis(tree: Path, stage: Path, asset: Path, product: str, version: str) -> No
     ident = "wptsall-client-webui" if product == "webui" else "wptsall-client"
     # Per-user, non-elevated installation. A manifest enumerates only package
     # members for uninstall; config/data created by the app are never removed.
-    def quote(path: Path | str) -> str:
-        value = str(path).replace("\\", "/")
-        if '"' in value or "$" in value or "\n" in value:
-            raise ValueError("unsupported NSIS package path")
-        return value
     files = sorted(path for path in tree.rglob("*") if path.is_file())
     install = ['SetOutPath "$INSTDIR"']
     uninstall = []
     for path in files:
         relative = path.relative_to(tree)
         parent = str(relative.parent).replace("/", "\\")
-        install += [f'SetOutPath "$INSTDIR\\{parent}"', f'File "{quote(path)}"']
+        install += [f'SetOutPath "$INSTDIR\\{parent}"', f'File "{nsis_path(path)}"']
         uninstall.append(f'Delete "$INSTDIR\\{str(relative).replace("/", chr(92))}"')
     folders = sorted({parent for path in files for parent in path.relative_to(tree).parents},
                      key=lambda p: (len(p.parts), str(p)), reverse=True)
@@ -143,7 +168,7 @@ set "WPTSALL_WEB_UI=1"
 set "WPTSALL_WEB_UI_BIND=127.0.0.1:8977"
 "%~dp0bin\\wptsall-client.exe" %*
 """)
-        install += ['SetOutPath "$INSTDIR"', f'File "{quote(stage / "launch-webui.cmd")}"']
+        install += ['SetOutPath "$INSTDIR"', f'File "{nsis_path(stage / "launch-webui.cmd")}"']
         uninstall += ['Delete "$INSTDIR\\launch-webui.cmd"']
         command = r"$INSTDIR\launch-webui.cmd"
     else:
@@ -151,7 +176,7 @@ set "WPTSALL_WEB_UI_BIND=127.0.0.1:8977"
     script = f"""Unicode true
 RequestExecutionLevel user
 Name "{name}"
-OutFile "{quote(asset)}"
+OutFile "{nsis_path(asset)}"
 InstallDir "$LOCALAPPDATA\\Programs\\{ident}"
 !include "MUI2.nsh"
 !insertmacro MUI_PAGE_DIRECTORY

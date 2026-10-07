@@ -186,7 +186,7 @@ pub async fn fetch_verified_releases_data(
             .context("releases manifest minisign verify")?;
             let _ = std::fs::remove_file(&tmp_json);
             let _ = std::fs::remove_file(&sig_path);
-            let _ = SignedReleaseManifest::from_json(&serde_json::to_string(&data)?);
+            SignedReleaseManifest::from_json(&serde_json::to_string(&data)?)?;
             Ok(data)
         }
         Err(e) if require_sig => Err(e).context(

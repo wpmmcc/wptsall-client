@@ -1642,11 +1642,15 @@ async fn handle_update_check(
     socket: &mut TcpStream,
     state: &Arc<Mutex<WebUiState>>,
 ) -> anyhow::Result<()> {
-    let (server_base, http_client) = {
+    let server_base = {
         let guard = state.lock().await;
-        (guard.server_base.clone(), guard.http_client.clone())
+        guard.server_base.clone()
     };
-    let outcome = crate::updater::check_for_update(&http_client, &server_base).await;
+    let outcome = async {
+        let http_client = crate::updater::default_http_client()?;
+        crate::updater::check_for_update(&http_client, &server_base).await
+    }
+    .await;
     match &outcome {
         Ok(result) => {
             crate::logging::log_event_global(
@@ -1759,13 +1763,19 @@ async fn handle_perform_update(
     socket: &mut TcpStream,
     state: &Arc<Mutex<WebUiState>>,
 ) -> anyhow::Result<()> {
-    let (server_base, http_client, update_flag) = {
+    let (server_base, update_flag) = {
         let guard = state.lock().await;
         (
             guard.server_base.clone(),
-            guard.http_client.clone(),
             guard.update_in_progress.clone(),
         )
+    };
+    let http_client = match crate::updater::default_http_client() {
+        Ok(client) => client,
+        Err(_) => {
+            return write_error_response(socket, "UPDATE_CHECK_FAILED", "OTA transport unavailable")
+                .await;
+        }
     };
 
     // Concurrent update guard
