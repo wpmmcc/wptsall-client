@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -53,6 +54,7 @@ def assemble(product: str, binary: Path, ui: Path, version: str, platform: str,
             "strip=build-profile\nobfuscation=none\n", encoding="utf-8")
         shutil.copy2(INSTALL / "shared/PRODUCTION-FIRST-LAUNCH-AUTHORIZATION.md",
                      tree / "FIRST-LAUNCH-AUTHORIZATION.md")
+        (tree / "FIRST-LAUNCH-AUTHORIZATION.md").chmod(0o644)
         if not platform.startswith("windows-"):
             launcher = tree / "bin" / ("wptsall-webui-start" if product == "webui"
                                        else "wptsall-start")
@@ -72,7 +74,7 @@ def assemble(product: str, binary: Path, ui: Path, version: str, platform: str,
         temporary_asset = Path(temporary) / asset.name
         with tarfile.open(temporary_asset, "w:gz") as archive:
             archive.add(tree, arcname=root_name)
-        subprocess.run(["bash", (INSTALL / "packaging/validate-kit.sh").as_posix(),
+        subprocess.run([sys.executable, str(INSTALL / "packaging/validate-kit.py"),
                         product, temporary_asset.as_posix(), "--version", version], check=True)
         with asset.open("xb") as target, temporary_asset.open("rb") as source:
             shutil.copyfileobj(source, target)

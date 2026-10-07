@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 
@@ -52,7 +53,7 @@ def prepare(assets: Path, version: str, repository: str, tag: str,
                 path = assets / name
                 if path.is_symlink() or not path.is_file() or sha(path) != record["assets"][name]:
                     raise ValueError("runner package hash mismatch")
-            subprocess.run(["bash", (INSTALL / "packaging/validate-kit.sh").as_posix(),
+            subprocess.run([sys.executable, str(INSTALL / "packaging/validate-kit.py"),
                             product, kit.as_posix(), "--version", version], check=True)
             with tarfile.open(kit) as archive:
                 if archive.extractfile(root + "/PLATFORM.txt").read().decode().strip() != platform:

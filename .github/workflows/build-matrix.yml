@@ -8,7 +8,9 @@ permissions:
   contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Keep earlier owned candidates running so failures and completed platform
+  # evidence are not erased by a packaging-only correction.
+  cancel-in-progress: false
 jobs:
   package:
     name: ${{ matrix.product }} kit and native package (${{ matrix.platform }})
@@ -58,9 +60,17 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install nsis --yes --no-progress
-          if ($LASTEXITCODE -notin @(0, 3010)) { exit $LASTEXITCODE }
-          Join-Path ${env:ProgramFiles(x86)} 'NSIS' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $directory = Join-Path ${env:ProgramFiles(x86)} 'NSIS'
+          if (-not (Test-Path (Join-Path $directory 'makensis.exe'))) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              choco install nsis --yes --no-progress
+              if ($LASTEXITCODE -in @(0, 3010)) { break }
+              if ($attempt -eq 3) { exit $LASTEXITCODE }
+              Start-Sleep -Seconds (10 * $attempt)
+            }
+          }
+          if (-not (Test-Path (Join-Path $directory 'makensis.exe'))) { throw 'NSIS executable missing after installation' }
+          $directory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -98,12 +108,10 @@ jobs:
             --version "$version" --platform "$PLATFORM" --triple "$triple" --out "$RUNNER_TEMP/kits"
           python install-client/packaging/native-pack.py "$PRODUCT" \
             --kit "$RUNNER_TEMP/kits/kit-$PRODUCT-$PLATFORM.tar.gz" --version "$version" \
-            --kinds "portable,$KIND" --out "$RUNNER_TEMP/native"
+            --kinds "portable,$KIND" --out "$RUNNER_TEMP/kits"
       - name: Upload current candidate products
         uses: actions/upload-artifact@v4
         with:
           name: candidate-${{ matrix.product }}-${{ matrix.platform }}
-          path: |
-            ${{ runner.temp }}/kits/*.tar.gz
-            ${{ runner.temp }}/native/*
+          path: ${{ runner.temp }}/kits/*
           if-no-files-found: error

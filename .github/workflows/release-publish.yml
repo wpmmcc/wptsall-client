@@ -38,7 +38,10 @@ jobs:
           set -euo pipefail
           branch="$(gh api "repos/{owner}/{repo}" --jq .default_branch)"
           head="$(gh api "repos/{owner}/{repo}/branches/$branch" --jq .commit.sha)"
-          [ "$GITHUB_REF_NAME" = "$branch" ] && [ "$GITHUB_SHA" = "$head" ]
+          if [ "$GITHUB_REF_NAME" != "$branch" ] || [ "$GITHUB_SHA" != "$head" ]; then
+            echo "Release refused: candidate is not current default-branch HEAD." >&2
+            exit 1
+          fi
           version="$(tr -d '\r\n' < VERSION)"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
           # Listing refs distinguishes a free tag from an API/auth failure.
@@ -100,6 +103,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Assert workflow and binary pin the same public release key
         run: grep -F "$RELEASE_PUBKEY_B64" libs/wptsall-client-security/build.rs
+      - name: Revalidate private authority after the platform builds
+        env:
+          ACCEPTANCE: ${{ inputs.acceptance }}
+          SIGNATURE: ${{ inputs.acceptance_signature }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ACCEPTANCE" > "$RUNNER_TEMP/acceptance.json"
+          printf '%s\n' "$SIGNATURE" > "$RUNNER_TEMP/acceptance.json.minisig"
+          minisign -Vm "$RUNNER_TEMP/acceptance.json" -P "$RELEASE_PUBKEY_B64"
+          python3 install-client/packaging/release-acceptance.py "$RUNNER_TEMP/acceptance.json" \
+            --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --version "$(tr -d '\r\n' < VERSION)"
       - name: Prepare and verify all signed candidate products
         env:
           RELEASE_KEY: ${{ secrets.WPTSALL_RELEASE_MINISIGN_KEY }}

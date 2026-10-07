@@ -11,6 +11,7 @@ import plistlib
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -192,7 +193,7 @@ def main() -> None:
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version):
         parser.error("version must be an exact three-part version")
     kit, out = args.kit.resolve(strict=True), args.out.resolve()
-    run("bash", (INSTALL / "packaging/validate-kit.sh").as_posix(), args.product,
+    run(sys.executable, str(INSTALL / "packaging/validate-kit.py"), args.product,
         kit.as_posix(), "--version", args.version)
     kinds = args.kinds.split(",")
     if len(set(kinds)) != len(kinds) or any(k not in {"tree", "portable", "deb", "dmg", "nsis"} for k in kinds):
@@ -246,6 +247,7 @@ def main() -> None:
             raise RuntimeError("existing authorization document differs")
         if not auth_out.exists():
             shutil.copy2(auth, auth_out)
+            auth_out.chmod(0o644)
         write(checksum, "".join(f"{digest(path)}  {path.name}\n" for path in [*assets, auth_out]))
         write(record, json.dumps({
             "format": "source-free-native-pack-v1",
