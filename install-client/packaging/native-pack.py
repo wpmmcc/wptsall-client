@@ -43,7 +43,7 @@ def deb(tree: Path, stage: Path, asset: Path, product: str, version: str, arch: 
     name = "wptsall-client-webui" if product == "webui" else "wptsall-client"
     root = stage / "deb"
     shutil.copytree(tree, root / "opt" / name)
-    deps = "" if product == "webui" else "libwebkit2gtk-4.1-0, libgtk-3-0"
+    deps = "" if product == "webui" else "libwebkit2gtk-4.1-0, libgtk-3-0, libayatana-appindicator3-1"
     write(root / "DEBIAN/control", f"""Package: {name}
 Version: {version}
 Section: utils
