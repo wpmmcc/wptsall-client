@@ -86,7 +86,7 @@ jobs:
           if [ "$PRODUCT" = webui ]; then
             cargo build --locked --release --bin wptsall-client --manifest-path client-wpplugin/source/Cargo.toml
           else
-            cargo build --locked --release --manifest-path client-desktop/src-tauri/Cargo.toml
+            cargo build --locked --release --features custom-protocol --manifest-path client-desktop/src-tauri/Cargo.toml
           fi
       - name: Assemble validated kit and native installer
         env:

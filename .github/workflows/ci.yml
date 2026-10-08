@@ -48,4 +48,4 @@ jobs:
       - name: Check production Rust core
         run: cargo check --locked --lib --bins --manifest-path client-wpplugin/source/Cargo.toml
       - name: Check production Desktop
-        run: cargo check --locked --manifest-path client-desktop/src-tauri/Cargo.toml
+        run: cargo check --locked --features custom-protocol --manifest-path client-desktop/src-tauri/Cargo.toml
