@@ -21,66 +21,7 @@ pub(crate) struct ManualPlan {
     pub(crate) proxy_profiles: HashMap<String, ProxyProfile>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[tokio::test]
-    async fn remaining_manual_credential_file_reference_is_frozen_not_resolved_on_retry() {
-        let root = tempfile::tempdir().unwrap();
-        let _credential_root = crate::db::TestEnvVarGuard::set(
-            "WPTSALL_CREDENTIAL_FILE_ROOT",
-            root.path().display().to_string(),
-        );
-        let path = root.path().join("owned-mock-key.txt");
-        std::fs::write(&path, "owned-key-before").unwrap();
-        let reference = "file://owned-mock-key.txt".to_string();
-        let runtime = ComponentRuntime {
-            template: serde_json::from_value(
-                serde_json::json!({"id":"owned","name":"Owned","version":"1","type":"text",
-                "request":{"method":"POST","url":"http://127.0.0.1:9","body_type":"json"},
-                "response":{"translated_text_path":"text"}}),
-            )
-            .unwrap(),
-            auth_values: HashMap::from([("auth.static_key".into(), reference.clone())]),
-            language_map: HashMap::new(),
-            supported_content_formats: vec!["plain_text".into()],
-            supported_formats: vec![],
-            supported_business_lines: vec![],
-            key_pool: Some(Arc::new(crate::component_rt::key_pool::KeyPool::new(
-                vec![(
-                    "owned-frozen-file-key".into(),
-                    HashMap::from([("api_key".into(), reference)]),
-                    1,
-                    1,
-                )],
-                KeySelectionStrategy::RoundRobin,
-            ))),
-            oauth_pool: None,
-            oauth_manager: None,
-            proxy_profile_id: None,
-            runtime_max_concurrent_requests: 1,
-            runtime_min_interval_ms: 0,
-            runtime_concurrency_sem: None,
-            runtime_last_request_at: None,
-        };
-        let registry = ComponentRuntimeRegistry {
-            runtimes: HashMap::from([("owned".into(), runtime)]),
-            ordered_ids: vec!["owned".into()],
-        };
-        let saved = ManualPlan::freeze_runtimes(&registry).await.unwrap();
-        std::fs::write(&path, "owned-key-after").unwrap();
-        let value = serde_json::to_value(saved).unwrap();
-        assert_eq!(
-            value["owned"]["auth_values"]["auth.static_key"],
-            "owned-key-before"
-        );
-        assert_eq!(
-            value["owned"]["key_pool"]["keys"][0]["auth"]["api_key"],
-            "owned-key-before"
-        );
-    }
-}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

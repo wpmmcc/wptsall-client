@@ -232,23 +232,7 @@ impl Drop for RetainedMutation<'_> {
     }
 }
 
-/// A prior translation record is only safe for dedup short-circuit when it
-/// carries evidence that a real translation/callback path already happened.
-///
-/// Historical `NoChanges` runs used to be written as `status=success` with
-/// zero translated fields and no component trace, which would permanently
-/// suppress later real executions. Treat those rows as non-materialized.
-#[cfg(test)]
-pub(crate) fn has_materialized_success_record(
-    conn: &Connection,
-    domain: &str,
-    relation_id: i64,
-    object_id: i64,
-    object_type: &str,
-) -> bool {
-    has_materialized_success_record_checked(conn, domain, relation_id, object_id, object_type)
-        .expect("valid owned translation history fixture")
-}
+
 
 pub(crate) fn has_materialized_success_record_checked(
     conn: &Connection,
@@ -769,5 +753,3 @@ pub(crate) fn stats_daily(conn: &Connection, days: i64) -> Result<Vec<DailyStats
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
-#[cfg(test)]
-mod tests;

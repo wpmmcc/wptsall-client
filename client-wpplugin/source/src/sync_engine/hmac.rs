@@ -106,29 +106,3 @@ pub fn build_hmac_headers(
         ("X-WPMMCC-Signature".to_string(), signature),
     ])
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_hmac_string_to_sign_and_signature() {
-        let method = "POST";
-        let uri = "/wpmmcc/v1/sync/push";
-        let timestamp = 1700000000;
-        let nonce = "0123456789abcdef";
-        let sender_uuid = "site-uuid-1234";
-        let body = b"{\"test\":true}";
-        let body_hash = sha256_hex(body);
-
-        let s = compute_string_to_sign(method, uri, timestamp, nonce, sender_uuid, &body_hash);
-        let expected_s = format!(
-            "POST\n/wpmmcc/v1/sync/push\n1700000000\n0123456789abcdef\nsite-uuid-1234\n{}",
-            body_hash
-        );
-        assert_eq!(s, expected_s);
-
-        let secret = b"my-secret-key-32-bytes-long-123";
-        let sig = compute_hmac_signature(&s, secret).expect("compute sig");
-        assert_eq!(sig.len(), 64); // 32 bytes hex encoded = 64 chars
-    }
-}

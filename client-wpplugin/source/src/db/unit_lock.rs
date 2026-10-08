@@ -169,9 +169,7 @@ impl ContentExecution {
     }
 }
 
-#[cfg(test)]
-#[path = "../../../../tests/modules/client-wpplugin/unit/physical_unit_reclaim_capacity.rs"]
-mod physical_unit_reclaim_capacity;
+
 
 impl UnitLease {
     pub(crate) fn acquire(

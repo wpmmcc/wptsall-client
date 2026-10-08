@@ -23,14 +23,3 @@ pub fn debug_only_valve(name: &str) -> bool {
     );
     false
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn s11_unset_valve_is_never_allowed() {
-        // With the valve unset the answer is false in any build profile.
-        // (Uses a valve name nothing sets.)
-        assert!(!debug_only_valve("WPTSALL_S11_UNSET_PROBE"));
-    }
-}

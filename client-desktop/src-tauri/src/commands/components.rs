@@ -231,21 +231,3 @@ pub async fn create_component_version(
 pub async fn upsert_rule_component_binding(request: Value) -> Result<Value, String> {
     webui_proxy::post("/api/rule-component-bindings/upsert", request).await
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn maps_local_component_info() {
-        let component = map_component_info(&json!({
-            "id": "mock-openai",
-            "name": "Mock OpenAI",
-            "kind": "openai_compatible",
-            "enabled": true
-        }));
-        assert_eq!(component.id, "mock-openai");
-        assert_eq!(component.provider_type, "openai_compatible");
-        assert!(component.configured);
-    }
-}

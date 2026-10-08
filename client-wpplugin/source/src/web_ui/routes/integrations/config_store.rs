@@ -4,29 +4,7 @@ use std::path::Path;
 
 const JOURNAL_PREFIX: &str = "integration-save-v1:";
 
-#[cfg(test)]
-fn owned_process_stage(stage: &str) -> anyhow::Result<()> {
-    if std::env::var("WPTSALL_OWNED_CONFIG_PROCESS").as_deref() != Ok("owned-config-process-v1")
-        || std::env::var("WPTSALL_OWNED_CONFIG_STAGE").as_deref() != Ok(stage)
-    {
-        return Ok(());
-    }
-    let root = std::path::PathBuf::from(std::env::var("WPTSALL_DATA_DIR")?);
-    let label = std::env::var("WPTSALL_OWNED_CONFIG_LABEL")?;
-    anyhow::ensure!(
-        label
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
-        "invalid owned configuration process label"
-    );
-    crate::bindings::atomic_file::install_new(
-        &root.join(format!("{label}.{stage}")),
-        b"owned committed configuration boundary",
-    )?;
-    loop {
-        std::thread::park();
-    }
-}
+
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,8 +88,7 @@ fn recover<D: Serialize + DeserializeOwned + Default>(
         digest(&read::<D>(path)?)? == after_digest,
         "integration save file projection was not confirmed; receipt retained"
     );
-    #[cfg(test)]
-    owned_process_stage("projected")?;
+    ;
     let projected_bytes = std::fs::read(path)?;
     lease.assert_owner()?;
     anyhow::ensure!(
@@ -268,8 +245,7 @@ pub(in crate::web_ui::routes) async fn save_config<D: Serialize + DeserializeOwn
         tx.commit()?;
         Ok(())
     })?;
-    #[cfg(test)]
-    owned_process_stage("prepared")?;
+    ;
     // This committed snapshot is the sole authority across the SQLite/file
     // boundary. Restart replays it, never a new token or an operator's newer file.
     recover::<D>(&mut conn, lease.path(), key, &lease)?;

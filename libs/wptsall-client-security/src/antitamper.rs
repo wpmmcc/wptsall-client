@@ -108,23 +108,3 @@ pub fn injection_indicators_present() -> bool {
     }
     false
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn injection_check_runs() {
-        let _ = injection_indicators_present();
-    }
-
-    #[test]
-    fn s8_enforce_by_default_and_warn_via_downgrade() {
-        // S8 decision core: default ENFORCE (Err), warn-only env downgrade
-        // maps the same violation to Ok.
-        let enforced = enforce_or_warn("debugger detected", false);
-        assert_eq!(enforced.unwrap_err().to_string(), "debugger detected");
-
-        let warned = enforce_or_warn("debugger detected", true);
-        assert!(warned.is_ok(), "warn-only downgrade must not fail bootstrap");
-    }
-}

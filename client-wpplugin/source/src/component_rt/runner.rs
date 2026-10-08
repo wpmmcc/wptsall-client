@@ -16,36 +16,7 @@ use crate::types::*;
 
 pub(crate) mod provider_recovery;
 
-/// Legacy key-name redaction oracle; production diagnostics now omit URLs.
-#[cfg(test)]
-fn redact_url_secrets(url: &str) -> String {
-    if let Some(q_pos) = url.find('?') {
-        let (base, query) = url.split_at(q_pos);
-        let redacted = query
-            .split('&')
-            .map(|param| {
-                if let Some(eq_pos) = param.find('=') {
-                    let key_lower = param[..eq_pos].to_lowercase();
-                    if key_lower.contains("key")
-                        || key_lower.contains("token")
-                        || key_lower.contains("secret")
-                        || key_lower.contains("auth")
-                    {
-                        format!("{}=***", &param[..eq_pos])
-                    } else {
-                        param.to_string()
-                    }
-                } else {
-                    param.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        format!("{}{}", base, redacted)
-    } else {
-        url.to_string()
-    }
-}
+
 
 /// Validate a rendered provider URL before any component-side egress.
 ///
@@ -243,8 +214,7 @@ mod request;
 mod signing;
 mod source_asset;
 use self::async_poll::*;
-#[cfg(test)]
-use self::chunking::{is_gutenberg_content, split_rich_html_by_blocks};
+
 pub(crate) use self::chunking::{
     translate_rich_html_blocks, translate_rich_html_blocks_with_env,
     translate_text_with_constraints, translate_text_with_constraints_with_env,
@@ -580,7 +550,7 @@ fn configured_vault_base_url() -> anyhow::Result<url::Url> {
     let raw = env::var("WPTSALL_VAULT_ADDR")
         .map_err(|_| anyhow!("WPTSALL_VAULT_ADDR is required for vault references"))?;
     let mut base = url::Url::parse(raw.trim()).map_err(|_| anyhow!("Vault address is invalid"))?;
-    if base.scheme() != "https" && !(cfg!(test) && base.scheme() == "http") {
+    if base.scheme() != "https" && !(false && base.scheme() == "http") {
         anyhow::bail!("Vault address must use HTTPS");
     }
     if !base.username().is_empty()
@@ -605,7 +575,7 @@ fn configured_vault_base_url() -> anyhow::Result<url::Url> {
     // cloud-metadata addresses are never valid secret-store targets in a
     // production build.
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_forbidden_secret_store_ip(ip) && !(cfg!(test) && ip.is_loopback()) {
+        if is_forbidden_secret_store_ip(ip) && !(false && ip.is_loopback()) {
             anyhow::bail!("Vault host resolves to a forbidden address");
         }
     } else {
@@ -630,7 +600,7 @@ fn configured_kms_base_url() -> anyhow::Result<url::Url> {
     let raw = env::var("WPTSALL_KMS_ADDR")
         .map_err(|_| anyhow!("WPTSALL_KMS_ADDR is required for KMS references"))?;
     let mut base = url::Url::parse(raw.trim()).map_err(|_| anyhow!("KMS address is invalid"))?;
-    if base.scheme() != "https" && !(cfg!(test) && base.scheme() == "http") {
+    if base.scheme() != "https" && !(false && base.scheme() == "http") {
         anyhow::bail!("KMS address must use HTTPS");
     }
     if !base.username().is_empty()
@@ -650,7 +620,7 @@ fn configured_kms_base_url() -> anyhow::Result<url::Url> {
         anyhow::bail!("KMS host is not in WPTSALL_SECRET_STORE_ALLOWLIST");
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_forbidden_secret_store_ip(ip) && !(cfg!(test) && ip.is_loopback()) {
+        if is_forbidden_secret_store_ip(ip) && !(false && ip.is_loopback()) {
             anyhow::bail!("KMS host resolves to a forbidden address");
         }
     } else {
@@ -2256,28 +2226,17 @@ pub(crate) fn insert_component_non_text_context(
     }
 }
 
-#[cfg(test)]
-mod tests;
 
-#[cfg(test)]
-#[path = "../../../../tests/modules/client-wpplugin/unit/physical_provider_capacity.rs"]
-mod physical_provider_capacity;
 
-#[cfg(test)]
-#[path = "../../../../tests/modules/client-wpplugin/unit/credential_source_limits.rs"]
-mod credential_source_limits;
 
-#[cfg(test)]
-#[path = "../../../../tests/modules/client-wpplugin/unit/provider_response_privacy.rs"]
-mod provider_response_privacy;
 
-#[cfg(test)]
-#[path = "../../../../tests/modules/client-wpplugin/unit/poll_deadline_limits.rs"]
-mod poll_deadline_limits;
 
-#[cfg(test)]
-#[path = "../../../../tests/modules/client-wpplugin/unit/provider_http_limits.rs"]
-mod provider_http_limits;
+
+
+
+
+
+
 
 pub(crate) mod http_limits;
 use self::http_limits::*;

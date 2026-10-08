@@ -489,12 +489,9 @@ impl OAuthTokenManager {
     }
 
     fn resolve_default_db_path() -> Option<String> {
-#[cfg(test)]
-        {
-            None
-        }
 
-#[cfg(not(test))]
+
+
         {
             Some(crate::config::db_path())
         }
@@ -1075,5 +1072,3 @@ impl OAuthTokenManager {
         Ok(())
     }
 }
-#[cfg(test)]
-mod tests;

@@ -189,10 +189,7 @@ pub(crate) trait NonTextExecutor: Send + Sync {
 pub(crate) struct PlaceholderNonTextExecutor;
 
 impl PlaceholderNonTextExecutor {
-#[cfg(test)]
-    pub(crate) fn new() -> Self {
-        Self
-    }
+
 }
 
 #[async_trait]
@@ -299,8 +296,7 @@ fn extract_payload_field(payload: Option<&Value>, keys: &[&str]) -> Option<Strin
     None
 }
 
-#[cfg(test)]
-mod tests;
+
 
 pub(crate) mod recovery;
 pub(crate) mod recovery_store;

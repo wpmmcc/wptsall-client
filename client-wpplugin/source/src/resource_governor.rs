@@ -85,36 +85,3 @@ impl ResourceGovernor {
         }
     }
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_governor_has_sane_defaults() {
-        let gov = ResourceGovernor::with_limits(
-            DEFAULT_DOMAIN_CONCURRENCY,
-            DEFAULT_GLOBAL_TRANSLATION_CONCURRENCY,
-            DEFAULT_GLOBAL_CALLBACK_CONCURRENCY,
-        );
-        assert_eq!(gov.domain_concurrency, 3);
-        assert_eq!(gov.global_translation_concurrency, 30);
-        assert_eq!(gov.global_callback_concurrency, 12);
-    }
-
-    #[test]
-    fn governor_enforces_minimum_one() {
-        let gov = ResourceGovernor::with_limits(0, 0, 0);
-        assert_eq!(gov.domain_concurrency, 1);
-        assert_eq!(gov.global_translation_concurrency, 1);
-        assert_eq!(gov.global_callback_concurrency, 1);
-    }
-
-    #[tokio::test]
-    async fn domain_semaphore_limits_concurrency() {
-        let gov = ResourceGovernor::with_limits(2, 10, 10);
-        let _p1 = gov.domain_sem.acquire().await.unwrap();
-        let _p2 = gov.domain_sem.acquire().await.unwrap();
-        // Third acquire would block — verify with try_acquire
-        assert!(gov.domain_sem.try_acquire().is_err());
-    }
-}

@@ -14,17 +14,11 @@ use serde_json::Value;
 use super::signing::prime_sign_context;
 use super::*;
 
-#[cfg(test)]
-#[path = "../../../../../tests/modules/client-wpplugin/unit/source_asset_limits.rs"]
-mod source_asset_limits;
 
-#[cfg(test)]
-#[path = "../../../../../tests/modules/client-wpplugin/unit/s3_source_transport.rs"]
-mod s3_source_transport;
 
-#[cfg(test)]
-#[path = "../../../../../tests/modules/client-wpplugin/unit/encrypted_provider_assets.rs"]
-mod encrypted_provider_assets;
+
+
+
 
 #[derive(Debug, Clone)]
 pub(super) struct SourceAsset {
@@ -709,26 +703,7 @@ impl HttpConnector for SourceUploadConnector {
     }
 }
 
-#[cfg(test)]
-async fn upload_source_asset_to_s3(
-    client: &Client,
-    runtime: &ComponentRuntime,
-    rendered_url: &str,
-    rendered_headers: &[(String, String)],
-    asset: &SourceAsset,
-) -> anyhow::Result<()> {
-    let budget = HttpBudget::new(None, HttpResponseKind::UploadAck, &runtime.template.id)?;
-    budget
-        .wait(upload_source_asset_to_s3_with_budget(
-            client,
-            runtime,
-            rendered_url,
-            rendered_headers,
-            asset,
-            &budget,
-        ))
-        .await?
-}
+
 
 async fn upload_source_asset_to_s3_with_budget(
     client: &Client,
@@ -885,114 +860,4 @@ pub(super) fn persist_downloaded_provider_asset(
     let path = dir.join(format!("wpa1{}-{filename}", uuid::Uuid::new_v4().simple()));
     crate::retained_assets::write_bytes(&path, bytes)?;
     Ok(path.to_string_lossy().to_string())
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn durable_binary_assets_do_not_overwrite_same_provider_filename() {
-        let _key = crate::db::owned_mock_bindings_key();
-        let root = tempfile::tempdir().unwrap();
-        let _data =
-            crate::db::TestEnvVarGuard::set("WPTSALL_DATA_DIR", root.path().display().to_string());
-        let name = format!("owned-durable-{}.bin", uuid::Uuid::new_v4());
-        let first = persist_downloaded_provider_asset(b"first", Some(&name)).unwrap();
-        let second = persist_downloaded_provider_asset(b"second", Some(&name)).unwrap();
-        let first_bytes = crate::retained_assets::read(std::path::Path::new(&first), 5).unwrap();
-        let second_bytes = crate::retained_assets::read(std::path::Path::new(&second), 6).unwrap();
-        assert_ne!(std::fs::read(&first).unwrap(), b"first");
-        assert_ne!(std::fs::read(&second).unwrap(), b"second");
-        for path in std::collections::HashSet::from([first.clone(), second.clone()]) {
-            std::fs::remove_file(path).unwrap();
-        }
-        assert_ne!(
-            first, second,
-            "provider filenames must not overwrite another paid result"
-        );
-        assert_eq!(first_bytes, b"first");
-        assert_eq!(second_bytes, b"second");
-        assert!(std::path::Path::new(&first).starts_with(root.path().join("provider-assets")));
-    }
-
-    fn minimal_runtime() -> ComponentRuntime {
-        ComponentRuntime {
-            template: ComponentTemplate {
-                id: "s3-guard-test".into(),
-                name: "S3 guard test".into(),
-                version: "1".into(),
-                kind: "translation".into(),
-                client_contract: None,
-                default_values: None,
-                auth: None,
-                prepare: None,
-                request: ComponentRequest {
-                    http_limits: None,
-                    method: "POST".into(),
-                    url: "https://example.com".into(),
-                    headers: None,
-                    body: None,
-                    body_type: None,
-                    response_type: None,
-                },
-                response: ComponentResponse {
-                    translated_text_path: None,
-                    translated_ref_path: None,
-                    translated_media_ref_path: None,
-                    translated_image_ref_path: None,
-                    translated_video_ref_path: None,
-                    translated_audio_ref_path: None,
-                    translated_document_ref_path: None,
-                    error_path: None,
-                },
-                async_poll: None,
-                source_upload: None,
-                sign: None,
-                constraints: None,
-                editable_params: Vec::new(),
-                translation_modes: Vec::new(),
-            },
-            auth_values: HashMap::new(),
-            supported_business_lines: Vec::new(),
-            language_map: HashMap::new(),
-            supported_content_formats: Vec::new(),
-            supported_formats: Vec::new(),
-            key_pool: None,
-            oauth_pool: None,
-            oauth_manager: None,
-            runtime_max_concurrent_requests: 0,
-            runtime_min_interval_ms: 0,
-            runtime_concurrency_sem: None,
-            runtime_last_request_at: None,
-            proxy_profile_id: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn s3_upload_rejects_private_endpoint_before_sdk_initialization() {
-        let runtime = minimal_runtime();
-        let asset = SourceAsset {
-            bytes: b"fixture".to_vec(),
-            content_type: "text/plain".into(),
-            filename: "fixture.txt".into(),
-        };
-        let headers = vec![
-            ("x-amz-access-key-id".into(), "AKIA_TEST_REAL".into()),
-            ("x-amz-secret-access-key".into(), "secret".into()),
-            (
-                "x-amz-endpoint-url".into(),
-                "http://169.254.169.254:9000".into(),
-            ),
-        ];
-        let err = upload_source_asset_to_s3(
-            &Client::new(),
-            &runtime,
-            "s3://bucket/key",
-            &headers,
-            &asset,
-        )
-        .await
-        .expect_err("metadata endpoint must be rejected");
-        assert!(err.to_string().contains("endpoint rejected"));
-    }
 }

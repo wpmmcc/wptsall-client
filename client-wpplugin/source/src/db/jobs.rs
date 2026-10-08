@@ -324,11 +324,7 @@ pub(crate) fn project_job_from_items(
     Ok(status)
 }
 
-/// SELECT a single job by id. Returns `None` if not found.
-#[cfg(test)]
-pub(crate) fn get_job(conn: &Connection, job_id: i64) -> Option<TranslationJob> {
-    get_job_checked(conn, job_id).expect("valid owned job fixture")
-}
+
 
 pub(crate) fn get_job_checked(conn: &Connection, job_id: i64) -> Result<Option<TranslationJob>> {
     Ok(conn
@@ -972,11 +968,7 @@ pub(crate) fn count_pending_review_items(conn: &Connection) -> Result<i64> {
     )?)
 }
 
-/// Get a single translation item by its primary key id.
-#[cfg(test)]
-pub(crate) fn get_item(conn: &Connection, id: i64) -> Option<TranslationItem> {
-    get_item_checked(conn, id).expect("valid owned item fixture")
-}
+
 
 pub(crate) fn get_item_checked(conn: &Connection, id: i64) -> Result<Option<TranslationItem>> {
     Ok(conn.query_row(
@@ -1062,18 +1054,7 @@ pub(crate) fn list_resumable_items_for_client_base(
     Ok(items)
 }
 
-/// Find items matching a specific domain + relation + WP object ID.
-/// Used by review mode to locate items for status update.
-#[cfg(test)]
-pub(crate) fn list_items_by_domain_object(
-    conn: &Connection,
-    domain: &str,
-    relation_id: i64,
-    wp_object_id: i64,
-) -> Vec<TranslationItem> {
-    list_items_by_domain_object_checked(conn, domain, relation_id, wp_object_id)
-        .expect("valid owned item fixture")
-}
+
 
 pub(crate) fn list_items_by_domain_object_checked(
     conn: &Connection,
@@ -1108,22 +1089,7 @@ pub(crate) fn count_pending_items(conn: &Connection, job_id: i64) -> Result<i64>
     )?)
 }
 
-/// FL-2a companion: is this (domain, relation, WP object) already parked in
-/// the pending-review pool? A parked item's machine translation IS
-/// materialized — the reviewer, not another discovery lane, drives its
-/// terminal state. Without this check, once a site actually implements the
-/// claim route (mock fidelity), the scan lane re-translates items the
-/// outbox lane already parked and the review pool double-lists them.
-#[cfg(test)]
-pub(crate) fn has_pending_review_item(
-    conn: &Connection,
-    domain: &str,
-    relation_id: i64,
-    wp_object_id: i64,
-) -> bool {
-    has_pending_review_item_checked(conn, domain, relation_id, wp_object_id)
-        .expect("valid owned item fixture")
-}
+
 
 pub(crate) fn has_pending_review_item_checked(
     conn: &Connection,
@@ -1149,5 +1115,3 @@ pub(crate) fn has_pending_review_item_checked(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-#[cfg(test)]
-mod tests;

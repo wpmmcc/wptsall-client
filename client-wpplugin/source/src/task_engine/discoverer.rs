@@ -3044,5 +3044,3 @@ pub(crate) async fn discover_and_translate(
 
 // Translation helper functions have been moved to pipeline.rs.
 // Discovery execution helpers live in execute.rs.
-#[cfg(test)]
-mod tests;

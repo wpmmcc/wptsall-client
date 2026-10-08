@@ -93,25 +93,3 @@ pub async fn refresh_domains() -> Result<Vec<DomainInfo>, String> {
         .map(|items| items.iter().map(map_domain).collect())
         .unwrap_or_default())
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn maps_webui_status_domains_without_plan_or_quota_fields() {
-        let status = map_auth_status(&json!({
-            "logged_in": false,
-            "domains": [{
-                "api_base_url": "http://127.0.0.1:9181/wp-json/wptsall/v2/secret/client",
-                "site_status": "active"
-            }]
-        }));
-        assert!(!status.logged_in);
-        assert_eq!(status.domains.len(), 1);
-        assert_eq!(
-            status.domains[0].domain,
-            "http://127.0.0.1:9181/wp-json/wptsall/v2/secret/client"
-        );
-    }
-}

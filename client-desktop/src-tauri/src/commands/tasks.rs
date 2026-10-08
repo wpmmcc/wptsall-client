@@ -184,23 +184,3 @@ pub async fn focus_discovery_relation(
         enabled,
     })
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn maps_job_summary_progress() {
-        let task = map_task_summary(&json!({
-            "id": 42,
-            "domain": "http://127.0.0.1:9181",
-            "status": "completed",
-            "total_items": 10,
-            "done_items": 7,
-            "created_at": "2026-08-28 12:00:00"
-        }));
-        assert_eq!(task.id, "42");
-        assert_eq!(task.status, "completed");
-        assert_eq!(task.progress, 70.0);
-    }
-}

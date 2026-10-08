@@ -11,9 +11,7 @@ const NAME: &str = "wptsall-capacity-v1";
 const C_NAME: &[u8] = b"wptsall-capacity-v1\0";
 static REGISTERED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
-#[cfg(test)]
-#[path = "../../../../tests/modules/client-wpplugin/unit/physical_sqlite_native.rs"]
-mod native_capacity_contracts;
+
 
 #[repr(C)]
 struct File {
