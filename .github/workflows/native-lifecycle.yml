@@ -1,0 +1,45 @@
+name: Native install update uninstall
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-lifecycle-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  lifecycle:
+    name: ${{ matrix.product }} ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        product: [webui, desktop]
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
+        include:
+          - { os: ubuntu-latest, platform: linux-x86_64, kind: deb }
+          - { os: ubuntu-24.04-arm, platform: linux-aarch64, kind: deb }
+          - { os: windows-latest, platform: windows-x86_64, kind: nsis }
+          - { os: windows-11-arm, platform: windows-aarch64, kind: nsis }
+          - { os: macos-latest, platform: darwin-aarch64, kind: dmg }
+          - { os: macos-15-intel, platform: darwin-x86_64, kind: dmg }
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: "2.1.5"
+      PRODUCT: ${{ matrix.product }}
+      PLATFORM: ${{ matrix.platform }}
+      KIND: ${{ matrix.kind }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install, update-check, and uninstall the published package
+        run: bash install-client/packaging/native-lifecycle-runner.sh
+      - name: Upload lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-lifecycle-${{ matrix.product }}-${{ matrix.platform }}
+          path: native-lifecycle.json
+          if-no-files-found: warn
