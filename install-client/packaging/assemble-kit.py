@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 from pathlib import Path
 import re
 import shutil
@@ -15,6 +16,15 @@ import tempfile
 INSTALL = Path(__file__).resolve().parents[1]
 PLATFORMS = {f"{os_}-{arch}" for os_ in ("linux", "windows", "darwin")
              for arch in ("x86_64", "aarch64")}
+
+
+def bash_executable() -> str:
+    """Windows PATH bash is the WSL launcher. Packaging scripts need Git Bash."""
+    if os.name == "nt":
+        candidate = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Git" / "bin" / "bash.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return "bash"
 
 
 def assemble(product: str, binary: Path, ui: Path, version: str, platform: str,
@@ -55,11 +65,12 @@ def assemble(product: str, binary: Path, ui: Path, version: str, platform: str,
         shutil.copy2(INSTALL / "shared/PRODUCTION-FIRST-LAUNCH-AUTHORIZATION.md",
                      tree / "FIRST-LAUNCH-AUTHORIZATION.md")
         (tree / "FIRST-LAUNCH-AUTHORIZATION.md").chmod(0o644)
+        bash = bash_executable()
         harden = INSTALL / "shared/secure-harden-release.sh"
-        subprocess.run(["bash", str(harden), str(tree)], check=True)
+        subprocess.run([bash, str(harden), str(tree)], check=True)
         obfuscate = INSTALL / "hooks/obfuscate-kit.sh"
         if obfuscate.is_file():
-            subprocess.run(["bash", str(obfuscate), str(tree)], check=True)
+            subprocess.run([bash, str(obfuscate), str(tree)], check=True)
         else:
             (tree / "OBFUSCATION.txt").write_text("diversify=skipped\n", encoding="utf-8")
         (tree / "HARDENING.txt").write_text(
