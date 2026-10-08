@@ -1,5 +1,6 @@
 pub mod credentials;
 pub mod discoverer;
+pub(crate) mod field_plan;
 pub mod hmac;
 mod json_store;
 mod media_delivery;

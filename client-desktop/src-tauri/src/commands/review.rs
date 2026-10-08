@@ -180,3 +180,40 @@ pub async fn reject_item(item_id: String, request: Option<Value>) -> Result<Valu
     )
     .await
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_job_query_paths() {
+        assert_eq!(
+            query_path(
+                "/api/jobs",
+                &[
+                    ("domain", Some("https://example.test".into())),
+                    ("limit", Some("20".into())),
+                    ("offset", None),
+                ]
+            ),
+            "/api/jobs?domain=https%3A%2F%2Fexample.test&limit=20"
+        );
+        assert_eq!(query_path("/api/jobs", &[]), "/api/jobs");
+    }
+
+    #[test]
+    fn builds_translation_query_paths() {
+        assert_eq!(
+            query_path(
+                "/api/translations",
+                &[
+                    ("page", Some("2".into())),
+                    ("limit", Some("20".into())),
+                    ("domain", Some("blog.example.test".into())),
+                    ("status", Some("failed".into())),
+                    ("search", None),
+                ]
+            ),
+            "/api/translations?page=2&limit=20&domain=blog.example.test&status=failed"
+        );
+    }
+}

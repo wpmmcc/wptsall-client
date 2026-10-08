@@ -1,0 +1,2 @@
+WPTSALL mock document source text fixture.
+This file exists so document_translation templates that only accept txt can run through the real client task flow.

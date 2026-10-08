@@ -115,7 +115,10 @@
         items = res.data.items;
         catalogVersion = res.data.catalog_version;
         const available = res.data.available_version;
-        if (available && available !== catalogVersion) {
+        const check = res.data.online_check;
+        if (check?.attempted && check.offline) {
+          error = check.error || $_('vendor_catalog.offline_retained');
+        } else if (available && available !== catalogVersion) {
           notice = $_('vendor_catalog.new_version_available', { values: { version: available } });
         }
       } else {

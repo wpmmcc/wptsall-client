@@ -145,3 +145,228 @@ pub fn reconcile_batch(state: &PairSyncState) -> (Vec<&KnownEntity>, usize) {
     let next_cursor = if end >= uuids.len() { 0 } else { end };
     (batch, next_cursor)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_storage_corrupt_state_cannot_be_reset_or_mutated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        for raw in [
+            "",
+            "{invalid",
+            "{}",
+            r#"{"schema_version":"future.v9","pairs":{},"updated_at":0}"#,
+        ] {
+            std::fs::write(&path, raw).unwrap();
+            assert!(
+                load_sync_state(path.to_str().unwrap()).is_err(),
+                "corrupt state accepted: {raw}"
+            );
+            assert!(update_pair_state(path.to_str().unwrap(), "pair-1", |s| {
+                s.last_seen_source_id = 999;
+            })
+            .is_err());
+            assert!(save_sync_state(path.to_str().unwrap(), &SyncStateDoc::default()).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn sync_storage_parallel_state_updates_do_not_lose_successful_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let path = path.to_str().unwrap().to_string();
+        save_sync_state(&path, &SyncStateDoc::default()).unwrap();
+        let workers = 12;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(workers));
+        let tasks: Vec<_> = (0..workers)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut acknowledged = 0u64;
+                    let mut rejected_busy = 0u64;
+                    for _ in 0..20 {
+                        let mut applied = false;
+                        let result = update_pair_state(&path, "pair-1", |state| {
+                            applied = true;
+                            state.last_seen_source_id += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        });
+                        match result {
+                            Ok(()) => {
+                                assert!(applied);
+                                acknowledged += 1;
+                            }
+                            Err(error)
+                                if error.to_string().starts_with("sync document is busy;") =>
+                            {
+                                // The bounded lock contract may reject under
+                                // load. A rejected operation is not an ack and
+                                // must not execute its mutation.
+                                assert!(!applied, "busy rejection applied a mutation");
+                                rejected_busy += 1;
+                            }
+                            Err(error) => panic!("unexpected state mutation error: {error}"),
+                        }
+                    }
+                    (acknowledged, rejected_busy)
+                })
+            })
+            .collect();
+        let (acknowledged, rejected_busy) = tasks
+            .into_iter()
+            .map(|task| task.join().expect("owned mutation worker"))
+            .fold((0, 0), |(ack, busy), (next_ack, next_busy)| {
+                (ack + next_ack, busy + next_busy)
+            });
+        assert!(acknowledged > 0, "probe must exercise successful writes");
+        assert_eq!(acknowledged + rejected_busy, (workers * 20) as u64);
+        eprintln!(
+            "owned concurrency probe: {acknowledged} acknowledged, {rejected_busy} rejected busy"
+        );
+        let doc = load_sync_state(&path).unwrap();
+        assert_eq!(doc.pairs["pair-1"].last_seen_source_id, acknowledged);
+    }
+
+    #[test]
+    fn sync_storage_separate_processes_keep_all_state_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        save_sync_state(path.to_str().unwrap(), &SyncStateDoc::default()).unwrap();
+        let mut children = Vec::new();
+        for _ in 0..4 {
+            children.push(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "sync_engine::state::tests::sync_storage_subprocess_worker",
+                        "--ignored",
+                    ])
+                    .env("WPTSALL_OWNED_SYNC_STORAGE_TEST", &path)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let outputs: Vec<_> = children
+            .into_iter()
+            .map(|child| child.wait_with_output().unwrap())
+            .collect();
+        for output in outputs {
+            assert!(
+                output.status.success(),
+                "owned subprocess failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let doc = load_sync_state(path.to_str().unwrap()).unwrap();
+        assert_eq!(doc.pairs["multiprocess"].last_seen_source_id, 60);
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture; run only via sync_storage_separate_processes_keep_all_state_updates"]
+    fn sync_storage_subprocess_worker() {
+        let path = std::env::var("WPTSALL_OWNED_SYNC_STORAGE_TEST").expect("owned path required");
+        assert!(std::path::Path::new(&path).starts_with(std::env::temp_dir()));
+        for _ in 0..15 {
+            update_pair_state(&path, "multiprocess", |state| {
+                state.last_seen_source_id += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn cli07_old_known_entity_without_rejection_marker_is_still_shipped() {
+        let old = serde_json::json!({
+            "canonical_uuid": "uuid-old", "source_fingerprint": "fp-old", "vector_clock": 3,
+            "post_type": "post", "post_status": "publish", "target_post_id": 123,
+            "last_shipped_at": 42,
+        });
+        let entity: KnownEntity = serde_json::from_value(old).unwrap();
+        assert!(!entity.review_rejected);
+        assert_eq!(
+            (entity.target_post_id, entity.last_shipped_at),
+            (Some(123), 42)
+        );
+        let roundtrip: KnownEntity =
+            serde_json::from_value(serde_json::to_value(&entity).unwrap()).unwrap();
+        assert_eq!(roundtrip, entity);
+    }
+
+    fn known(uuid: &str, fp: &str) -> KnownEntity {
+        KnownEntity {
+            canonical_uuid: uuid.to_string(),
+            source_fingerprint: fp.to_string(),
+            vector_clock: 1,
+            post_type: "post".to_string(),
+            post_status: "publish".to_string(),
+            target_post_id: Some(10),
+            last_shipped_at: 1,
+            review_rejected: false,
+        }
+    }
+
+    #[test]
+    fn state_roundtrip_and_update() {
+        let dir = std::env::temp_dir().join(format!("sync_state_test_{}", unix_ts()));
+        let path = dir.join("state.json");
+        let path_str = path.to_string_lossy().to_string();
+
+        update_pair_state(&path_str, "pair-1", |s| {
+            s.last_seen_source_id = 42;
+            s.known
+                .insert("uuid-a".to_string(), known("uuid-a", "fp-1"));
+        })
+        .expect("update");
+
+        let doc = load_sync_state(&path_str).unwrap();
+        let state = find_pair_state(&doc, "pair-1").unwrap();
+        assert_eq!(state.last_seen_source_id, 42);
+        assert_eq!(state.known["uuid-a"].source_fingerprint, "fp-1");
+
+        update_pair_state(&path_str, "pair-1", |s| {
+            s.last_seen_source_id = 50;
+        })
+        .unwrap();
+        let doc = load_sync_state(&path_str).unwrap();
+        assert_eq!(
+            find_pair_state(&doc, "pair-1").unwrap().last_seen_source_id,
+            50
+        );
+        assert_eq!(doc.pairs.len(), 1);
+
+        assert!(remove_pair_state(&path_str, "pair-1").unwrap());
+        let doc = load_sync_state(&path_str).unwrap();
+        assert!(doc.pairs.is_empty());
+    }
+
+    #[test]
+    fn reconcile_batch_rotates_and_wraps() {
+        let mut state = PairSyncState::default();
+        for i in 0..(RECONCILE_BATCH_SIZE + 10) {
+            let uuid = format!("uuid-{i:04}");
+            state.known.insert(uuid.clone(), known(&uuid, "fp"));
+        }
+        let (batch, next) = reconcile_batch(&state);
+        assert_eq!(batch.len(), RECONCILE_BATCH_SIZE);
+        assert_eq!(next, RECONCILE_BATCH_SIZE);
+
+        state.reconcile_cursor = next;
+        let (batch2, next2) = reconcile_batch(&state);
+        assert_eq!(batch2.len(), 10);
+        assert_eq!(next2, 0, "cursor wraps after a full rotation");
+
+        // Empty state is a no-op.
+        let empty = PairSyncState::default();
+        let (b, n) = reconcile_batch(&empty);
+        assert!(b.is_empty());
+        assert_eq!(n, 0);
+    }
+}

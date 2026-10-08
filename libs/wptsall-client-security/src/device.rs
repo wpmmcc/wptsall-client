@@ -122,3 +122,18 @@ mod hex {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_key_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().to_string_lossy().to_string();
+        let kp1 = load_or_create_device_key(&data, "test-app", "dev-test-1").unwrap();
+        let kp2 = load_or_create_device_key(&data, "test-app", "dev-test-1").unwrap();
+        assert_eq!(kp1.identity.public_key_b64, kp2.identity.public_key_b64);
+        let sig = kp1.sign(b"hello");
+        assert!(!sig.is_empty());
+    }
+}

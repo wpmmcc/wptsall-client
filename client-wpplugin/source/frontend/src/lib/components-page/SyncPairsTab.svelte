@@ -81,6 +81,9 @@
   let formSyncFrequency = $state<SyncFrequency>('manual');
   let formPostTypes = $state<string[]>(['post', 'page']);
   let formTranslateComponentId = $state('');
+  let formTitleAction = $state('translate');
+  let formContentAction = $state('translate');
+  let formExcerptAction = $state('translate');
   let formReviewBeforePush = $state(false);
 
   // Post-type values; labels resolve via i18n (`sync_pairs.post_type_*`) so
@@ -271,6 +274,13 @@
     }
   }
 
+  function savedFieldAction(pair: SyncPair, field: string): string {
+    const action = pair.field_actions?.find((row) => row.field === field)?.action;
+    if (action === 'copy' || action === 'as_is') return 'copy';
+    if (action === 'skip' || action === 'exclude') return 'skip';
+    return 'translate';
+  }
+
   function openCreateModal() {
     isEditing = false;
     formId = '';
@@ -285,6 +295,9 @@
     formSyncFrequency = 'manual';
     formPostTypes = ['post', 'page'];
     formTranslateComponentId = '';
+    formTitleAction = 'translate';
+    formContentAction = 'translate';
+    formExcerptAction = 'translate';
     formReviewBeforePush = false;
     formError = '';
     modalOpen = true;
@@ -304,6 +317,9 @@
     formSyncFrequency = pair.sync_frequency || 'manual';
     formPostTypes = [...(pair.post_types || ['post', 'page'])];
     formTranslateComponentId = pair.translate_component_id || '';
+    formTitleAction = savedFieldAction(pair, 'post_title');
+    formContentAction = savedFieldAction(pair, 'post_content');
+    formExcerptAction = savedFieldAction(pair, 'post_excerpt');
     formReviewBeforePush = !!pair.review_before_push;
     formError = '';
     modalOpen = true;
@@ -351,7 +367,16 @@
       formError = '请至少选择一个内容类型 (post types)';
       return;
     }
-    if (formSyncMode === 'sync_and_translate' && !formTranslateComponentId.trim()) {
+    const fieldActions = [
+      { field: 'post_title', action: formTitleAction },
+      { field: 'post_content', action: formContentAction },
+      { field: 'post_excerpt', action: formExcerptAction },
+    ];
+    if (
+      formSyncMode === 'sync_and_translate' &&
+      fieldActions.some((row) => row.action === 'translate') &&
+      !formTranslateComponentId.trim()
+    ) {
       formError = $_('sync_pairs.translate_component_required');
       return;
     }
@@ -372,6 +397,7 @@
       };
       if (formSyncMode === 'sync_and_translate') {
         payload.translate_component_id = formTranslateComponentId.trim();
+        payload.field_actions = fieldActions;
       }
       payload.review_before_push = formReviewBeforePush;
       if (isEditing && formId) {
@@ -1053,6 +1079,31 @@
               {/each}
             </select>
             <p class="text-xs text-gray-400 mt-1">{$_('sync_pairs.translate_component_hint')}</p>
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            {#each [
+              ['post_title', 'sync_pairs.field_action_title', formTitleAction],
+              ['post_content', 'sync_pairs.field_action_content', formContentAction],
+              ['post_excerpt', 'sync_pairs.field_action_excerpt', formExcerptAction],
+            ] as [field, label, selected]}
+              <label class="block text-xs font-medium text-gray-700">
+                {$_(label)}
+                <select
+                  value={selected}
+                  onchange={(event) => {
+                    const value = (event.currentTarget as HTMLSelectElement).value;
+                    if (field === 'post_title') formTitleAction = value;
+                    else if (field === 'post_content') formContentAction = value;
+                    else formExcerptAction = value;
+                  }}
+                  class="mt-1 w-full px-3 py-2 border border-gray-300 rounded-lg text-sm"
+                >
+                  <option value="translate">{$_('sync_pairs.field_action_translate')}</option>
+                  <option value="copy">{$_('sync_pairs.field_action_copy')}</option>
+                  <option value="skip">{$_('sync_pairs.field_action_skip')}</option>
+                </select>
+              </label>
+            {/each}
           </div>
         {/if}
 

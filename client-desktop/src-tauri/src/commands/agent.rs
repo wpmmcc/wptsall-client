@@ -127,3 +127,43 @@ fn pick_free_loopback_port() -> anyhow::Result<u16> {
     let port = listener.local_addr()?.port();
     Ok(port)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_a_free_loopback_port() {
+        let port = pick_free_loopback_port().unwrap();
+        assert!(port > 0);
+        // The released port must be bindable again immediately (SO_REUSEADDR
+        // semantics on loopback make this deterministic for the test).
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port));
+        assert!(listener.is_ok(), "fallback port {port} should be bindable");
+    }
+
+    #[test]
+    fn pinned_port_detection_follows_env() {
+        if !crate::tests::in_owned_env_child(
+            "commands::agent::tests::pinned_port_detection_follows_env",
+        ) {
+            return;
+        }
+        // Baseline: no env → not pinned.
+        std::env::remove_var("WPTSALL_WEB_UI_BIND");
+        std::env::remove_var("WPTSALL_WEB_UI_PORT");
+        assert!(!user_pinned_web_ui_port());
+
+        std::env::set_var("WPTSALL_WEB_UI_PORT", "9100");
+        assert!(user_pinned_web_ui_port());
+        std::env::remove_var("WPTSALL_WEB_UI_PORT");
+
+        std::env::set_var("WPTSALL_WEB_UI_BIND", "127.0.0.1:9101");
+        assert!(user_pinned_web_ui_port());
+        std::env::remove_var("WPTSALL_WEB_UI_BIND");
+
+        // Whitespace-only values count as unset.
+        std::env::set_var("WPTSALL_WEB_UI_PORT", "   ");
+        assert!(!user_pinned_web_ui_port());
+        std::env::remove_var("WPTSALL_WEB_UI_PORT");
+    }
+}

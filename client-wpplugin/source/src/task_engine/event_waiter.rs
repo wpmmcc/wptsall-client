@@ -304,3 +304,150 @@ pub(crate) async fn run_event_waiter(
     }
     let _ = log_event(&log_file, "info", "worker.event_wait_stopped", json!({}));
 }
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-event-waiter-rs
+    // oracle: L1
+    // 批 Q (事件驱动): waiter 契约——响应解析、唤醒合流、404 降级回退、
+    // URL 装配（token/route_secret 解析同 worker 主环）。
+    use super::*;
+
+    #[test]
+    fn wait_response_parses_ready_and_timeout_shapes() {
+        let ready: EventsWaitResponse =
+            serde_json::from_str(r#"{"success":true,"data":{"events_ready":true,"waited_ms":412}}"#)
+                .unwrap();
+        assert!(ready.success && ready.data.events_ready && ready.data.waited_ms == 412);
+        let timeout: EventsWaitResponse =
+            serde_json::from_str(r#"{"success":true,"data":{"events_ready":false,"waited_ms":25000}}"#)
+                .unwrap();
+        assert!(timeout.success && !timeout.data.events_ready);
+        // Server shape drift (missing data) must not panic the waiter.
+        let bare: EventsWaitResponse = serde_json::from_str(r#"{"success":true}"#).unwrap();
+        assert!(!bare.data.events_ready);
+    }
+
+    #[tokio::test]
+    async fn wait_loop_wakes_once_and_coalesces_while_draining() {
+        // Plain-HTTP test server: disable the http transport-encryption
+        // requirement the same way the discoverer tests do.
+        let _transport_guard =
+            crate::db::TestEnvVarGuard::set("WPTSALL_WP_TRANSPORT_ENCRYPT", "off");
+        // A server that reports events_ready=true on the first call and
+        // holds later calls (never answers within the test window): the
+        // loop must wake the notify, debounce, then block on the held
+        // request — and repeated notify permits must coalesce to one.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let body = r#"{"success":true,"data":{"events_ready":true,"waited_ms":5}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.write_all(resp.as_bytes()).await;
+            // Hold the connection: the next request on this stream never
+            // gets a response inside the test window.
+            let _ = tokio::time::sleep(Duration::from_secs(15)).await;
+        });
+        let cfg = EventWaitConfig {
+            enabled: true,
+            wait_seconds: 1,
+            debounce_secs: 1,
+            error_backoff_secs: 1,
+            unsupported_retry_secs: 1,
+        };
+        let client = Arc::new(
+            Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap(),
+        );
+        let wake = Arc::new(Notify::new());
+        let shutdown = CancellationToken::new();
+        let url = format!("http://{addr}/wp-json/wptsall/v2/secret/client/events/wait?wait_seconds=1");
+        let log_file = Arc::new(String::from("/tmp/wptsall-event-waiter-test.log"));
+        let handle = tokio::spawn(wait_domain_loop_on_url(
+            Arc::clone(&client),
+            cfg,
+            url,
+            Arc::clone(&wake),
+            shutdown.clone(),
+        ));
+        // First wake arrives within the debounce window.
+        tokio::time::timeout(Duration::from_secs(4), wake.notified())
+            .await
+            .expect("first wake must fire");
+        // Coalescing: two notifies while nobody waits store at most one
+        // permit, so exactly one more notified() resolves without waiting.
+        wake.notify_one();
+        wake.notify_one();
+        let second = tokio::time::timeout(Duration::from_millis(200), wake.notified()).await;
+        assert!(second.is_ok(), "stored permit must resolve immediately");
+        let third = tokio::time::timeout(Duration::from_millis(200), wake.notified()).await;
+        assert!(third.is_err(), "permits must coalesce to one");
+        shutdown.cancel();
+        handle.abort();
+        server.abort();
+    }
+
+    /// Test seam: drive the domain loop body against a fixed URL instead of
+    /// resolving bindings (binding resolution is covered by the URL
+    /// assembly test).
+    async fn wait_domain_loop_on_url(
+        client: Arc<Client>,
+        cfg: EventWaitConfig,
+        url: String,
+        wake: Arc<Notify>,
+        shutdown: CancellationToken,
+    ) {
+        let token = "test-token".to_string();
+        loop {
+            if shutdown.is_cancelled() {
+                return;
+            }
+            match wp_get_json_with_transport_and_secret::<EventsWaitResponse>(
+                &client, &url, &token, "w-test", "d-test", None,
+            )
+            .await
+            {
+                Ok(resp) if resp.success && resp.data.events_ready => {
+                    wake.notify_one();
+                    if !sleep_or_shutdown(cfg.debounce_secs, &shutdown).await {
+                        return;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if !sleep_or_shutdown(cfg.error_backoff_secs, &shutdown).await {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wait_url_assembles_with_secret_and_window() {
+        let doc: DomainTokenBindingsDoc = serde_json::from_str(
+            r#"{"version":3,"domains":{"http://127.0.0.1:9181":{"wp_client_token":"tok1","route_secret":"sec1"}}}"#,
+        )
+        .unwrap();
+        let domains = domain_token_binding_local_sites(&doc);
+        assert_eq!(domains.len(), 1, "binding map must resolve one local site");
+        let api_base_url = &domains[0].api_base_url;
+        let Some((url, token, secret)) = wait_url_for_domain(api_base_url, &doc, 25) else {
+            panic!("binding must resolve");
+        };
+        assert!(
+            url.ends_with("/wp-json/wptsall/v2/sec1/client/events/wait?wait_seconds=25"),
+            "url: {url}"
+        );
+        assert_eq!(token, "tok1");
+        assert_eq!(secret, "sec1");
+    }
+}

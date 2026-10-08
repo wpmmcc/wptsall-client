@@ -112,6 +112,7 @@ export interface RuleSlotOption {
 
 export interface RuleDiscoveryFieldSummary {
   field_name: string;
+  action: string;
   content_format: string;
   source_role: string;
   storage: string;

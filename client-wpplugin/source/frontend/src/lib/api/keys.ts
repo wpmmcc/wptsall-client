@@ -29,6 +29,12 @@ export interface ProviderCatalogData {
   items: ProviderCatalogItem[];
   offline: boolean;
   available_version?: string | null;
+  online_check?: {
+    attempted: boolean;
+    offline: boolean;
+    error?: string | null;
+    available_version?: string | null;
+  };
 }
 
 export const listProviderCatalog = (params: { q?: string; vendor_id?: string; check?: boolean } = {}) => {

@@ -153,7 +153,7 @@ pub(crate) fn parse_task_type_binding_key(raw: &str) -> Option<String> {
     task_rules::parse_task_type_binding_key(raw)
 }
 
-#[allow (dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_content_format_binding_key(raw: &str) -> Option<String> {
     task_rules::parse_content_format_binding_key(raw)
 }
@@ -337,7 +337,11 @@ pub(crate) fn set_default_device_id(device_id: &str) {
     crypto::set_default_device_id(device_id)
 }
 
-
+/// Test seam forwarded for the SEC-02 at-rest tests (see crypto.rs).
+#[cfg(test)]
+pub(crate) fn clear_default_device_id_for_tests() {
+    crypto::clear_default_device_id_for_tests()
+}
 
 pub(crate) fn load_encrypted_or_plain(file_path: &Path) -> anyhow::Result<String> {
     crypto::load_encrypted_or_plain(file_path)
@@ -377,3 +381,5 @@ pub(crate) fn save_encrypted_file_with_audit(
     }));
     Ok(())
 }
+#[cfg(test)]
+mod tests;

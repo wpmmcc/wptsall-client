@@ -108,3 +108,166 @@ pub(crate) fn legacy_route_blocked(method: &str, path: &str) -> bool {
         LegacyRouteClass::Legacy
     ) && !crate::config::server_control_plane_enabled()
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_every_table_entry_as_legacy() {
+        for (method, path) in LEGACY_STATIC_ROUTES {
+            assert_eq!(
+                classify_legacy_route(method, path),
+                LegacyRouteClass::Legacy,
+                "{method} {path} must classify as Legacy"
+            );
+        }
+    }
+
+    #[test]
+    fn method_mismatch_is_not_legacy() {
+        assert_eq!(
+            classify_legacy_route("GET", "/api/components/refresh"),
+            LegacyRouteClass::Local
+        );
+        assert_eq!(
+            classify_legacy_route("POST", "/api/platform/products"),
+            LegacyRouteClass::Local
+        );
+    }
+
+    #[test]
+    fn vendor_oauth_callback_stays_local() {
+        // The vendor OAuth callback is LOCAL functionality and must never be
+        // misclassified as the website OAuth callback.
+        assert_eq!(
+            classify_legacy_route("GET", "/oauth/callback"),
+            LegacyRouteClass::Legacy
+        );
+        assert_eq!(
+            classify_legacy_route("GET", "/oauth/vendor/callback"),
+            LegacyRouteClass::Local
+        );
+    }
+
+    #[test]
+    fn legacy_v1_prefixes_are_recognized() {
+        // /api/v1/platform/* — the original obsolete frontend spellings.
+        assert_eq!(
+            classify_legacy_route("GET", "/api/v1/platform/products"),
+            LegacyRouteClass::Legacy
+        );
+        assert_eq!(
+            classify_legacy_route("GET", "/api/v1/platform/entitlements"),
+            LegacyRouteClass::Legacy
+        );
+        assert_eq!(
+            classify_legacy_route("POST", "/api/v1/platform/anything"),
+            LegacyRouteClass::Legacy
+        );
+        // P1-9: /api/v1/client/* and /api/v1/account/* are also legacy
+        // server-control-plane spellings and must be classified as Legacy so
+        // the dispatcher rejects them before any handler runs.
+        assert_eq!(
+            classify_legacy_route("GET", "/api/v1/client/locale-preference"),
+            LegacyRouteClass::Legacy
+        );
+        assert_eq!(
+            classify_legacy_route("PUT", "/api/v1/client/profile"),
+            LegacyRouteClass::Legacy
+        );
+        assert_eq!(
+            classify_legacy_route("GET", "/api/v1/account/preferences"),
+            LegacyRouteClass::Legacy
+        );
+        // Any other /api/v1/<x> spelling is covered by the full prefix.
+        assert_eq!(
+            classify_legacy_route("POST", "/api/v1/something-new"),
+            LegacyRouteClass::Legacy
+        );
+    }
+
+    #[test]
+    fn local_component_routes_stay_local_except_server_ops() {
+        assert_eq!(
+            classify_legacy_route("GET", "/api/components/local"),
+            LegacyRouteClass::Local
+        );
+        assert_eq!(
+            classify_legacy_route("POST", "/api/components/local"),
+            LegacyRouteClass::Local
+        );
+        assert_eq!(
+            classify_legacy_route("POST", "/api/components/local/import"),
+            LegacyRouteClass::Local
+        );
+        assert_eq!(
+            classify_legacy_route("POST", "/api/components/local/test-file"),
+            LegacyRouteClass::Local
+        );
+        assert_eq!(
+            classify_legacy_route("POST", "/api/components/local/install-from-server"),
+            LegacyRouteClass::Legacy
+        );
+    }
+
+    #[test]
+    fn dynamic_refresh_snapshot_is_legacy_but_other_ids_are_not() {
+        assert_eq!(
+            classify_legacy_route("POST", "/api/components/local/abc-123/refresh-snapshot"),
+            LegacyRouteClass::Legacy
+        );
+        // Not the refresh-snapshot action.
+        assert_eq!(
+            classify_legacy_route("POST", "/api/components/local/abc-123/quick-test"),
+            LegacyRouteClass::Local
+        );
+        assert_eq!(
+            classify_legacy_route("GET", "/api/components/local/abc-123/refresh-snapshot"),
+            LegacyRouteClass::Local
+        );
+        // Too few segments.
+        assert_eq!(
+            classify_legacy_route("POST", "/api/components/local/refresh-snapshot"),
+            LegacyRouteClass::Local
+        );
+    }
+
+    #[test]
+    fn local_workload_routes_stay_local() {
+        for (method, path) in [
+            ("GET", "/api/status"),
+            ("GET", "/api/components/capabilities"),
+            ("POST", "/api/components/test"),
+            ("GET", "/api/components/local"),
+            ("GET", "/api/provider-catalog"),
+            ("POST", "/api/provider-catalog/refresh"),
+            ("GET", "/api/vendor-keys"),
+            ("GET", "/api/vendor-oauth"),
+            ("GET", "/api/proxy-profiles"),
+            ("POST", "/api/site-connections/import"),
+            ("POST", "/api/domain-tokens/test"),
+            ("POST", "/api/worker/run-once"),
+            ("POST", "/api/logs/recent"),
+            ("POST", "/api/logs/settings"),
+            ("POST", "/api/integrations/pack/import"),
+            ("GET", "/api/jobs"),
+        ] {
+            assert_eq!(
+                classify_legacy_route(method, path),
+                LegacyRouteClass::Local,
+                "{method} {path} must stay local"
+            );
+        }
+    }
+
+    #[test]
+    fn query_strings_are_not_part_of_the_path() {
+        // The HTTP request reader strips the query string before dispatch; the
+        // classifier must never see one. This guards the contract.
+        assert_eq!(
+            classify_legacy_route("GET", "/api/vendors?x=1"),
+            LegacyRouteClass::Local,
+            "query strings must be split off before classification"
+        );
+    }
+}

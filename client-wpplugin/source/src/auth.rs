@@ -263,7 +263,16 @@ pub(crate) fn scoped_run_trace_id(id: String) -> RunTraceIdGuard {
     RunTraceIdGuard { previous }
 }
 
-
+/// Test-only serializer for the process-global run trace (批 J). The trace
+/// static is run-scope state, so every test that arms or asserts it must
+/// hold this lock for its whole duration — otherwise cargo's parallel test
+/// threads race the guard's set/restore windows and flake each other.
+/// Production code never touches this.
+#[cfg(test)]
+pub(crate) fn run_trace_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
 
 pub(crate) fn parse_api_error_response(body: &str) -> Option<ApiErrorResponse> {
     serde_json::from_str::<ApiErrorResponse>(body)
@@ -887,4 +896,584 @@ pub(crate) fn is_auth_error_message(err_text: &str) -> bool {
         || msg.contains("status=401")
         || msg.contains("status 401")
         || msg.contains("relogin")
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::TestEnvVarGuard as EnvVarGuard;
+
+    // -----------------------------------------------------------------------
+    // GAP-06 收尾: run 级 trace 上下文（scoped static + RAII Guard）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn run_trace_guard_sets_reads_and_restores() {
+        let _serialized = run_trace_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 基线：run 外无 trace（出站不挂头）。测试锁保证此刻无其他
+        // trace 敏感测试持有 run trace。
+        assert!(current_run_trace_id().is_none());
+
+        let guard = scoped_run_trace_id("disc-run-a".to_string());
+        assert_eq!(current_run_trace_id().as_deref(), Some("disc-run-a"));
+
+        drop(guard);
+        assert!(
+            current_run_trace_id().is_none(),
+            "guard drop must restore the no-run baseline"
+        );
+    }
+
+    #[test]
+    fn run_trace_guard_nesting_restores_previous_value() {
+        let _serialized = run_trace_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let outer = scoped_run_trace_id("disc-run-outer".to_string());
+        {
+            let inner = scoped_run_trace_id("disc-run-inner".to_string());
+            assert_eq!(current_run_trace_id().as_deref(), Some("disc-run-inner"));
+            drop(inner);
+        }
+        assert_eq!(
+            current_run_trace_id().as_deref(),
+            Some("disc-run-outer"),
+            "inner guard drop must restore the outer run trace"
+        );
+        drop(outer);
+        assert!(current_run_trace_id().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // build_request_id
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_request_id_includes_label() {
+        let id = build_request_id("client login");
+        assert!(id.starts_with("client-login-"), "id: {}", id);
+    }
+
+    #[test]
+    fn build_request_id_normalizes_special_chars() {
+        let id = build_request_id("task.pull (status=pending)");
+        // Should not contain dots, parens, equals
+        let prefix = id.split('-').take(3).collect::<Vec<_>>().join("-");
+        assert!(
+            prefix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "prefix should be normalized: {}",
+            prefix
+        );
+    }
+
+    #[test]
+    fn build_request_id_truncates_long_label() {
+        let long_label = "a".repeat(100);
+        let id = build_request_id(&long_label);
+        // Prefix should be at most 24 chars
+        let parts: Vec<&str> = id.splitn(2, '-').collect();
+        assert!(parts[0].len() <= 24, "prefix too long: {}", parts[0]);
+    }
+
+    #[test]
+    fn build_request_id_empty_label() {
+        let id = build_request_id("");
+        assert!(id.starts_with("req-"), "id: {}", id);
+    }
+
+    #[test]
+    fn build_request_id_unique() {
+        let id1 = build_request_id("test");
+        let id2 = build_request_id("test");
+        assert_ne!(id1, id2, "each call should produce unique id");
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_api_error_response
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_api_error_valid() {
+        let body = r#"{"success": false, "error": {"code": "session_expired", "message": "Your session has expired"}}"#;
+        let parsed = parse_api_error_response(body);
+        assert!(parsed.is_some());
+        let resp = parsed.unwrap();
+        assert!(!resp.success);
+        assert_eq!(resp.error.code, "session_expired");
+    }
+
+    #[test]
+    fn parse_api_error_success_true_returns_none() {
+        let body = r#"{"success": true, "error": {"code": "ok", "message": "all good"}}"#;
+        let parsed = parse_api_error_response(body);
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn parse_api_error_invalid_json_returns_none() {
+        assert!(parse_api_error_response("not json").is_none());
+        assert!(parse_api_error_response("").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // is_auth_error_message
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_auth_error_detects_session_errors() {
+        assert!(is_auth_error_message(
+            "session_revoked: kicked by new login"
+        ));
+        assert!(is_auth_error_message("session_expired"));
+        assert!(is_auth_error_message("session_required"));
+        assert!(is_auth_error_message("NOT_LOGGED_IN: please login first"));
+        assert!(is_auth_error_message("Unauthorized access"));
+    }
+
+    #[test]
+    fn is_auth_error_detects_401_status() {
+        assert!(is_auth_error_message("request failed: status=401"));
+        assert!(is_auth_error_message("got status 401 from server"));
+    }
+
+    #[test]
+    fn is_auth_error_detects_relogin() {
+        assert!(is_auth_error_message("relogin required"));
+    }
+
+    #[test]
+    fn is_auth_error_case_insensitive() {
+        assert!(is_auth_error_message("SESSION_REVOKED"));
+        assert!(is_auth_error_message("Unauthorized"));
+    }
+
+    #[test]
+    fn is_auth_error_rejects_normal_errors() {
+        assert!(!is_auth_error_message("network timeout"));
+        assert!(!is_auth_error_message("parse error"));
+        assert!(!is_auth_error_message("status=500"));
+        assert!(!is_auth_error_message(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_wp_token_rotation_error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn wp_token_rotation_detects_wp_transport_401() {
+        assert!(is_wp_token_rotation_error(
+            "wp transport non-2xx (status=401, url=https://blog.wpmm.cc/..., body={\"code\":\"signature_invalid\"})"
+        ));
+        assert!(is_wp_token_rotation_error(
+            "wp transport request failed: status 401"
+        ));
+    }
+
+    #[test]
+    fn wp_token_rotation_rejects_server_401() {
+        // Server session errors are NOT WP token rotation
+        assert!(!is_wp_token_rotation_error("status=401 session_revoked"));
+        assert!(!is_wp_token_rotation_error("got status 401 from server"));
+    }
+
+    #[test]
+    fn wp_token_rotation_rejects_non_401() {
+        assert!(!is_wp_token_rotation_error(
+            "wp transport non-2xx (status=403, url=...)"
+        ));
+        assert!(!is_wp_token_rotation_error("status=500"));
+        assert!(!is_wp_token_rotation_error("network timeout"));
+        assert!(!is_wp_token_rotation_error(""));
+    }
+
+    // -----------------------------------------------------------------------
+    // requires_transport_encryption
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn transport_encryption_required_for_http() {
+        // Env-locked with a NEUTRAL value (default branch: http requires
+        // encryption) so concurrent env users cannot flip the outcome.
+        let _guard =
+            crate::db::TestEnvVarGuard::set("WPTSALL_WP_TRANSPORT_ENCRYPT", "default-auto");
+        assert!(requires_transport_encryption("http://example.com/api"));
+    }
+
+    #[test]
+    fn transport_encryption_not_required_for_https_by_default() {
+        // Env-locked instead of a bare remove_var: these tests run
+        // concurrently and the env is process-global. The neutral value
+        // exercises the default branch (https opt-out).
+        let _guard =
+            crate::db::TestEnvVarGuard::set("WPTSALL_WP_TRANSPORT_ENCRYPT", "default-auto");
+        assert!(!requires_transport_encryption("https://example.com/api"));
+    }
+
+    #[test]
+    fn transport_encryption_https_when_env_always() {
+        let _guard = crate::db::TestEnvVarGuard::set("WPTSALL_WP_TRANSPORT_ENCRYPT", "always");
+        assert!(requires_transport_encryption("https://example.com/api"));
+    }
+
+    #[test]
+    fn transport_encryption_required_case_insensitive() {
+        // Env-locked: concurrent tests must not flip the opt-in flag.
+        let _guard =
+            crate::db::TestEnvVarGuard::set("WPTSALL_WP_TRANSPORT_ENCRYPT", "default-auto");
+        assert!(requires_transport_encryption("HTTP://EXAMPLE.COM/api"));
+        assert!(!requires_transport_encryption("HTTPS://example.com/api"));
+    }
+
+    #[test]
+    fn transport_encryption_not_required_for_other_schemes() {
+        assert!(!requires_transport_encryption("ftp://example.com/file"));
+        assert!(!requires_transport_encryption("ws://example.com/sock"));
+        assert!(!requires_transport_encryption(""));
+        assert!(!requires_transport_encryption("not-a-url"));
+    }
+
+    #[test]
+    fn extract_url_path_with_query_strips_wp_json_and_sorts_query() {
+        let url = "https://blog.wpmm.cc/wp-json/wptsall/v2/abc/client/media-upload/status?z=9&upload_id=up-1&a=1";
+        let path = extract_url_path_with_query(url);
+        assert_eq!(
+            path,
+            "/wptsall/v2/abc/client/media-upload/status?a=1&upload_id=up-1&z=9"
+        );
+    }
+
+    #[test]
+    fn extract_url_path_with_query_uses_rfc3986_encoding() {
+        let url =
+            "https://blog.wpmm.cc/wp-json/wptsall/v2/abc/client/content?search=hello world&tag=a%2Bb";
+        let path = extract_url_path_with_query(url);
+        assert_eq!(
+            path,
+            "/wptsall/v2/abc/client/content?search=hello%20world&tag=a%2Bb"
+        );
+    }
+
+    #[test]
+    fn canonical_signature_changes_when_signed_headers_change() {
+        let base = crate::crypto::build_canonical_string(
+            "POST",
+            "/wptsall/v2/abc/client/media-upload",
+            "1700000000",
+            "nonce-1",
+            b"payload",
+            &[("X-WPTSALL-Task-ID", "1")],
+        );
+        let changed = crate::crypto::build_canonical_string(
+            "POST",
+            "/wptsall/v2/abc/client/media-upload",
+            "1700000000",
+            "nonce-1",
+            b"payload",
+            &[("X-WPTSALL-Task-ID", "2")],
+        );
+        assert_ne!(
+            base, changed,
+            "signed header changes must affect canonical string"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // try_decrypt_response_body (RFC #183 envelope detection)
+    // -----------------------------------------------------------------------
+
+    /// Build an encrypted envelope JSON string for testing.
+    fn build_test_encrypted_envelope(plaintext: &[u8], kdf_info: &str, ikm: &str) -> String {
+        use aes_gcm::aead::generic_array::GenericArray;
+        use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine;
+        use hkdf::Hkdf;
+        use rand::RngCore;
+        use sha2::Sha256;
+
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce_b64url = URL_SAFE_NO_PAD.encode(nonce_bytes);
+
+        let hk = Hkdf::<Sha256>::new(Some(nonce_b64url.as_bytes()), ikm.as_bytes());
+        let mut key = [0u8; 32];
+        hk.expand(kdf_info.as_bytes(), &mut key).unwrap();
+
+        let hk_nonce = Hkdf::<Sha256>::new(Some(kdf_info.as_bytes()), nonce_b64url.as_bytes());
+        let mut gcm_nonce = [0u8; 12];
+        hk_nonce
+            .expand(b"wptsall-response-nonce-v1", &mut gcm_nonce)
+            .unwrap();
+
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let encrypted = cipher
+            .encrypt(GenericArray::from_slice(&gcm_nonce), plaintext)
+            .unwrap();
+
+        let payload_b64 = STANDARD.encode(&encrypted);
+
+        serde_json::json!({
+            "success": true,
+            "encrypted": true,
+            "data": {
+                "encrypted_payload": payload_b64,
+                "nonce": nonce_b64url,
+                "algorithm": "AES-256-GCM",
+                "kdf_version": "hkdf-sha256-v1",
+                "kdf_info": kdf_info
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn try_decrypt_detects_encrypted_envelope() {
+        let plaintext = br#"{"success":true,"data":{"items":[{"id":"d1"}]}}"#;
+        let ikm = "sess_test_token_123";
+        let body = build_test_encrypted_envelope(plaintext, "wptsall-domains-v1", ikm);
+
+        let result = try_decrypt_response_body(&body, ikm, None).unwrap();
+        assert!(result.is_some(), "should detect and decrypt envelope");
+        let decrypted = result.unwrap();
+        assert_eq!(decrypted, String::from_utf8_lossy(plaintext));
+    }
+
+    #[test]
+    fn try_decrypt_returns_none_for_plaintext() {
+        let body = r#"{"success":true,"data":{"items":[]}}"#;
+        let result = try_decrypt_response_body(body, "any-ikm", None).unwrap();
+        assert!(result.is_none(), "plain response should return None");
+    }
+
+    #[test]
+    fn try_decrypt_returns_none_for_non_json() {
+        let result = try_decrypt_response_body("not json at all", "ikm", None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_decrypt_returns_none_when_encrypted_is_false() {
+        let body = r#"{"success":true,"encrypted":false,"data":{"items":[]}}"#;
+        let result = try_decrypt_response_body(body, "ikm", None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_decrypt_returns_none_when_encrypted_missing() {
+        let body = r#"{"success":true,"data":{"items":[]}}"#;
+        let result = try_decrypt_response_body(body, "ikm", None).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn try_decrypt_returns_error_with_wrong_ikm() {
+        let plaintext = b"secret";
+        let body = build_test_encrypted_envelope(plaintext, "wptsall-domains-v1", "correct-ikm");
+        let result = try_decrypt_response_body(&body, "wrong-ikm", None);
+        assert!(result.is_err(), "wrong IKM must fail decryption");
+    }
+
+    #[test]
+    fn try_decrypt_rejects_unsupported_algorithm() {
+        let body = serde_json::json!({
+            "success": true,
+            "encrypted": true,
+            "data": {
+                "encrypted_payload": "ZmFrZQ==",
+                "nonce": "ZmFrZQ",
+                "algorithm": "ChaCha20-Poly1305",
+                "kdf_version": "hkdf-sha256-v1",
+                "kdf_info": "wptsall-domains-v1"
+            }
+        })
+        .to_string();
+        let result = try_decrypt_response_body(&body, "ikm", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn try_decrypt_rejects_unsupported_kdf_version() {
+        let body = serde_json::json!({
+            "success": true,
+            "encrypted": true,
+            "data": {
+                "encrypted_payload": "ZmFrZQ==",
+                "nonce": "ZmFrZQ",
+                "algorithm": "AES-256-GCM",
+                "kdf_version": "hkdf-sha512-v1",
+                "kdf_info": "wptsall-domains-v1"
+            }
+        })
+        .to_string();
+        let result = try_decrypt_response_body(&body, "ikm", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_wp_response_signature_requires_header_when_required() {
+        let _skip_sig_guard = EnvVarGuard::set("WPTSALL_SKIP_SIGNATURE_CHECK", String::new());
+        let result = verify_wp_response_signature_for_plaintext(
+            "wptc1.test.123.sig",
+            br#"{"success":true}"#,
+            None,
+            "https://example.com/wp-json/wptsall/v2/abc/client/media-upload",
+            true,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_wp_response_signature_fails_on_invalid_signature() {
+        let _skip_sig_guard = EnvVarGuard::set("WPTSALL_SKIP_SIGNATURE_CHECK", String::new());
+        let result = verify_wp_response_signature_for_plaintext(
+            "wptc1.test.123.sig",
+            br#"{"success":true}"#,
+            Some("invalid-signature"),
+            "https://example.com/wp-json/wptsall/v2/abc/client/media-upload",
+            true,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_wp_response_signature_passes_on_valid_signature() {
+        let token = "wptc1.test.123.sig";
+        let body = r#"{"success":true,"data":{"ok":1}}"#;
+        let signing_key = derive_signing_key(token);
+        let sig = crate::crypto::compute_request_signature(&signing_key, body);
+
+        let result = verify_wp_response_signature_for_plaintext(
+            token,
+            body.as_bytes(),
+            Some(sig.as_str()),
+            "https://example.com/wp-json/wptsall/v2/abc/client/media-upload",
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_wp_response_signature_can_skip_missing_header_in_dev_mode() {
+        let _skip_sig_guard = EnvVarGuard::set("WPTSALL_SKIP_SIGNATURE_CHECK", "true".to_string());
+        let result = verify_wp_response_signature_for_plaintext(
+            "wptc1.test.123.sig",
+            br#"{"success":true}"#,
+            None,
+            "https://example.com/wp-json/wptsall/v2/abc/client/ping",
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn verify_wp_response_signature_can_skip_invalid_signature_in_dev_mode() {
+        let _skip_sig_guard = EnvVarGuard::set("WPTSALL_SKIP_SIGNATURE_CHECK", "true".to_string());
+        let result = verify_wp_response_signature_for_plaintext(
+            "wptc1.test.123.sig",
+            br#"{"success":true}"#,
+            Some("invalid-signature"),
+            "https://example.com/wp-json/wptsall/v2/abc/client/ping",
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // opus5 A-03 (AF-03): device identity is threaded per binding.
+    // The transport layer takes device_id as an explicit argument and must
+    // never re-read WPTSALL_WP_DEVICE_ID: with the env override set (exactly
+    // what the e2e lane exports), two bindings in the same process still
+    // send their own device ids, preserving WP-side device-scoped token
+    // revocation per binding.
+    // -----------------------------------------------------------------------
+
+    async fn start_device_capture_server() -> (u16, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let (rd, mut wr) = tokio::io::split(socket);
+                    let mut reader = BufReader::new(rd);
+                    let mut device = String::new();
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        if trimmed
+                            .to_ascii_lowercase()
+                            .starts_with("x-wptsall-device-id:")
+                        {
+                            device =
+                                trimmed["x-wptsall-device-id:".len()..].trim().to_string();
+                        }
+                    }
+                    if !device.is_empty() {
+                        sink.lock().await.push(device);
+                    }
+                    let body = r#"{"success":true}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = wr.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    #[tokio::test]
+    async fn wp_transport_threads_device_id_per_binding_ignores_env() {
+        let _env_guard = EnvVarGuard::set("WPTSALL_WP_DEVICE_ID", "env-hijack-device".to_string());
+        // Dev-mode signature skip (test lane): the capture mock serves no
+        // X-WPTSALL-Response-Signature, which Protocol v2 otherwise requires.
+        let _skip_sig_guard =
+            EnvVarGuard::set("WPTSALL_SKIP_SIGNATURE_CHECK", "true".to_string());
+        let (port, seen) = start_device_capture_server().await;
+        let client = Client::new();
+        let url = format!("http://127.0.0.1:{}/wptsall/v2/ping", port);
+
+        for device in ["device-A", "device-B"] {
+            wp_request_with_transport(
+                &client,
+                reqwest::Method::GET,
+                &url,
+                "tok",
+                "shared-worker",
+                device,
+                &serde_json::json!({}),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("request for {} failed: {e:#}", device));
+        }
+
+        let devices = seen.lock().await.clone();
+        assert_eq!(
+            devices,
+            vec!["device-A".to_string(), "device-B".to_string()],
+            "each binding must send its own threaded device id, never the env override"
+        );
+    }
 }

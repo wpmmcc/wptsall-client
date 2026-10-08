@@ -17,7 +17,9 @@ pub mod translations;
 pub(crate) mod unit_lock;
 pub mod vendor;
 
-
+#[cfg(test)]
+#[path = "../../../../tests/modules/client-wpplugin/unit/physical_sqlite_capacity.rs"]
+mod physical_sqlite_capacity;
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -129,3 +131,541 @@ pub(crate) fn migrate_from_json_if_needed(conn: &Connection) -> Result<()> {
 }
 
 // Private harness serialization, migrated with the private test overlay.
+use std::sync::{Mutex as StdMutex, OnceLock};use std::{
+    cell::{Cell, RefCell},
+    thread_local,
+};thread_local! {
+    static TEST_ENV_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static TEST_ENV_LOCK_GUARD: RefCell<Option<std::sync::MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+}pub(crate) fn test_env_lock() -> &'static StdMutex<()> {
+    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| StdMutex::new(()))
+}#[derive(Debug)]
+pub(crate) struct TestEnvVarGuard {
+    key: &'static str,
+    previous: Option<String>,
+}impl TestEnvVarGuard {
+    fn acquire_scope() {
+        TEST_ENV_LOCK_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current == 0 {
+                TEST_ENV_LOCK_GUARD.with(|slot| {
+                    let guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+                    *slot.borrow_mut() = Some(guard);
+                });
+            }
+            depth.set(current + 1);
+        });
+    }
+
+    fn release_scope() {
+        TEST_ENV_LOCK_DEPTH.with(|depth| {
+            let current = depth.get();
+            debug_assert!(current > 0, "test env lock depth underflow");
+            let next = current.saturating_sub(1);
+            depth.set(next);
+            if next == 0 {
+                TEST_ENV_LOCK_GUARD.with(|slot| {
+                    *slot.borrow_mut() = None;
+                });
+            }
+        });
+    }
+
+    pub(crate) fn set(key: &'static str, value: impl Into<String>) -> Self {
+        Self::acquire_scope();
+        let previous = std::env::var(key).ok();
+        std::env::set_var(key, value.into());
+        Self { key, previous }
+    }
+
+    pub(crate) fn set_default(key: &'static str, value: impl Into<String>) -> Self {
+        Self::acquire_scope();
+        let previous = std::env::var(key).ok();
+        let effective = previous.clone().unwrap_or_else(|| value.into());
+        std::env::set_var(key, effective);
+        Self { key, previous }
+    }
+}impl Drop for TestEnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.as_deref() {
+            std::env::set_var(self.key, previous);
+        } else {
+            std::env::remove_var(self.key);
+        }
+        Self::release_scope();
+    }
+}#[cfg(test)]
+pub(crate) fn owned_mock_bindings_key() -> TestEnvVarGuard {
+    TestEnvVarGuard::set_default(
+        "WPTSALL_COMPONENT_BINDINGS_SECRET",
+        "owned-private-fixture-key",
+    )
+}#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_db() -> Connection {
+        open_db(":memory:").expect("in-memory db")
+    }
+
+    #[test]
+    fn test_open_db_creates_tables() {
+        let conn = make_db();
+        // Verify system_config table exists by querying it
+        let result: rusqlite::Result<i64> =
+            conn.query_row("SELECT COUNT(*) FROM system_config", [], |row| row.get(0));
+        assert!(result.is_ok(), "system_config table should exist");
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[test]
+    fn open_db_busy_timeout_default_provides_bounded_wait() {
+        // Live probe (2026-09-08) DISPROVED the FM-DB-LOCK premise "no
+        // busy_timeout configured": rusqlite's Connection::open applies a
+        // default 5000ms busy_timeout, so lock contention waits up to 5s
+        // instead of failing with an immediate SQLITE_BUSY. Hard-assert the
+        // bounded wait. Unproven remainder tracked on FM-DB-LOCK notes:
+        // explicit/configurable timeout, concurrent-writer integrity,
+        // integrity_check on open.
+        let conn = make_db();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("PRAGMA busy_timeout must be queryable");
+        assert!(
+            timeout >= 5000,
+            "busy_timeout must provide a bounded wait for lock contention, got {timeout}ms"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_preserve_wal_integrity() {
+        // DB-03 open half (2026-09-08, Phase 4 L3 round 6): multi-connection
+        // concurrent writes through the REAL open_db path — every open runs
+        // schema DDL (create_tables), so this also probes DB-03's hot-path
+        // DDL concern. WAL + the default busy_timeout must land every row
+        // and leave the file passing PRAGMA integrity_check.
+        let dir = std::env::temp_dir().join(format!(
+            "wptsall-db-concurrent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("concurrent.db");
+        let path_str = db_path.to_str().unwrap().to_string();
+
+        {
+            let conn = open_db(&path_str).expect("initial open_db");
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS concurrent_probe (
+                    id        INTEGER PRIMARY KEY,
+                    thread_id INTEGER NOT NULL,
+                    seq       INTEGER NOT NULL
+                );",
+            )
+            .expect("probe table");
+        }
+
+        const THREADS: usize = 8;
+        const INSERTS: usize = 50;
+        let mut handles = Vec::new();
+        for t in 0..THREADS {
+            let p = path_str.clone();
+            handles.push(std::thread::spawn(move || {
+                // 30s busy_timeout covering open_db's OWN WAL/DDL statements
+                // too (not just post-open inserts): saturated CI runners can
+                // blow past the 5s default under bursty IO (observed:
+                // insert-time DatabaseBusy on the v2.1.3 tag run; open-time
+                // DatabaseBusy on windows-latest 2026-09-14). This test
+                // proves WAL integrity — every write lands — not that 5s
+                // specifically always suffices; the 5s default itself is
+                // pinned by open_db_busy_timeout_default_provides_bounded_wait.
+                let conn = open_db_with_busy_timeout(&p, std::time::Duration::from_secs(30))
+                    .expect("per-thread open_db (DDL + WAL)");
+                for i in 0..INSERTS {
+                    conn.execute(
+                        "INSERT INTO concurrent_probe (thread_id, seq) VALUES (?1, ?2)",
+                        rusqlite::params![t as i64, i as i64],
+                    )
+                    .expect("concurrent insert");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread join");
+        }
+
+        let conn = open_db(&path_str).expect("verify open_db");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM concurrent_probe", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            count as usize,
+            THREADS * INSERTS,
+            "every concurrent write must land — no silent losses"
+        );
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .expect("integrity_check");
+        assert_eq!(
+            integrity, "ok",
+            "WAL database must pass integrity_check after concurrent writers"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_migrate_from_json_if_needed_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = migration_env(dir.path());
+        let conn = make_db();
+
+        // First call: performs migration and sets the done flag
+        migrate_from_json_if_needed(&conn).unwrap();
+
+        // Verify done flag was set
+        let done_flag = system::get_system_config(&conn, "json_migration_done");
+        assert_eq!(done_flag, Some("1".to_string()));
+
+        // Second call should be a no-op (no error, idempotent)
+        migrate_from_json_if_needed(&conn).unwrap();
+
+        // Done flag should still be "1"
+        let done_flag2 = system::get_system_config(&conn, "json_migration_done");
+        assert_eq!(done_flag2, Some("1".to_string()));
+    }
+
+    #[test]
+    fn test_migrate_sets_done_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = migration_env(dir.path());
+        let conn = make_db();
+
+        // Before migration, done flag should not exist
+        let before = system::get_system_config(&conn, "json_migration_done");
+        assert_eq!(before, None);
+
+        // Run migration
+        migrate_from_json_if_needed(&conn).unwrap();
+
+        // After migration, done flag should be "1"
+        let after = system::get_system_config(&conn, "json_migration_done");
+        assert_eq!(after, Some("1".to_string()));
+    }
+
+    const BINDING_FILES: [(&str, &str, &str); 4] = [
+        (
+            "component_bindings_doc",
+            "WPTSALL_COMPONENT_BINDINGS_FILE",
+            r#"{"version":2,"components":{"original":{"auth":{"api_key":"cli03-private-sentinel"}}}}"#,
+        ),
+        (
+            "domain_token_bindings_doc",
+            "WPTSALL_DOMAIN_TOKEN_BINDINGS_FILE",
+            r#"{"version":2,"domains":{"https://cli03.invalid":{"wp_client_token":"cli03-private-sentinel"}}}"#,
+        ),
+        (
+            "task_type_component_bindings_doc",
+            "WPTSALL_TASK_TYPE_COMPONENT_BINDINGS_FILE",
+            r#"{"version":2,"task_types":{"text":{"component_id":"original"}}}"#,
+        ),
+        (
+            "rule_component_bindings_doc",
+            "WPTSALL_RULE_COMPONENT_BINDINGS_FILE",
+            r#"{"version":2,"global_defaults":{"plain_text":"original"}}"#,
+        ),
+    ];
+
+    fn migration_env(root: &Path) -> Vec<TestEnvVarGuard> {
+        let mut guards = vec![
+            TestEnvVarGuard::set("WPTSALL_DATA_DIR", root.to_str().unwrap()),
+            TestEnvVarGuard::set("WPTSALL_COMPONENT_BINDINGS_SECRET", "cli03-test-key"),
+        ];
+        for env in [
+            "WPTSALL_COMPONENT_BINDINGS_FILE",
+            "WPTSALL_DOMAIN_TOKEN_BINDINGS_FILE",
+            "WPTSALL_TASK_TYPE_COMPONENT_BINDINGS_FILE",
+            "WPTSALL_RULE_COMPONENT_BINDINGS_FILE",
+            "WPTSALL_VENDOR_KEYS_FILE",
+            "WPTSALL_VENDOR_OAUTH_FILE",
+            "WPTSALL_PROXY_PROFILES_FILE",
+            "WPTSALL_COMPONENTS_LOCAL_FILE",
+            "WPTSALL_SIGNING_PUBLIC_KEY_FILE",
+        ] {
+            guards.push(TestEnvVarGuard::set(env, root.join(env).to_str().unwrap()));
+        }
+        guards
+    }
+
+    // catalog: WEBUI-MOD-db-mod-rs
+    // oracle: L2
+    #[test]
+    fn cli03_migration_bad_binding_file_rolls_back_without_done_flag_and_can_retry() {
+        for (_, broken_env, _) in BINDING_FILES {
+            let dir = tempfile::tempdir().unwrap();
+            let _env = migration_env(dir.path());
+            let conn = make_db();
+            system::set_system_config(&conn, "device_id", "original-device").unwrap();
+            for (_, env, raw) in BINDING_FILES {
+                std::fs::write(
+                    dir.path().join(env),
+                    if env == broken_env { "{" } else { raw },
+                )
+                .unwrap();
+            }
+            assert!(migrate_from_json_if_needed(&conn).is_err());
+            assert!(
+                system::get_system_config_checked(&conn, "json_migration_done")
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                system::get_system_config(&conn, "device_id").as_deref(),
+                Some("original-device")
+            );
+            for (key, env, raw) in BINDING_FILES {
+                assert!(
+                    system::get_system_config_checked(&conn, key)
+                        .unwrap()
+                        .is_none(),
+                    "all binding imports roll back"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join(env)).unwrap(),
+                    if env == broken_env { "{" } else { raw }
+                );
+            }
+            for (_, env, raw) in BINDING_FILES {
+                if env == broken_env {
+                    std::fs::write(dir.path().join(env), raw).unwrap();
+                }
+            }
+            migrate_from_json_if_needed(&conn).unwrap();
+            assert_eq!(
+                system::get_system_config(&conn, "json_migration_done").as_deref(),
+                Some("1")
+            );
+            assert!(!bindings::load_component_bindings_doc(&conn)
+                .unwrap()
+                .components
+                .is_empty());
+            assert!(!bindings::load_domain_token_bindings_doc(&conn)
+                .unwrap()
+                .domains
+                .is_empty());
+            assert!(!bindings::load_task_type_component_bindings_doc(&conn)
+                .unwrap()
+                .task_types
+                .is_empty());
+            assert!(!bindings::load_rule_component_bindings_doc(&conn)
+                .unwrap()
+                .global_defaults
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn cli03_migration_done_write_failure_rolls_back_every_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = migration_env(dir.path());
+        let conn = make_db();
+        for (_, env, raw) in BINDING_FILES {
+            std::fs::write(dir.path().join(env), raw).unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_done BEFORE INSERT ON system_config
+            WHEN NEW.key = 'json_migration_done'
+            BEGIN SELECT RAISE(ABORT, 'cli03 fixture'); END;",
+        )
+        .unwrap();
+        assert!(migrate_from_json_if_needed(&conn).is_err());
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM system_config", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "no earlier import may escape a failed migration");
+        conn.execute_batch("DROP TRIGGER refuse_done").unwrap();
+        migrate_from_json_if_needed(&conn).unwrap();
+        assert_eq!(
+            system::get_system_config(&conn, "json_migration_done").as_deref(),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn cli03_migration_keeps_existing_db_bindings_even_when_json_is_stale_or_corrupt() {
+        for (key, env, raw) in BINDING_FILES {
+            let dir = tempfile::tempdir().unwrap();
+            let _env = migration_env(dir.path());
+            let conn = make_db();
+            system::set_encrypted_config(&conn, key, raw).unwrap();
+            let before = system::get_system_config(&conn, key).unwrap();
+            std::fs::write(dir.path().join(env), "{").unwrap();
+            migrate_from_json_if_needed(&conn).unwrap();
+            assert_eq!(
+                system::get_system_config(&conn, key).as_deref(),
+                Some(before.as_str())
+            );
+            assert_eq!(std::fs::read_to_string(dir.path().join(env)).unwrap(), "{");
+            assert_eq!(
+                system::get_system_config(&conn, "json_migration_done").as_deref(),
+                Some("1")
+            );
+        }
+    }
+
+    #[test]
+    fn cli03_migration_does_not_hide_sql_or_existing_binding_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = migration_env(dir.path());
+        let conn = make_db();
+        system::set_system_config(&conn, "component_bindings_doc", "{").unwrap();
+        assert!(migrate_from_json_if_needed(&conn).is_err());
+        assert!(
+            system::get_system_config_checked(&conn, "json_migration_done")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            system::get_system_config(&conn, "component_bindings_doc").as_deref(),
+            Some("{")
+        );
+        let conn = Connection::open_in_memory().unwrap();
+        assert!(
+            migrate_from_json_if_needed(&conn).is_err(),
+            "missing table must not count as a completed migration"
+        );
+        let conn = make_db();
+        conn.execute(
+            "INSERT INTO system_config (key, value) VALUES ('json_migration_done', X'FF')",
+            [],
+        )
+        .unwrap();
+        assert!(
+            migrate_from_json_if_needed(&conn).is_err(),
+            "an unreadable done marker is not a missing marker"
+        );
+        let value: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM system_config WHERE key = 'json_migration_done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, [255]);
+    }
+
+    #[test]
+    fn cli03_migration_rejects_empty_and_positional_binding_documents() {
+        for (key, env, _) in BINDING_FILES {
+            let positional = match key {
+                "task_type_component_bindings_doc" => "[2,{},{}]",
+                "rule_component_bindings_doc" => "[2,{},{},{},{},{},[]]",
+                _ => "[2,{}]",
+            };
+            for raw in ["", " \n", "null", positional] {
+                let dir = tempfile::tempdir().unwrap();
+                let _env = migration_env(dir.path());
+                std::fs::write(dir.path().join(env), raw).unwrap();
+                let conn = make_db();
+                assert!(
+                    migrate_from_json_if_needed(&conn).is_err(),
+                    "{key} must not import a non-object document"
+                );
+                assert!(system::get_system_config_checked(&conn, key)
+                    .unwrap()
+                    .is_none());
+                assert!(
+                    system::get_system_config_checked(&conn, "json_migration_done")
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(std::fs::read_to_string(dir.path().join(env)).unwrap(), raw);
+            }
+        }
+    }
+
+    /// Verify that pending_callbacks has the relation_id/object_id/object_type
+    /// columns
+    /// after create_tables() (fresh DB).
+    #[test]
+    fn test_pending_callbacks_has_new_columns() {
+        let conn = make_db();
+        // Insert a row using the new columns to prove they exist
+        conn.execute(
+            "INSERT INTO pending_callbacks
+             (api_base_url, idempotency_key, payload_json, created_at, relation_id, object_id, object_type)
+             VALUES ('https://x.com', 'key1', '{}', 0, 5, 42, 'post_type')",
+            [],
+        )
+        .expect("insert with new columns should succeed");
+
+        let (rel, obj, obj_type): (i64, i64, String) = conn
+            .query_row(
+                "SELECT relation_id, object_id, object_type FROM pending_callbacks WHERE idempotency_key = 'key1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("should read back inserted values");
+        assert_eq!(rel, 5);
+        assert_eq!(obj, 42);
+        assert_eq!(obj_type, "post_type");
+    }
+
+    /// Verify the ALTER TABLE upgrade path: simulate an old database that has the
+    /// pending_callbacks table WITHOUT relation_id/object_id/object_type, then call create_tables()
+    /// again and confirm the columns are added (idempotent schema upgrade).
+    #[test]
+    fn test_alter_table_upgrade_adds_new_columns() {
+        let conn = Connection::open(":memory:").expect("in-memory");
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+            .unwrap();
+
+        // Create the old-style pending_callbacks table without the new columns.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pending_callbacks (
+                api_base_url     TEXT NOT NULL,
+                idempotency_key  TEXT PRIMARY KEY NOT NULL,
+                payload_json     TEXT NOT NULL DEFAULT '{}',
+                route_secret_enc TEXT,
+                created_at       INTEGER NOT NULL DEFAULT 0,
+                retry_count      INTEGER NOT NULL DEFAULT 0,
+                last_retry_at    INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+
+        // Insert a row into the old schema to ensure existing data is preserved.
+        conn.execute(
+            "INSERT INTO pending_callbacks (api_base_url, idempotency_key, payload_json)
+             VALUES ('https://old.com', 'old-key', '{}')",
+            [],
+        )
+        .unwrap();
+
+        // Now run create_tables() — the ALTER TABLE calls should add the new columns.
+        schema::create_tables(&conn).expect("create_tables on existing db should succeed");
+
+        // Verify new columns exist and have default values for the old row.
+        let (rel, obj, obj_type): (i64, i64, String) = conn
+            .query_row(
+                "SELECT relation_id, object_id, object_type FROM pending_callbacks WHERE idempotency_key = 'old-key'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("columns should exist after ALTER TABLE");
+        assert_eq!(rel, 0, "old row gets DEFAULT 0 for relation_id");
+        assert_eq!(obj, 0, "old row gets DEFAULT 0 for object_id");
+        assert_eq!(
+            obj_type, "post_type",
+            "old row is normalized to 'post_type' for object_type"
+        );
+
+        // Verify calling create_tables() a second time is safe (idempotent).
+        schema::create_tables(&conn).expect("second create_tables call should be idempotent");
+    }
+}

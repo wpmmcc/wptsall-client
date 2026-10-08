@@ -1,7 +1,7 @@
 mod capacity_status;
 pub(crate) mod routes;
 pub(crate) mod static_html;
-
+pub mod test_support;
 
 use anyhow::{anyhow, Context};
 use reqwest::header::HeaderMap;
@@ -1730,7 +1730,8 @@ pub(crate) async fn fetch_components_for_session(
     Ok(items)
 }
 
-
+#[cfg(test)]
+mod tests;
 
 pub(crate) fn read_recent_log_lines(path: &str, limit: usize) -> anyhow::Result<Vec<String>> {
     read_log_lines_page(path, limit, None, None, None).map(|page| page.lines)

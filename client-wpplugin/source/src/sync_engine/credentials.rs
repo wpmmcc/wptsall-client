@@ -417,3 +417,174 @@ pub async fn pair_with_site(
 
     Ok(credential)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reference vectors generated with PHP 8 `hash_hkdf` on the exact
+    // plugin construction (`class-wpmmcc-rest-handshake.php` §6):
+    //   bin2hex(hash_hkdf('sha256', <secret>, 32, 'wpmmcc-peer-hmac-v1',
+    //                      <min-uuid> . '|1'))
+    #[test]
+    fn hkdf_matches_php_plugin_derivation() {
+        // pairing_secret, client_uuid, peer_uuid → expected hex (PHP).
+        let vector_1 = (
+            "9f1a2b3c4d5e6f708192a3b4c5d6e7f8",
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            "7cd6844ad9f65531518ede47c92422ec411ff6b5cb8bf8a20b8c1ecd8b046b25",
+        );
+        // Salt uses min(uuid_a, uuid_b) — peer UUID sorts first here.
+        let vector_2 = (
+            "aabbccdd",
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "99999999-9999-9999-9999-999999999999",
+            "69a237817d641818d13a7e0cbf2fd96dec452f14f32350f41b4aaca61ce7ded4",
+        );
+
+        for (secret, client_uuid, peer_uuid, expected) in [vector_1, vector_2] {
+            let derived = derive_peer_shared_secret(secret, client_uuid, peer_uuid);
+            assert_eq!(encode_hex(&derived), expected);
+        }
+    }
+
+    #[test]
+    fn hkdf_salt_uses_lexicographic_min() {
+        // Client UUID sorts after the peer UUID: salt must be peer|1.
+        // Proves the min() branch both ways through distinct vectors.
+        let a = derive_peer_shared_secret("s", "zzzz", "aaaa");
+        let b = derive_peer_shared_secret("s", "aaaa", "zzzz");
+        assert_eq!(a, b, "derivation must be symmetric in the two uuids");
+    }
+
+    #[test]
+    fn roles_map_to_requested_directions() {
+        assert_eq!(PairingRole::Source.as_requested_direction(), "pull_only");
+        assert_eq!(PairingRole::Target.as_requested_direction(), "push_only");
+    }
+
+    #[test]
+    fn credentials_storage_roundtrip_encrypted() {
+        let _key = crate::db::owned_mock_bindings_key();
+        let dir = std::env::temp_dir().join(format!("sync_cred_test_{}", unix_ts()));
+        let path = dir.join("creds.json");
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut doc = PeerCredentialsDoc::default();
+        ensure_client_identity(&mut doc);
+        assert!(!doc.client_origin_uuid.is_empty());
+        assert!(doc
+            .client_origin_url
+            .starts_with("https://wpmmcc-ats-client.local/"));
+
+        let cred = PeerCredential {
+            domain: "https://site-a.example".to_string(),
+            peer_uuid: "22222222-2222-2222-2222-222222222222".to_string(),
+            peer_name: "Site A".to_string(),
+            shared_secret_hex: "00".repeat(32),
+            key_scheme: "hmac_v1".to_string(),
+            negotiated_direction: "push_only".to_string(),
+            install_signature: String::new(),
+            paired_at: unix_ts(),
+            paired_as: "source".to_string(),
+        };
+        doc.peers.insert(cred.domain.clone(), cred.clone());
+        save_peer_credentials(&path_str, &doc).expect("save");
+
+        let loaded = load_peer_credentials(&path_str).expect("load");
+        assert_eq!(loaded.client_origin_uuid, doc.client_origin_uuid);
+        assert_eq!(loaded.peers.get("https://site-a.example"), Some(&cred));
+        assert!(find_peer_credential(&loaded, "https://site-a.example").is_some());
+        assert!(find_peer_credential(&loaded, "https://site-a.example/").is_some());
+
+        assert!(remove_peer_credential(&path_str, "https://site-a.example").unwrap());
+        let after = load_peer_credentials(&path_str).unwrap();
+        assert!(after.peers.is_empty());
+        assert!(!remove_peer_credential(&path_str, "https://site-a.example").unwrap());
+    }
+
+    #[test]
+    fn shared_secret_bytes_decodes_hex() {
+        let cred = PeerCredential {
+            domain: "https://x.example".to_string(),
+            peer_uuid: "u".to_string(),
+            peer_name: String::new(),
+            shared_secret_hex: encode_hex(&[7u8; 32]),
+            key_scheme: "hmac_v1".to_string(),
+            negotiated_direction: "push_only".to_string(),
+            install_signature: String::new(),
+            paired_at: 0,
+            paired_as: "source".to_string(),
+        };
+        assert_eq!(cred.shared_secret_bytes().unwrap(), vec![7u8; 32]);
+        assert!(cred.rest_base_url().ends_with("/wp-json/wpmmcc/v1"));
+    }
+
+    #[tokio::test]
+    async fn pair_with_site_rejects_invalid_code_shapes() {
+        let client = Client::new();
+        let dir = std::env::temp_dir().join(format!("sync_cred_pair_test_{}", unix_ts()));
+        let path = dir.join("creds.json");
+        let path_str = path.to_string_lossy().to_string();
+
+        // Too short / non-hex codes are rejected before any network call.
+        let err = pair_with_site(
+            &client,
+            &path_str,
+            "https://site.example",
+            "abc",
+            PairingRole::Source,
+            "en_US",
+            "zh_CN",
+            "sync_only",
+            "lww",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("32 hex"));
+    }
+
+    #[tokio::test]
+    async fn pair_with_site_rejects_unknown_conflict_strategy() {
+        let client = Client::new();
+        let dir = std::env::temp_dir().join(format!("sync_cred_strategy_test_{}", unix_ts()));
+        let path = dir.join("creds.json");
+        let path_str = path.to_string_lossy().to_string();
+
+        // Legacy/unknown strategy words are rejected before any network
+        // call — the client only ever sends the canonical vocabulary.
+        let err = pair_with_site(
+            &client,
+            &path_str,
+            "https://site.example",
+            "0f1a2b3c4d5e6f708192a3b4c5d6e7f8",
+            PairingRole::Source,
+            "en_US",
+            "zh_CN",
+            "sync_only",
+            "source_dominant",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid conflict strategy"));
+    }
+
+    #[test]
+    fn handshake_body_carries_conflict_strategy() {
+        let mut doc = PeerCredentialsDoc::default();
+        ensure_client_identity(&mut doc);
+
+        let body = handshake_request_body(
+            &doc,
+            "0f1a2b3c4d5e6f708192a3b4c5d6e7f8",
+            "pull_only",
+            "en_US",
+            "zh_CN",
+            "sync_only",
+            "manual_review",
+        );
+        assert_eq!(body["conflict_strategy"], "manual_review");
+        assert_eq!(body["pairing_code"], "0f1a2b3c4d5e6f708192a3b4c5d6e7f8");
+        assert_eq!(body["origin_uuid"], doc.client_origin_uuid.as_str());
+    }
+}

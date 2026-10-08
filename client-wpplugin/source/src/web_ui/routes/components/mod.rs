@@ -41,7 +41,11 @@ pub(super) use self::downloads::{
 use self::downloads::{
     request_component_download_with_passthrough, resolve_download_template_with_signing_key,
 };
-
+#[cfg(test)]
+pub(super) use self::helpers::{
+    backfill_local_components_from_server, invalid_task_override_paths,
+    patch_template_snapshot_for_local_kind,
+};
 pub(super) use self::helpers::{
     build_local_component_runtime_for_task, component_exists_in_local_doc,
     find_server_component_by_template_id, load_local_components_runtime_doc,

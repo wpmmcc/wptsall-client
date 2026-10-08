@@ -50,6 +50,10 @@ pub struct EntityPayload {
     pub plugin_specific: HashMap<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changed_fields: Option<Vec<String>>,
+    /// Fields the target must keep on an existing post. A missing core key
+    /// would otherwise become an empty title, content or excerpt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserved_fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

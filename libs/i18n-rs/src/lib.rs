@@ -303,3 +303,173 @@ pub fn translate(key: &str, lang: Language) -> I18nResult<String> {
 pub fn translate_with_fallback(key: &str, lang: Language) -> I18nResult<String> {
     I18nManager::get()?.translate_with_fallback(key, lang)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EN_JSON: &str = r#"{
+      "common": {
+        "save": "Save",
+        "cancel": "Cancel",
+        "delete": "Delete"
+      },
+      "login": {
+        "prompt": "Login"
+      }
+    }"#;
+
+    const ZH_CN_JSON: &str = r#"{
+      "common": {
+        "save": "保存",
+        "cancel": "取消",
+        "delete": "删除"
+      },
+      "login": {
+        "prompt": "登录"
+      }
+    }"#;
+
+    #[test]
+    fn test_language_from_str() {
+        assert_eq!(Language::from_str("en").unwrap(), Language::En);
+        assert_eq!(Language::from_str("en-US").unwrap(), Language::En);
+        assert_eq!(Language::from_str("zh-CN").unwrap(), Language::ZhCn);
+        assert_eq!(Language::from_str("zh-Hans").unwrap(), Language::ZhCn);
+        assert!(Language::from_str("fr").is_err());
+    }
+
+    #[test]
+    fn test_i18n_initialization() {
+        let _manager = I18nManager::load_from_content(EN_JSON, ZH_CN_JSON, Language::En)
+            .expect("Failed to load translations");
+    }
+
+    #[test]
+    fn test_translate_english() {
+        let manager = I18nManager::load_from_content(EN_JSON, ZH_CN_JSON, Language::En)
+            .expect("Failed to load translations");
+
+        assert_eq!(
+            manager.translate("common.save", Language::En).unwrap(),
+            "Save"
+        );
+        assert_eq!(
+            manager.translate("common.cancel", Language::En).unwrap(),
+            "Cancel"
+        );
+    }
+
+    #[test]
+    fn test_translate_chinese() {
+        let manager = I18nManager::load_from_content(EN_JSON, ZH_CN_JSON, Language::ZhCn)
+            .expect("Failed to load translations");
+
+        assert_eq!(
+            manager.translate("common.save", Language::ZhCn).unwrap(),
+            "保存"
+        );
+        assert_eq!(
+            manager.translate("common.cancel", Language::ZhCn).unwrap(),
+            "取消"
+        );
+    }
+
+    #[test]
+    fn test_missing_key() {
+        let manager = I18nManager::load_from_content(EN_JSON, ZH_CN_JSON, Language::En)
+            .expect("Failed to load translations");
+
+        match manager.translate("nonexistent.key", Language::En) {
+            Err(I18nError::KeyNotFound(_)) => {}
+            _ => panic!("Expected KeyNotFound error"),
+        }
+    }
+
+    #[test]
+    fn test_fallback() {
+        let manager = I18nManager::load_from_content(EN_JSON, ZH_CN_JSON, Language::En)
+            .expect("Failed to load translations");
+
+        // Key exists in both, should return Chinese
+        assert_eq!(
+            manager
+                .translate_with_fallback("common.save", Language::ZhCn)
+                .unwrap(),
+            "保存"
+        );
+    }
+
+    #[test]
+    fn test_get_section() {
+        let manager = I18nManager::load_from_content(EN_JSON, ZH_CN_JSON, Language::En)
+            .expect("Failed to load translations");
+
+        let common_section = manager
+            .get_section("common", Language::En)
+            .expect("Failed to get section");
+        assert!(common_section.is_object());
+        assert_eq!(
+            common_section.get("save").unwrap().as_str().unwrap(),
+            "Save"
+        );
+    }
+
+    // ── flat dotted-key catalog style (2026-09-12: resolves the mismatch
+    // documented in the client's main.rs — embedded catalogs are flat) ──
+    const FLAT_EN_JSON: &str = r#"{
+      "app.title": "WPTSALL Client",
+      "app.menu.tasks": "Tasks"
+    }"#;
+
+    const FLAT_ZH_CN_JSON: &str = r#"{
+      "app.title": "WPTSALL 客户端"
+    }"#;
+
+    #[test]
+    fn test_translate_flat_catalog_keys() {
+        let manager = I18nManager::load_from_content(FLAT_EN_JSON, FLAT_ZH_CN_JSON, Language::En)
+            .expect("Failed to load flat translations");
+
+        assert_eq!(
+            manager.translate("app.title", Language::En).unwrap(),
+            "WPTSALL Client"
+        );
+        assert_eq!(
+            manager.translate("app.menu.tasks", Language::En).unwrap(),
+            "Tasks"
+        );
+        // Flat style + language fallback: key only in en, asked in zh-CN.
+        assert_eq!(
+            manager
+                .translate_with_fallback("app.menu.tasks", Language::ZhCn)
+                .unwrap(),
+            "Tasks"
+        );
+        // Flat style in the requested language wins when present.
+        assert_eq!(
+            manager.translate("app.title", Language::ZhCn).unwrap(),
+            "WPTSALL 客户端"
+        );
+        // Truly missing keys still KeyNotFound in flat catalogs.
+        match manager.translate("app.missing", Language::En) {
+            Err(I18nError::KeyNotFound(_)) => {}
+            _ => panic!("Expected KeyNotFound error for missing flat key"),
+        }
+    }
+
+    #[test]
+    fn test_nested_walk_takes_precedence_over_flat_entry() {
+        let en = r#"{
+          "app": { "title": "Nested Wins" },
+          "app.title": "Flat Loses"
+        }"#;
+        let manager = I18nManager::load_from_content(en, en, Language::En)
+            .expect("Failed to load mixed-style translations");
+
+        assert_eq!(
+            manager.translate("app.title", Language::En).unwrap(),
+            "Nested Wins",
+            "the nested walk must resolve before the flat fallback"
+        );
+    }
+}

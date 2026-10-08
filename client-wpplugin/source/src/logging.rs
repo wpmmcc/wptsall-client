@@ -465,13 +465,52 @@ fn flush_log_checked() -> anyhow::Result<()> {
 // so they must flip LOG_ENABLED under the SAME lock these tests use.
 // ---------------------------------------------------------------------------
 
+/// Serialize all tests that read/write the process-global LOG_ENABLED /
+/// LOG_MIN_LEVEL. Without this, parallel test threads corrupt each other's
+/// expected state.
+#[cfg(test)]
+pub(crate) static GLOBAL_LOG_LOCK: Mutex<()> = Mutex::new(());
 
+/// RAII guard: restores LOG_ENABLED and LOG_MIN_LEVEL when dropped.
+#[cfg(test)]
+pub(crate) struct LogStateGuard {
+    prev_enabled: bool,
+    prev_level: &'static str,
+}
 
+#[cfg(test)]
+impl Drop for LogStateGuard {
+    fn drop(&mut self) {
+        set_log_enabled(self.prev_enabled);
+        set_log_min_level(self.prev_level);
+        // Close any test log writer to avoid leaking into other tests.
+        let mut g = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        *g = None;
+    }
+}
 
-
-
-
-
+/// Acquires the global log lock, snapshots current state, applies
+/// (enabled, level), and returns (MutexGuard, LogStateGuard) that restores
+/// state on drop.
+#[cfg(test)]
+pub(crate) fn acquire_log_state(
+    enabled: bool,
+    level: &str,
+) -> (std::sync::MutexGuard<'static, ()>, LogStateGuard) {
+    let guard = GLOBAL_LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let state = LogStateGuard {
+        prev_enabled: get_log_enabled(),
+        prev_level: get_log_min_level_str(),
+    };
+    set_log_enabled(enabled);
+    set_log_min_level(level);
+    // Reset any existing log writer so tests don't interfere with each other.
+    {
+        let mut g = LOG_WRITER.lock().unwrap_or_else(|e| e.into_inner());
+        *g = None;
+    }
+    (guard, state)
+}
 
 pub(crate) fn maybe_export_log(log_file: &str, export_path: &str) -> anyhow::Result<()> {
     if export_path.trim().is_empty() {
@@ -743,4 +782,13 @@ pub(crate) fn redact_string_for_log(input: &str) -> String {
 fn credential_span(s: &str, terminators: &[char]) -> usize {
     s.find(|c: char| terminators.contains(&c) || c.is_whitespace())
         .unwrap_or(s.len())
+}
+#[cfg(test)]
+mod tests;#[cfg(test)]
+mod physical_logging_capacity {
+    use super::*;
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/modules/client-wpplugin/unit/physical_logging_capacity.rs"
+    ));
 }

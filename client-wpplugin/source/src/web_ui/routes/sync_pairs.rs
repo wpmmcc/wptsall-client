@@ -35,6 +35,8 @@ pub(crate) struct SyncPairUpsertRequest {
     pub status: Option<SyncPairStatus>,
     pub translate_component_id: Option<String>,
     #[serde(default)]
+    pub field_actions: Option<Vec<crate::sync_engine::types::SyncFieldAction>>,
+    #[serde(default)]
     pub review_before_push: Option<bool>,
 }
 
@@ -196,7 +198,17 @@ pub(super) async fn handle_sync_pairs_upsert(
         .translate_component_id
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
-    if sync_mode == SyncMode::SyncAndTranslate && translate_component_id.is_none() {
+    let field_actions = crate::sync_engine::field_plan::normalize_field_actions(
+        req.field_actions.clone().unwrap_or_default(),
+    );
+    let component_required = if field_actions.is_empty() {
+        sync_mode == SyncMode::SyncAndTranslate
+    } else {
+        field_actions.iter().any(|row| {
+            row.action == "translate" && row.component_id.as_deref().unwrap_or("").trim().is_empty()
+        }) && translate_component_id.is_none()
+    };
+    if component_required && translate_component_id.is_none() {
         return write_error_response(
             socket,
             "TRANSLATE_COMPONENT_REQUIRED",
@@ -253,6 +265,9 @@ pub(super) async fn handle_sync_pairs_upsert(
             last_sync_count,
             last_error,
             translate_component_id,
+            field_actions: crate::sync_engine::field_plan::normalize_field_actions(
+                req.field_actions.clone().unwrap_or_default(),
+            ),
             review_before_push: req
                 .review_before_push
                 .unwrap_or(existing_review_before_push),

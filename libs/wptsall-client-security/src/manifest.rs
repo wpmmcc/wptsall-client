@@ -136,3 +136,29 @@ pub fn verify_artifact_hash(data: &[u8], expected_hex: &str) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anti_rollback_rejects_older() {
+        assert!(SignedReleaseManifest::assert_not_downgrade("2.1.0", "2.0.9").is_err());
+        assert!(SignedReleaseManifest::assert_not_downgrade("2.1.0", "2.1.0").is_ok());
+        assert!(SignedReleaseManifest::assert_not_downgrade("2.1.0", "2.1.1").is_ok());
+    }
+
+    #[test]
+    fn canonical_json_bytes_sorts_nested_keys_and_preserves_utf8() {
+        let envelope: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../install-client/security/fixtures/releases-envelope.json"
+        ))
+        .unwrap();
+        let value = envelope.get("data").unwrap();
+        let expected =
+            include_str!("../../../install-client/security/fixtures/releases-data.canonical.json")
+                .trim_end();
+
+        let canonical = String::from_utf8(canonical_json_bytes(&value).unwrap()).unwrap();
+        assert_eq!(canonical, expected);
+    }
+}

@@ -289,3 +289,52 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+#[cfg(test)]
+mod tests {
+    // NOTE: client-desktop is outside the catalog scan roots (catalog_core.py
+    // scans client-wpplugin/source + tests/modules) — no `catalog:` annotation
+    // here on purpose; that would claim tracked coverage this surface doesn't
+    // have. X-6 regression pin: tray labels must come from the shared i18n
+    // catalog, never hard-coded strings — pin the zh values (the pre-X-6
+    // hard-codes) and the EN values, plus the unknown-locale English fallback.
+    use super::*;
+
+    pub(crate) fn in_owned_env_child(test: &str) -> bool {
+        const MARKER: &str = "WPTSALL_DESKTOP_ENV_TEST";
+        if std::env::var(MARKER).as_deref() == Ok(test) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(MARKER, test)
+            .output()
+            .expect("start isolated Desktop environment test");
+        assert!(
+            output.status.success(),
+            "isolated Desktop test failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    #[test]
+    fn tray_labels_resolve_from_the_shared_catalog_per_locale() {
+        let zh = tray_menu_labels("zh-CN");
+        assert_eq!(zh.show, "打开主界面");
+        assert_eq!(zh.run_once, "立即运行一次");
+        assert_eq!(zh.quit, "退出 WPTSALL");
+
+        let en = tray_menu_labels("en");
+        assert_eq!(en.show, "Open Main Window");
+        assert_eq!(en.run_once, "Run Once Now");
+        assert_eq!(en.quit, "Quit WPTSALL");
+    }
+
+    #[test]
+    fn tray_labels_fall_back_to_english_for_unknown_locales() {
+        let labels = tray_menu_labels("xx-XX");
+        assert_eq!(labels.show, "Open Main Window");
+        assert_eq!(labels.quit, "Quit WPTSALL");
+    }
+}

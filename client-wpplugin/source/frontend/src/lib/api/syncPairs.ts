@@ -5,6 +5,13 @@ export type SyncMode = 'sync_only' | 'sync_and_translate';
 export type ConflictStrategy = 'lww' | 'source_wins' | 'target_wins' | 'manual_review' | 'merge';
 export type SyncFrequency = 'manual' | 'every_minute' | 'hourly' | 'daily';
 export type SyncPairStatus = 'active' | 'paused' | 'error';
+export type SyncFieldKind = 'translate' | 'copy' | 'skip';
+
+export interface SyncFieldAction {
+  field: 'post_title' | 'post_content' | 'post_excerpt' | string;
+  action: SyncFieldKind | string;
+  component_id?: string;
+}
 
 export interface SyncPair {
   id: string;
@@ -24,6 +31,7 @@ export interface SyncPair {
   last_sync_count?: number;
   last_error?: string;
   translate_component_id?: string;
+  field_actions?: SyncFieldAction[];
   review_before_push?: boolean;
   created_at: number;
   updated_at: number;
@@ -61,6 +69,7 @@ export interface SyncPairUpsertPayload {
   post_types?: string[];
   status?: SyncPairStatus;
   translate_component_id?: string;
+  field_actions?: SyncFieldAction[];
   review_before_push?: boolean;
 }
 

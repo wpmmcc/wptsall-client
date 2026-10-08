@@ -44,7 +44,15 @@ pub(crate) fn set_default_device_id(device_id: &str) {
     }
 }
 
-
+/// Test seam: drop the registered default so the no-identity-source
+/// fallback path stays reachable in-process (tests serialize through the
+/// caller's own mutex).
+#[cfg(test)]
+pub(crate) fn clear_default_device_id_for_tests() {
+    *DEFAULT_DEVICE_ID
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
 
 pub(crate) fn bindings_secret() -> Option<String> {
     if let Ok(s) = env::var("WPTSALL_COMPONENT_BINDINGS_SECRET") {

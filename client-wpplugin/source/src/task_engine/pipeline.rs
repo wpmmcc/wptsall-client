@@ -1214,6 +1214,122 @@ fn merge_target_for_storage(storage: &str) -> &'static str {
     }
 }
 
+fn field_is_protected_name(field_name: &str, rule: Option<&DiscoveredRule>) -> bool {
+    const BLOCKED_PREFIXES: &[&str] = &["_wptsall_", "_wp_", "_edit_", "_oembed_"];
+    let allowed_internal_field = field_name == "_wp_attachment_image_alt";
+    let explicit_rule_allows_field = resolve_field_content_format(rule, field_name).is_some()
+        || resolve_field_storage(rule, field_name).is_some();
+    BLOCKED_PREFIXES
+        .iter()
+        .any(|prefix| field_name.starts_with(prefix))
+        && !allowed_internal_field
+        && !explicit_rule_allows_field
+}
+
+fn patch_string_for_copy(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        other => Some(serde_json::to_string(other).unwrap_or_default()),
+    }
+}
+
+/// Copy ships the source bytes with no provider call. Skip records the
+/// decision and writes nothing, including no empty string.
+fn apply_copy_and_skip_fields(
+    rule: Option<&DiscoveredRule>,
+    item: &ContentItem,
+    complete_data: &serde_json::Map<String, Value>,
+    copy_fields: &[String],
+    skip_fields: &[String],
+    fields_failed: &mut u32,
+    translated_fields: &mut serde_json::Map<String, Value>,
+    translated_meta: &mut serde_json::Map<String, Value>,
+    field_results: &mut Vec<CallbackFieldResult>,
+) {
+    for field_name in skip_fields {
+        push_field_result(
+            field_results,
+            field_name,
+            "skipped",
+            "",
+            "",
+            "user_excluded",
+        );
+    }
+    for field_name in copy_fields {
+        if field_is_protected_name(field_name, rule) {
+            push_field_result(
+                field_results,
+                field_name,
+                "skipped",
+                "",
+                "",
+                "blocked_prefix",
+            );
+            continue;
+        }
+        let storage = if let Some(storage) = resolve_field_storage(rule, field_name) {
+            storage
+        } else if rule.is_some_and(|candidate| !candidate.field_storage_map.is_empty()) {
+            *fields_failed += 1;
+            push_field_result(
+                field_results,
+                field_name,
+                "failed",
+                "plain_text",
+                "",
+                "missing_storage_mapping",
+            );
+            continue;
+        } else {
+            infer_storage_fallback(item.object_type.as_str(), field_name)
+        };
+        let Some(raw) = get_authoritative_field_value(complete_data, field_name, &storage) else {
+            push_field_result(
+                field_results,
+                field_name,
+                "skipped",
+                "plain_text",
+                &storage,
+                "empty_or_null",
+            );
+            continue;
+        };
+        let Some(text) = patch_string_for_copy(raw) else {
+            push_field_result(
+                field_results,
+                field_name,
+                "skipped",
+                "plain_text",
+                &storage,
+                "empty_or_null",
+            );
+            continue;
+        };
+        let meta = FieldResultMeta {
+            provider_component: String::new(),
+            merge_target: merge_target_for_storage(&storage).to_string(),
+            transform_stage: "copied_without_provider".to_string(),
+            fallback_reason: String::new(),
+        };
+        if matches!(storage.as_str(), "post_meta" | "term_meta" | "meta") {
+            translated_meta.insert(field_name.clone(), Value::String(text));
+        } else {
+            translated_fields.insert(field_name.clone(), Value::String(text));
+        }
+        push_field_result_with_meta(
+            field_results,
+            field_name,
+            "success",
+            "plain_text",
+            &storage,
+            "copied_without_provider",
+            &meta,
+        );
+    }
+}
+
 fn transform_stage_for_prepared(prepared: &PreparedFieldTranslation) -> String {
     if prepared.adapter.source_content_format == "media_ref"
         && prepared.adapter.execution_content_format == "plain_text"
@@ -1498,11 +1614,7 @@ fn resolve_plugin_slug_for_rule_binding(
 }
 
 fn translate_fields_for_rule(rule: &DiscoveredRule) -> Vec<String> {
-    if !rule.translate_fields.is_empty() {
-        rule.translate_fields.clone()
-    } else {
-        extract_translate_fields(&rule.field_capabilities)
-    }
+    super::field_action::plan_field_actions(rule).translate
 }
 
 fn rule_present_field_score(
@@ -1510,8 +1622,10 @@ fn rule_present_field_score(
     complete_data: &serde_json::Map<String, Value>,
     rule: &DiscoveredRule,
 ) -> usize {
-    translate_fields_for_rule(rule)
+    let plan = super::field_action::plan_field_actions(rule);
+    plan.translate
         .iter()
+        .chain(plan.copy.iter())
         .filter(|field_name| {
             let storage = if let Some(storage) = resolve_field_storage(Some(rule), field_name) {
                 storage
@@ -1780,13 +1894,14 @@ pub(crate) async fn translate_item_fields_with_trace_using_proxy(
     let plugin_slug_for_binding = resolve_plugin_slug_for_rule_binding(relation, rule);
 
     // Extract translatable fields
-    let translate_fields = if let Some(r) = &rule {
-        translate_fields_for_rule(r)
-    } else {
-        Vec::new()
-    };
+    let action_plan = rule
+        .map(super::field_action::plan_field_actions)
+        .unwrap_or_default();
+    let translate_fields = action_plan.translate.clone();
+    let copy_fields = action_plan.copy.clone();
+    let skip_fields = action_plan.skip.clone();
 
-    if translate_fields.is_empty() {
+    if translate_fields.is_empty() && copy_fields.is_empty() {
         match build_attachment_copy_trace(wp_base, item, relation, worker_config, &complete_data)? {
             Some(mut trace) => {
                 bind_manual_callback(&mut trace, async_scope.as_ref())?;
@@ -2343,6 +2458,57 @@ pub(crate) async fn translate_item_fields_with_trace_using_proxy(
                             continue;
                         }
 
+                        let (class_input, class_output) = rule
+                            .map(|candidate| {
+                                super::content_class::field_class_tokens(
+                                    &candidate.field_capabilities,
+                                    &field_name,
+                                )
+                            })
+                            .unwrap_or((None, None));
+                        let class_decision = super::content_class::decide(
+                            &field_content_format,
+                            class_input.as_deref(),
+                            class_output.as_deref(),
+                        );
+                        if class_decision.text_only {
+                            let Some(text) = super::content_class::text_product(
+                                &outcome.translated_text,
+                                &outcome.translated_ref,
+                            ) else {
+                                fields_failed += 1;
+                                push_field_result_with_meta(
+                                    &mut field_results,
+                                    &field_name,
+                                    "failed",
+                                    &field_content_format,
+                                    &field_storage,
+                                    "text_output_missing",
+                                    &result_meta,
+                                );
+                                continue;
+                            };
+                            result_meta.merge_target =
+                                merge_target_for_storage(&field_storage).to_string();
+                            result_meta.transform_stage = class_decision.detail.to_string();
+                            let text = text.to_string();
+                            if matches!(field_storage.as_str(), "post_meta" | "term_meta" | "meta") {
+                                translated_meta.insert(field_name.clone(), Value::String(text));
+                            } else {
+                                translated_fields.insert(field_name.clone(), Value::String(text));
+                            }
+                            push_field_result_with_meta(
+                                &mut field_results,
+                                &field_name,
+                                "success",
+                                &field_content_format,
+                                &field_storage,
+                                class_decision.detail,
+                                &result_meta,
+                            );
+                            continue;
+                        }
+
                         if source_id > 0 {
                             result_meta.merge_target = "media_mappings".to_string();
                             media_mappings_by_source.insert(
@@ -2552,6 +2718,18 @@ pub(crate) async fn translate_item_fields_with_trace_using_proxy(
             }
         }
     }
+
+    apply_copy_and_skip_fields(
+        rule,
+        item,
+        &complete_data,
+        &copy_fields,
+        &skip_fields,
+        &mut fields_failed,
+        &mut translated_fields,
+        &mut translated_meta,
+        &mut field_results,
+    );
 
     if total_groups > 0
         && groups_without_component == total_groups
@@ -3430,24 +3608,19 @@ pub(crate) async fn sync_item_to_wp_claimed(
                 crate::db::jobs::increment_item_retry(&tx, item_db_id)?;
                 let current = crate::db::jobs::get_item_checked(&tx, item_db_id)?;
                 if let Some(item) = current {
-                    if item.max_retries > 0 && item.retry_count >= item.max_retries {
-                        update_item_status(
-                            &tx,
-                            item_db_id,
-                            "failed",
-                            Some(&format!(
-                                "callback retry budget exhausted: {}",
-                                snippet(&format!("{:#}", err))
-                            )),
-                        )?;
+                    let next_status = super::delivery_policy::status_after_callback_failure(
+                        item.retry_count,
+                        item.max_retries,
+                    );
+                    let detail = if next_status == "failed" {
+                        format!(
+                            "callback retry budget exhausted: {}",
+                            snippet(&format!("{:#}", err))
+                        )
                     } else {
-                        update_item_status(
-                            &tx,
-                            item_db_id,
-                            "translated",
-                            Some(&snippet(&format!("{:#}", err))),
-                        )?;
-                    }
+                        snippet(&format!("{:#}", err))
+                    };
+                    update_item_status(&tx, item_db_id, next_status, Some(&detail))?;
                 }
                 tx.commit()?;
             }
@@ -3901,3 +4074,53 @@ pub(crate) async fn fetch_item_content(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod field_plan_patch {
+    use super::*;
+
+    #[test]
+    fn copy_writes_source_and_skip_writes_nothing() {
+        let item: ContentItem = serde_json::from_value(json!({
+            "object_type": "post",
+            "subtype": "post",
+            "object_id": 9,
+            "complete_data": {
+                "post_content": "Body",
+                "post_excerpt": "Keep the existing target"
+            }
+        }))
+        .expect("item");
+        let complete = item.complete_data.as_object().expect("object").clone();
+        let mut fields = serde_json::Map::new();
+        let mut meta = serde_json::Map::new();
+        let mut results = Vec::new();
+        let mut failed = 0u32;
+        apply_copy_and_skip_fields(
+            None,
+            &item,
+            &complete,
+            &["post_content".to_string()],
+            &["post_excerpt".to_string()],
+            &mut failed,
+            &mut fields,
+            &mut meta,
+            &mut results,
+        );
+        assert_eq!(failed, 0);
+        assert_eq!(
+            fields.get("post_content").and_then(Value::as_str),
+            Some("Body")
+        );
+        assert!(fields.get("post_excerpt").is_none());
+        assert!(meta.is_empty());
+        assert!(results.iter().any(|row| {
+            row.field == "post_content"
+                && row.detail == "copied_without_provider"
+                && row.provider_component.is_empty()
+        }));
+        assert!(results
+            .iter()
+            .any(|row| row.field == "post_excerpt" && row.detail == "user_excluded"));
+    }
+}

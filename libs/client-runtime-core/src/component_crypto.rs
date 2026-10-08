@@ -139,3 +139,68 @@ pub fn decrypt_component_template_aes_bytes(
         .decrypt(Nonce::from_slice(&nonce_bytes), cipher_bytes.as_ref())
         .map_err(|_| anyhow!("decrypt component template failed"))
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aes_gcm::aead::Aead;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_kdf_is_deterministic() {
+        let key1 = derive_component_crypto_key("session-abc", "nonce-xyz", "comp-001");
+        let key2 = derive_component_crypto_key("session-abc", "nonce-xyz", "comp-001");
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn hkdf_key_differs_from_legacy() {
+        let legacy = derive_component_crypto_key("session-abc", "nonce-xyz", "comp-001");
+        let hkdf = derive_component_crypto_key_hkdf("session-abc", "nonce-xyz", "comp-001");
+        assert_ne!(legacy, hkdf);
+    }
+
+    #[test]
+    fn official_owner_type_uses_distinct_hkdf_info() {
+        let user = derive_component_crypto_key_hkdf_with_owner(
+            "session-abc",
+            "nonce-xyz",
+            "comp-001",
+            Some("user"),
+        );
+        let official = derive_component_crypto_key_hkdf_with_owner(
+            "session-abc",
+            "nonce-xyz",
+            "comp-001",
+            Some("official"),
+        );
+        assert_ne!(user, official);
+    }
+
+    #[test]
+    fn hkdf_roundtrip_decrypts_template_json() {
+        let session = "test-session-hkdf-token";
+        let nonce_str = "hkdf-nonce-value";
+        let component_id = "component-hkdf-roundtrip";
+        let original = json!({"message": "hkdf hello", "count": 99});
+
+        let key = derive_component_crypto_key_hkdf(session, nonce_str, component_id);
+        let nonce_bytes = derive_component_crypto_nonce_hkdf(nonce_str, component_id);
+        let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+        let plain_bytes = serde_json::to_vec(&original).unwrap();
+        let encrypted = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plain_bytes.as_ref())
+            .unwrap();
+        let encrypted_b64 = BASE64_STANDARD.encode(encrypted);
+
+        let decrypted = decrypt_component_template_aes(
+            &encrypted_b64,
+            session,
+            nonce_str,
+            component_id,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(decrypted, original);
+    }
+}

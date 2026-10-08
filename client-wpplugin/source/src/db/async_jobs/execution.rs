@@ -5,7 +5,8 @@ use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
-
+#[cfg(test)]
+use std::{collections::HashMap, sync::Arc};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,7 +17,9 @@ struct SavedClaim {
     owner: String,
 }
 
-
+#[cfg(test)]
+#[path = "execution/tests.rs"]
+mod tests;
 
 /// This is intentionally not Clone. Callers pass this authority to persistence
 /// APIs, rather than reconstructing a writer from a unit or an owner string.

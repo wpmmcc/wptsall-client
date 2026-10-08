@@ -393,3 +393,5 @@ pub(crate) fn transport_decrypt(
 ) -> anyhow::Result<Vec<u8>> {
     client_runtime_core::wp_transport::transport_decrypt(encrypted_payload, nonce_b64url, token)
 }
+#[cfg(test)]
+mod tests;

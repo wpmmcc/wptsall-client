@@ -18,7 +18,9 @@ const TAG_BYTES: usize = 16;
 const META_BYTES: usize = 8 + 32 + 4 + 8;
 const HEADER_BYTES: usize = 8 + 16 + META_BYTES + TAG_BYTES;
 
-
+#[cfg(test)]
+#[path = "../../../tests/modules/client-wpplugin/unit/retained_asset_codec.rs"]
+mod tests;
 
 struct Encrypted {
     cipher: Aes256Gcm,

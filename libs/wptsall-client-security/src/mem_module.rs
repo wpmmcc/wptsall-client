@@ -89,3 +89,12 @@ pub fn load_module_in_memory(_name: &str, _elf_bytes: &[u8]) -> Result<()> {
         "in-memory module loading requires unix + mem-module feature"
     ))
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decrypt_rejects_short_payload() {
+        assert!(decrypt_aes_gcm(&[1, 2, 3], &[0u8; 32]).is_err());
+    }
+}

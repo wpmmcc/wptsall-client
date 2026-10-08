@@ -103,6 +103,10 @@ pub struct Shipper {
 }
 
 impl Shipper {
+    pub(crate) fn http_client(&self) -> &Client {
+        &self.client
+    }
+
     pub fn new(_client: Client) -> anyhow::Result<Self> {
         // An opaque reqwest client cannot prove redirect or credential routing.
         let client = crate::auth::wp_http_client_builder().build()?;
@@ -901,6 +905,7 @@ pub fn relay_packet_for_target(
     pair: &SyncPair,
     translated: Option<RelayTranslation>,
     media_url_map: &HashMap<String, String>,
+    preserved_fields: &[String],
 ) -> SyncPacket {
     let mut out = packet.clone();
     out.packet_id = format!("pkt_{}", uuid::Uuid::new_v4().simple());
@@ -913,15 +918,24 @@ pub fn relay_packet_for_target(
 
     if let Some(translation) = &translated {
         if let Some(v) = &translation.title {
-            out.entity
-                .core_fields
-                .insert("post_title".to_string(), Value::String(v.clone()));
+            if !preserved_fields.iter().any(|field| field == "post_title") {
+                out.entity
+                    .core_fields
+                    .insert("post_title".to_string(), Value::String(v.clone()));
+            }
         }
         if let Some(v) = &translation.excerpt {
-            out.entity
-                .core_fields
-                .insert("post_excerpt".to_string(), Value::String(v.clone()));
+            if !preserved_fields.iter().any(|field| field == "post_excerpt") {
+                out.entity
+                    .core_fields
+                    .insert("post_excerpt".to_string(), Value::String(v.clone()));
+            }
         }
+    }
+    if preserved_fields.is_empty() {
+        out.entity.preserved_fields = None;
+    } else {
+        out.entity.preserved_fields = Some(preserved_fields.to_vec());
     }
 
     // Exact per-asset media rewrites FIRST (map keys are source-site URLs;
@@ -934,7 +948,9 @@ pub fn relay_packet_for_target(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let base_content = if let Some(translation) = &translated {
+    let base_content = if preserved_fields.iter().any(|field| field == "post_content") {
+        source_content
+    } else if let Some(translation) = &translated {
         if let Some(v) = &translation.content {
             v.clone()
         } else {
@@ -1014,7 +1030,85 @@ pub fn build_tombstone_packet(
             meta_fields: HashMap::new(),
             plugin_specific: HashMap::new(),
             changed_fields: None,
+            preserved_fields: None,
         },
         multimodal_manifest: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod preserved_field_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn skipped_excerpt_is_preserved_and_translated_title_is_written() {
+        let packet: SyncPacket = serde_json::from_value(json!({
+            "schema_version": "wpmmcc-sync-v1.0",
+            "packet_id": "pkt_src",
+            "action": "upsert",
+            "sync_mode": "sync_and_translate",
+            "target_lang": "zh_CN",
+            "source_fingerprint": "fp",
+            "origin_context": {
+                "origin_site_uuid": "src",
+                "origin_site_url": "https://src.example",
+                "origin_blog_id": 1,
+                "origin_lang": "en_US",
+                "vector_clock": {"src": 1},
+                "hop_count": 0,
+                "dispatch_timestamp": 1
+            },
+            "entity": {
+                "guid": "uuid-1",
+                "object_type": "post",
+                "subtype": "post",
+                "source_id": 9,
+                "slug": "hello",
+                "status": "publish",
+                "core_fields": {
+                    "post_title": "Hello",
+                    "post_content": "Body",
+                    "post_excerpt": "Keep me"
+                }
+            }
+        }))
+        .expect("packet");
+        let pair: SyncPair = serde_json::from_value(json!({
+            "id": "p",
+            "name": "n",
+            "source_domain": "https://src.example",
+            "target_domain": "https://dst.example",
+            "sync_mode": "sync_and_translate",
+            "created_at": 1,
+            "updated_at": 1
+        }))
+        .expect("pair");
+        let out = relay_packet_for_target(
+            &packet,
+            &pair,
+            Some(RelayTranslation {
+                title: Some("你好".to_string()),
+                content: None,
+                excerpt: Some("should not land".to_string()),
+            }),
+            &HashMap::new(),
+            &["post_excerpt".to_string()],
+        );
+        assert_eq!(
+            out.entity.core_fields.get("post_title").and_then(Value::as_str),
+            Some("你好")
+        );
+        assert_eq!(
+            out.entity
+                .core_fields
+                .get("post_excerpt")
+                .and_then(Value::as_str),
+            Some("Keep me")
+        );
+        assert_eq!(
+            out.entity.preserved_fields,
+            Some(vec!["post_excerpt".to_string()])
+        );
     }
 }

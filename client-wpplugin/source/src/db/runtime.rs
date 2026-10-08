@@ -150,3 +150,6 @@ pub(crate) fn recover_interrupted_work(
     }
     Ok(report)
 }
+#[cfg(test)]
+#[path = "tests/runtime.rs"]
+mod tests;

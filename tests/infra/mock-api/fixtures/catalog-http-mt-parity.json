@@ -1,0 +1,962 @@
+{
+  "version": "builtin-3",
+  "count": 44,
+  "entries": [
+    {
+      "entry_id": "openai-compatible",
+      "family": "openai_compatible",
+      "path": "/v1/chat/completions",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4o-mini",
+        "temperature": 0.1
+      },
+      "translated_text_path": "choices.0.message.content",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "google-translate",
+      "family": "http_mt",
+      "path": "/language/translate/v2",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "key": "{{auth.api_key}}",
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "translated_text_path": "data.translations.0.translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "deepl",
+      "family": "http_mt",
+      "path": "/v2/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "DeepL-Auth-Key {{auth.api_key}}"
+      },
+      "body": {
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": [
+          "{{input.text}}"
+        ]
+      },
+      "translated_text_path": "translations.0.text",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "microsoft-translator",
+      "family": "http_mt",
+      "path": "/translate",
+      "method": "POST",
+      "query": "api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}",
+      "headers": {
+        "Content-Type": "application/json",
+        "Ocp-Apim-Subscription-Key": "{{auth.api_key}}"
+      },
+      "body": [
+        {
+          "text": "{{input.text}}"
+        }
+      ],
+      "translated_text_path": "0.translations.0.text",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "amazon-translate",
+      "family": "http_mt",
+      "path": "",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-amz-json-1.1",
+        "X-Amz-Target": "TranslateService.TranslateText"
+      },
+      "body": {
+        "SourceLanguageCode": "{{input.source_lang}}",
+        "TargetLanguageCode": "{{input.target_lang}}",
+        "Text": "{{input.text}}"
+      },
+      "translated_text_path": "TranslatedText",
+      "auth_fields": [
+        "access_key",
+        "secret_key"
+      ],
+      "sign_algo": "aws_sigv4"
+    },
+    {
+      "entry_id": "baidu",
+      "family": "http_mt",
+      "path": "/api/trans/vip/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body": {
+        "appid": "{{auth.app_id}}",
+        "from": "{{input.source_lang}}",
+        "q": "{{input.text}}",
+        "salt": "{{computed.salt}}",
+        "sign": "{{computed.sign}}",
+        "to": "{{input.target_lang}}"
+      },
+      "translated_text_path": "trans_result.0.dst",
+      "auth_fields": [
+        "app_id",
+        "api_key"
+      ],
+      "sign_algo": "md5"
+    },
+    {
+      "entry_id": "youdao",
+      "family": "http_mt",
+      "path": "/api",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body": {
+        "appKey": "{{auth.app_key}}",
+        "curtime": "{{computed.curtime}}",
+        "from": "{{input.source_lang}}",
+        "q": "{{input.text}}",
+        "salt": "{{computed.salt}}",
+        "sign": "{{computed.sign}}",
+        "signType": "v3",
+        "to": "{{input.target_lang}}"
+      },
+      "translated_text_path": "translation.0",
+      "auth_fields": [
+        "app_key",
+        "app_secret"
+      ],
+      "sign_algo": "sha256"
+    },
+    {
+      "entry_id": "tencent",
+      "family": "http_mt",
+      "path": "",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-TC-Action": "TextTranslate",
+        "X-TC-Region": "ap-guangzhou",
+        "X-TC-Version": "2018-03-21"
+      },
+      "body": {
+        "Source": "{{input.source_lang}}",
+        "SourceText": "{{input.text}}",
+        "Target": "{{input.target_lang}}"
+      },
+      "translated_text_path": "Response.TargetText",
+      "auth_fields": [
+        "secret_id",
+        "secret_key"
+      ],
+      "sign_algo": "tc3_hmac_sha256"
+    },
+    {
+      "entry_id": "alibaba",
+      "family": "http_mt",
+      "path": "/api/translate/web",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body": {
+        "AccessKeyId": "{{auth.access_key}}",
+        "Action": "TranslateGeneral",
+        "FormatType": "text",
+        "Signature": "{{computed.sign}}",
+        "SourceLanguage": "{{input.source_lang}}",
+        "SourceText": "{{input.text}}",
+        "TargetLanguage": "{{input.target_lang}}"
+      },
+      "translated_text_path": "Data.TranslatedText",
+      "auth_fields": [
+        "access_key",
+        "secret_key"
+      ],
+      "sign_algo": "alibaba_v1"
+    },
+    {
+      "entry_id": "iflytek",
+      "family": "http_mt",
+      "path": "/v1/its",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Appid": "{{auth.app_id}}",
+        "X-CheckSum": "{{computed.sign}}",
+        "X-CurTime": "{{computed.salt}}"
+      },
+      "body": {
+        "from": "{{input.source_lang}}",
+        "text": "{{input.text}}",
+        "to": "{{input.target_lang}}"
+      },
+      "translated_text_path": "data.trans_result.dst",
+      "auth_fields": [
+        "app_id",
+        "api_secret"
+      ],
+      "sign_algo": "md5"
+    },
+    {
+      "entry_id": "niutrans",
+      "family": "http_mt",
+      "path": "/NiuTransServer/translation",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body": {
+        "apikey": "{{auth.api_key}}",
+        "from": "{{input.source_lang}}",
+        "q": "{{input.text}}",
+        "sign": "{{computed.sign}}",
+        "to": "{{input.target_lang}}"
+      },
+      "translated_text_path": "tgt_text",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": "md5"
+    },
+    {
+      "entry_id": "azure-cognitive",
+      "family": "http_mt",
+      "path": "/translate",
+      "method": "POST",
+      "query": "api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": [
+        {
+          "Text": "{{input.text}}"
+        }
+      ],
+      "translated_text_path": "0.translations.0.text",
+      "auth_fields": [
+        "subscription_key"
+      ],
+      "sign_algo": "azure_subscription_key"
+    },
+    {
+      "entry_id": "kakao",
+      "family": "http_mt",
+      "path": "/v2/translation/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "query": "{{input.text}}",
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}"
+      },
+      "translated_text_path": "translated_text.0.0",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": "kakao_api_key"
+    },
+    {
+      "entry_id": "libretranslate",
+      "family": "http_mt",
+      "path": "/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "api_key": "{{auth.api_key}}",
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "translated_text_path": "translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "yandex",
+      "family": "http_mt",
+      "path": "/api/v1.5/tr.json/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body": "text={{input.text}}&lang={{input.source_lang}}-{{input.target_lang}}&key={{auth.api_key}}",
+      "translated_text_path": "text.0",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "ibm-watson",
+      "family": "http_mt",
+      "path": "/instances/{{auth.instance_id}}/v3/translate",
+      "method": "POST",
+      "query": "version=2018-05-01",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": [
+          "{{input.text}}"
+        ]
+      },
+      "translated_text_path": "translations.0.translation",
+      "auth_fields": [
+        "api_key",
+        "instance_id"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "papago",
+      "family": "http_mt",
+      "path": "/v1/papago/n2mt",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Naver-Client-Id": "{{auth.client_id}}",
+        "X-Naver-Client-Secret": "{{auth.client_secret}}"
+      },
+      "body": "source={{input.source_lang}}&target={{input.target_lang}}&text={{input.text}}",
+      "translated_text_path": "message.result.translatedText",
+      "auth_fields": [
+        "client_id",
+        "client_secret"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "systran",
+      "family": "http_mt",
+      "path": "/translation/text/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}"
+      },
+      "body": {
+        "input": [
+          "{{input.text}}"
+        ],
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "translated_text_path": "outputs.0.output",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "smartcat",
+      "family": "http_mt",
+      "path": "/api/v1/document/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "sourceLanguage": "{{input.source_lang}}",
+        "targetLanguage": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "phrase",
+      "family": "http_mt",
+      "path": "/v2/projects/mt/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "token {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "translated_text_path": "translation",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "mymemory",
+      "family": "http_mt",
+      "path": "/get",
+      "method": "GET",
+      "query": "q={{input.text}}&langpair={{input.source_lang}}|{{input.target_lang}}",
+      "headers": {},
+      "body": null,
+      "translated_text_path": "responseData.translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "reverso",
+      "family": "http_mt",
+      "path": "/translate/v1/translation",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Api-Key": "{{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "from": "{{input.source_lang}}",
+        "input": [
+          "{{input.text}}"
+        ],
+        "to": "{{input.target_lang}}"
+      },
+      "translated_text_path": "translation.0",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "linguee",
+      "family": "http_mt",
+      "path": "/api/v2/translations",
+      "method": "GET",
+      "query": "query={{input.text}}&src={{input.source_lang}}&dst={{input.target_lang}}",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}"
+      },
+      "body": null,
+      "translated_text_path": "0.0",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "volcengine",
+      "family": "http_mt",
+      "path": "",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "SourceLanguage": "{{input.source_lang}}",
+        "SourceText": "{{input.text}}",
+        "TargetLanguage": "{{input.target_lang}}"
+      },
+      "translated_text_path": "Translation",
+      "auth_fields": [
+        "access_key",
+        "secret_key"
+      ],
+      "sign_algo": "volcengine_hmac_sha256"
+    },
+    {
+      "entry_id": "hmac-generic",
+      "family": "http_mt",
+      "path": "/api/hmac/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "api_key": "{{auth.api_key}}",
+        "sign": "{{computed.sign}}",
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": "{{input.text}}",
+        "timestamp": "{{computed.salt}}"
+      },
+      "translated_text_path": "translated_text",
+      "auth_fields": [
+        "api_key",
+        "secret_key"
+      ],
+      "sign_algo": "hmac_sha256"
+    },
+    {
+      "entry_id": "oauth-mt",
+      "family": "http_mt",
+      "path": "/api/oauth/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.access_token}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translated_text",
+      "auth_fields": [
+        "client_id",
+        "client_secret"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "jwt-mt",
+      "family": "http_mt",
+      "path": "/api/jwt/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.jwt_token}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translated_text",
+      "auth_fields": [
+        "jwt_token"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "custom-http-mt",
+      "family": "http_mt",
+      "path": "/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "translated_text_path": "translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "deepl-pro",
+      "family": "http_mt",
+      "path": "/v2/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "DeepL-Auth-Key {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": [
+          "{{input.text}}"
+        ]
+      },
+      "translated_text_path": "translations.0.text",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "google-advanced",
+      "family": "http_mt",
+      "path": "/v3/projects/YOUR_PROJECT/locations/global:translateText",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translations.0.translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "modernmt",
+      "family": "http_mt",
+      "path": "/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "data.translation",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "argos-translate",
+      "family": "http_mt",
+      "path": "/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "apertium",
+      "family": "http_mt",
+      "path": "/apy/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "langpair": "{{input.source_lang}}|{{input.target_lang}}",
+        "q": "{{input.text}}"
+      },
+      "translated_text_path": "responseData.translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "bergamot",
+      "family": "http_mt",
+      "path": "/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "lingvanex",
+      "family": "http_mt",
+      "path": "/b1/api/v3/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "result",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "cloudtranslation",
+      "family": "http_mt",
+      "path": "/v1/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translations.0.text",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "iciba",
+      "family": "http_mt",
+      "path": "/index.php",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "content.out",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "sogou",
+      "family": "http_mt",
+      "path": "/api/transweb/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "data.translatedText",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "huawei-nlp",
+      "family": "http_mt",
+      "path": "/v1/infers/machine-translation/text-translation",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translations.0.text",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "crowdin-mt",
+      "family": "http_mt",
+      "path": "/api/v2/machines/translations",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "data.0.text",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "lokalise-mt",
+      "family": "http_mt",
+      "path": "/api2/projects/mt/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translation",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "unbabel",
+      "family": "http_mt",
+      "path": "/v1/translation",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translated_text",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "translated-matecat",
+      "family": "http_mt",
+      "path": "/v2/translate",
+      "method": "POST",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "translated_text_path": "translation",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    },
+    {
+      "entry_id": "microsoft-custom",
+      "family": "http_mt",
+      "path": "/translate",
+      "method": "POST",
+      "query": "api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}&category=generalnn",
+      "headers": {
+        "Content-Type": "application/json",
+        "Ocp-Apim-Subscription-Key": "{{auth.api_key}}"
+      },
+      "body": [
+        {
+          "Text": "{{input.text}}"
+        }
+      ],
+      "translated_text_path": "0.translations.0.text",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null
+    }
+  ]
+}

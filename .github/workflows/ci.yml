@@ -5,6 +5,11 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+env:
+  # Mock fixture credentials. These are test keys, configured as repository
+  # secrets. real-keys/ is never checked out and never copied here.
+  MOCK_TRANSLATE_API_KEY: ${{ secrets.MOCK_TRANSLATE_API_KEY }}
+  WPTSALL_COMPONENT_BINDINGS_SECRET: ${{ secrets.WPTSALL_COMPONENT_BINDINGS_SECRET }}
 jobs:
   production:
     name: Production builds (${{ matrix.os }})
@@ -14,6 +19,13 @@ jobs:
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-latest, macos-15-intel]
     steps:
+      - name: Require configured mock test keys
+        shell: bash
+        run: |
+          if [ -z "$MOCK_TRANSLATE_API_KEY" ] || [ -z "$WPTSALL_COMPONENT_BINDINGS_SECRET" ]; then
+            echo "Public mock tests need MOCK_TRANSLATE_API_KEY and WPTSALL_COMPONENT_BINDINGS_SECRET configured as repository secrets."
+            exit 1
+          fi
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -47,5 +59,9 @@ jobs:
             client-desktop/src-tauri
       - name: Check production Rust core
         run: cargo check --locked --lib --bins --manifest-path client-wpplugin/source/Cargo.toml
+      - name: Test Rust core
+        run: cargo test --locked --lib --bins --manifest-path client-wpplugin/source/Cargo.toml
       - name: Check production Desktop
         run: cargo check --locked --features custom-protocol --manifest-path client-desktop/src-tauri/Cargo.toml
+      - name: Test Desktop library
+        run: cargo test --locked --lib --features custom-protocol --manifest-path client-desktop/src-tauri/Cargo.toml

@@ -25,6 +25,7 @@ const RULE_DISCOVERY_MAX_RELATIONS_PER_DOMAIN: usize = 200;
 #[derive(Debug, Serialize)]
 struct RuleDiscoveryFieldSummary {
     field_name: String,
+    action: String,
     content_format: String,
     source_role: String,
     storage: String,
@@ -304,18 +305,20 @@ pub(crate) async fn handle_rule_component_binding_discovery(
 
             for rule in &rules {
                 summary.rules_checked += 1;
-                let translate_fields = if !rule.translate_fields.is_empty() {
-                    rule.translate_fields.clone()
-                } else {
-                    crate::task_engine::pipeline::extract_translate_fields(&rule.field_capabilities)
-                };
+                let action_plan = crate::task_engine::field_action::plan_field_actions(rule);
+                let translate_fields = action_plan
+                    .translate
+                    .iter()
+                    .map(|name| (name.clone(), "translate"))
+                    .chain(action_plan.copy.iter().map(|name| (name.clone(), "copy")))
+                    .chain(action_plan.skip.iter().map(|name| (name.clone(), "skip")));
                 let model = relation
                     .models
                     .iter()
                     .find(|item| item.model_id == rule.model_id);
                 let mut fields: Vec<RuleDiscoveryFieldSummary> = Vec::new();
 
-                for field_name in translate_fields {
+                for (field_name, action) in translate_fields {
                     let raw_content_format =
                         super::super::worker::resolve_preflight_field_content_format(
                             rule,
@@ -344,6 +347,7 @@ pub(crate) async fn handle_rule_component_binding_discovery(
                     summary.fields_checked += 1;
                     fields.push(RuleDiscoveryFieldSummary {
                         field_name,
+                        action: action.to_string(),
                         content_format,
                         source_role,
                         storage,

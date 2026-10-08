@@ -1301,10 +1301,34 @@ pub(super) async fn handle_provider_catalog_list(
     query: &str,
 ) -> anyhow::Result<()> {
     let params = parse_query_string(query);
-    // Only the optional catalog page asks for a bounded online check on open.
-    // Plain lists/searches and local component loading remain entirely local.
+    // Opening the catalog page passes check=1 and always attempts the
+    // network, including when a cache already exists. Search leaves it off.
+    let mut online_check = json!({
+        "attempted": false,
+        "offline": false,
+        "error": Value::Null
+    });
     if params.get("check").is_some_and(|value| value == "1") {
-        let _ = refresh_provider_catalog_from_source().await;
+        match refresh_provider_catalog_from_source().await {
+            Ok(value) => {
+                online_check = json!({
+                    "attempted": true,
+                    "offline": value.get("offline").and_then(Value::as_bool).unwrap_or(false),
+                    "error": value
+                        .pointer("/refresh_metadata/last_error")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "available_version": value.get("available_version").cloned().unwrap_or(Value::Null),
+                });
+            }
+            Err(err) => {
+                online_check = json!({
+                    "attempted": true,
+                    "offline": true,
+                    "error": err_public(&err),
+                });
+            }
+        }
     }
     let mut load_meta = match load_catalog_document_with_meta() {
         Ok((catalog, _builtin, meta)) => (catalog, meta),
@@ -1406,6 +1430,7 @@ pub(super) async fn handle_provider_catalog_list(
             },
             "refresh_metadata": refresh_metadata,
             "available_version": refresh_metadata.get("available_version").cloned().unwrap_or(Value::Null),
+            "online_check": online_check,
         }
     });
     write_http_response(

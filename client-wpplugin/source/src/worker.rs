@@ -2404,3 +2404,34 @@ fn log_loop_summary(log_file: &str, loop_reports: &[DomainRunReport]) {
         }),
     );
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_worker_config_defaults() {
+        let config = build_worker_config("worker-test-default");
+        assert_eq!(config.worker_id, "worker-test-default");
+        // opus5 A-03 (AF-03): the boot-level device identity rides on the
+        // config; WPTSALL_WORKER_ID may only relabel the lane, never change
+        // the paired device identity.
+        assert_eq!(config.device_id, "worker-test-default");
+        assert_eq!(config.task_pull_statuses, vec!["pending", "retry"]);
+        assert!(config.task_concurrency >= 1);
+        assert_eq!(config.retry_max, 2);
+        assert!(config.discovery_mode);
+        assert!(!config.review_mode);
+    }
+
+    #[test]
+    fn test_fatal_control_plane_error_classification() {
+        assert!(is_fatal_control_plane_error(
+            "Upstream returned RATE_LIMITED error"
+        ));
+        assert!(is_fatal_control_plane_error(
+            "unauthorized: session expired"
+        ));
+        assert!(is_fatal_control_plane_error("status=401"));
+        assert!(!is_fatal_control_plane_error("connection reset by peer"));
+    }
+}

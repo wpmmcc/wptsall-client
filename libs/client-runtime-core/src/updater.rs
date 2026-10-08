@@ -738,3 +738,399 @@ pub fn extract_update_binary(path: &Path) -> Result<PathBuf> {
     let _ = std::fs::remove_dir_all(&unpack_dir);
     Ok(dest)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ota02_blocks_swap_only_for_signed_bundles() {
+        // Unsigned in-repo builds (unknown / not-valid signature) keep the
+        // swap; only a signature-valid .app bundle fails closed.
+        assert!(!should_block_macos_swap(true, None), "unknown signature must not block");
+        assert!(!should_block_macos_swap(true, Some(false)), "unsigned bundle must not block");
+        assert!(!should_block_macos_swap(false, Some(true)), "raw binary outside a bundle must not block");
+        assert!(should_block_macos_swap(true, Some(true)), "signed bundle must block");
+    }
+
+    #[test]
+    fn ota03_restart_guard_skips_relaunch_under_scm_parent() {
+        let body = "Start-Process -FilePath 'x'";
+        let snip = ps_restart_unless_scm_parent(body, "$log");
+        assert!(snip.contains("ParentProcessId"), "guard must resolve the parent pid");
+        assert!(snip.contains("services.exe"), "guard must test for the SCM parent");
+        assert!(snip.contains("skipping child relaunch"), "guard must log the skip reason");
+        assert!(snip.contains(body), "guard must run the restart body in the else branch");
+        // The skip must come BEFORE the restart body in script order.
+        let skip_at = snip.find("skipping child relaunch").unwrap();
+        let body_at = snip.find(body).unwrap();
+        assert!(skip_at < body_at, "skip branch must precede the restart branch");
+    }
+
+    #[test]
+    fn parse_sha256sums_standard() {
+        let content = "\
+abc123def456  wptsall-client-2.1.0-x86_64-unknown-linux-gnu\n\
+789abc123def  SHA256SUMS\n";
+        assert_eq!(
+            parse_sha256sums(content, "wptsall-client-2.1.0-x86_64-unknown-linux-gnu"),
+            Some("abc123def456".to_string())
+        );
+        assert_eq!(
+            parse_sha256sums(content, "SHA256SUMS"),
+            Some("789abc123def".to_string())
+        );
+        assert_eq!(parse_sha256sums(content, "nonexistent"), None);
+    }
+
+    #[test]
+    fn parse_sha256sums_star_mode() {
+        let content = "abc123 *wptsall-client-2.1.0-x86_64-unknown-linux-gnu\n";
+        assert_eq!(
+            parse_sha256sums(content, "wptsall-client-2.1.0-x86_64-unknown-linux-gnu"),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_url_replaces_both_placeholders() {
+        let template = "https://example.com/releases/download/client-wpplugin-v{version}/wptsall-client-{version}-{target}";
+        let url = resolve_url(template, "2.1.1");
+        assert_eq!(
+            url,
+            format!(
+                "https://example.com/releases/download/client-wpplugin-v2.1.1/wptsall-client-2.1.1-{}",
+                current_target_triple()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_url_replaces_platform() {
+        let template = "https://example.com/kits-webui-v{version}/kit-webui-{platform}.tar.gz";
+        let url = resolve_url(template, "2.1.0");
+        assert_eq!(
+            url,
+            format!(
+                "https://example.com/kits-webui-v2.1.0/kit-webui-{}.tar.gz",
+                current_platform()
+            )
+        );
+    }
+
+    #[test]
+    fn apply_ui_bundle_replaces_ui_tree() {
+        let root =
+            std::env::temp_dir().join(format!("wptsall-test-ui-root-{}", uuid::Uuid::new_v4()));
+        let stage = root.join("stage");
+        let ui_src = stage.join("ui/webui");
+        std::fs::create_dir_all(&ui_src).unwrap();
+        std::fs::write(ui_src.join("index.html"), b"<html>new</html>").unwrap();
+        std::fs::write(stage.join("VERSION-WEBUI"), b"9.9.9").unwrap();
+        let tar = root.join("webui-ui-9.9.9.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&stage)
+            .arg(".")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let install = root.join("install");
+        std::fs::create_dir_all(install.join("ui/webui")).unwrap();
+        std::fs::write(install.join("ui/webui/index.html"), b"<html>old</html>").unwrap();
+
+        apply_ui_bundle(&tar, &install, "webui").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(install.join("ui/webui/index.html")).unwrap(),
+            "<html>new</html>"
+        );
+        assert_eq!(
+            std::fs::read_to_string(install.join("VERSION-WEBUI")).unwrap(),
+            "9.9.9"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn extract_update_binary_passthrough_raw() {
+        let dir = std::env::temp_dir().join("wptsall-test-extract-raw");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("raw-bin");
+        std::fs::write(&file_path, b"not-gzip").unwrap();
+        let out = extract_update_binary(&file_path).unwrap();
+        assert_eq!(out, file_path);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extract_update_binary_from_kit_tarball() {
+        let dir =
+            std::env::temp_dir().join(format!("wptsall-test-extract-kit-{}", uuid::Uuid::new_v4()));
+        let stage = dir.join("wptsall-client-webui/bin");
+        std::fs::create_dir_all(&stage).unwrap();
+        let inner = stage.join("wptsall-client");
+        std::fs::write(&inner, b"fake-webui-binary").unwrap();
+        let tar_path = dir.join("kit-webui-linux-x86_64.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&dir)
+            .arg("wptsall-client-webui")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let extracted = extract_update_binary(&tar_path).unwrap();
+        let bytes = std::fs::read(&extracted).unwrap();
+        assert_eq!(bytes, b"fake-webui-binary");
+        let _ = std::fs::remove_file(&extracted);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_url_empty_template() {
+        assert_eq!(resolve_url("", "1.0.0"), "");
+    }
+
+    #[tokio::test]
+    async fn verify_checksum_correct() {
+        let dir = std::env::temp_dir().join("wptsall-test-checksum-correct");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test-file");
+        let data = b"hello world";
+        std::fs::write(&file_path, data).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let expected = format!("{:x}", hasher.finalize());
+
+        assert!(verify_checksum(&file_path, &expected).await.is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn verify_checksum_mismatch() {
+        let dir = std::env::temp_dir().join("wptsall-test-checksum-mismatch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test-file");
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        let result = verify_checksum(&file_path, "deadbeef").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("checksum mismatch"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Self-replace permission semantics (2026-09-09). The helper is
+    // fire-and-forget with discarded output, so permission viability must
+    // be proven BEFORE spawning: fail closed on an unwritable install dir,
+    // and pin that the happy path actually swaps + chmods.
+    // -----------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn perform_self_replace_fails_closed_on_unwritable_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir()
+            .join(format!("wptsall-test-selfreplace-ro-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cur = bin.join("wptsall-client");
+        std::fs::write(&cur, b"old").unwrap();
+        let new = root.join("new-bin");
+        std::fs::write(&new, b"new").unwrap();
+
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&bin, perms).unwrap();
+
+        let err = perform_self_replace("wptsall-selftest-ro", &cur, &new, false).unwrap_err();
+        assert!(
+            err.to_string().starts_with("install dir not writable:"),
+            "must fail closed with the stable prefix, got: {err}"
+        );
+
+        // Cleanup needs the write bit back.
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        // Neither file moved.
+        assert_eq!(std::fs::read(&cur).unwrap(), b"old");
+        assert_eq!(std::fs::read(&new).unwrap(), b"new");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn perform_self_replace_swaps_binary_and_marks_executable() {
+        // End-to-end helper round on a writable directory: the detached
+        // helper must actually move the new binary over the old path and
+        // mark it executable (the runner OTA lane asserts the same via
+        // mtime; this pins it at unit level without systemd — the
+        // systemctl calls fail harmlessly under `|| true`).
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir()
+            .join(format!("wptsall-test-selfreplace-ok-{}", uuid::Uuid::new_v4()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let cur = bin.join("wptsall-client");
+        std::fs::write(&cur, b"old-binary").unwrap();
+        let new = root.join("new-bin");
+        std::fs::write(&new, b"new-binary").unwrap();
+
+        perform_self_replace("wptsall-selftest-ok", &cur, &new, false).unwrap();
+
+        let mut swapped = false;
+        for _ in 0..40 {
+            if std::fs::read(&cur).map(|b| b == b"new-binary").unwrap_or(false) {
+                swapped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        assert!(swapped, "helper must move the new binary over the old path");
+
+        let mode = std::fs::metadata(&cur).unwrap().permissions().mode();
+        assert!(mode & 0o111 != 0, "replaced binary must be executable (mode {mode:o})");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // D-1 OTA rollback semantics (plan §7 / roadmap D-1; NEW-T-08). The
+    // secure pipeline (manifest sig → kit sig → sha256) fails closed BEFORE
+    // any disk mutation — already covered by run-ota-secure-suite.sh. These
+    // two tests pin the APPLY stage: fail-closed pre-flight (hard assert)
+    // and the missing mid-apply rollback (known_red pin).
+    // -----------------------------------------------------------------------
+
+    fn make_ui_install_root(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wptsall-test-ota-{tag}-{}", uuid::Uuid::new_v4()));
+        let ui = root.join("install/ui/webui");
+        std::fs::create_dir_all(&ui).unwrap();
+        std::fs::write(ui.join("index.html"), b"<html>old</html>").unwrap();
+        std::fs::write(root.join("install/VERSION-WEBUI"), b"2.1.0").unwrap();
+        root
+    }
+
+    #[test]
+    fn apply_ui_bundle_corrupt_or_malformed_leaves_existing_ui_intact() {
+        // D-1 hard assert: a corrupt (non-gzip) or malformed (no ui/{subdir})
+        // bundle is rejected BEFORE the existing UI tree is touched.
+        let root = make_ui_install_root("premag");
+        let install = root.join("install");
+        let index = install.join("ui/webui/index.html");
+
+        // Case A: corrupt download — garbage bytes, tar must fail.
+        let corrupt = root.join("corrupt.tar.gz");
+        std::fs::write(&corrupt, b"this is not a gzip archive at all").unwrap();
+        let err = apply_ui_bundle(&corrupt, &install, "webui").unwrap_err();
+        assert!(
+            err.to_string().contains("tar failed"),
+            "corrupt archive must fail unpack, got: {err}"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), b"<html>old</html>");
+        assert_eq!(
+            std::fs::read(install.join("VERSION-WEBUI")).unwrap(),
+            b"2.1.0"
+        );
+
+        // Case B: well-formed tar.gz that simply has no ui/webui member.
+        let wrong = root.join("wrong-layout.tar.gz");
+        let stage = root.join("wrong-stage/ui/other");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("index.html"), b"<html>new</html>").unwrap();
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&wrong)
+            .arg("-C")
+            .arg(&root.join("wrong-stage"))
+            .arg("ui")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let err = apply_ui_bundle(&wrong, &install, "webui").unwrap_err();
+        assert!(
+            err.to_string().contains("UI bundle missing ui/webui"),
+            "malformed layout must be rejected pre-flight, got: {err}"
+        );
+        assert_eq!(std::fs::read(&index).unwrap(), b"<html>old</html>");
+        assert_eq!(
+            std::fs::read(install.join("VERSION-WEBUI")).unwrap(),
+            b"2.1.0"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_ui_bundle_mid_copy_failure_rolls_back_old_ui() {
+        // S10 (07 audit, batch G): apply_ui_bundle now stages the new tree
+        // into a sibling dir and only swaps after the copy fully succeeded,
+        // restoring the old tree if the swap fails. A failure during the
+        // copy phase must therefore leave the old UI byte-identically intact
+        // (the pre-batch-G behavior removed the old tree first and left NO
+        // UI at all — the former known_red pin, now inverted).
+        // Deterministic injection: a dangling symlink inside the bundle makes
+        // std::fs::copy fail mid-apply (the same class of failure as
+        // disk-full / permission errors on any real bundle).
+        let root = make_ui_install_root("norollback");
+        let install = root.join("install");
+        let old_index = install.join("ui/webui/index.html");
+        assert!(old_index.is_file());
+        let old_bytes = std::fs::read(&old_index).unwrap();
+
+        let stage = root.join("stage/ui/webui");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::os::unix::fs::symlink("no-such-target-xyz", stage.join("broken")).unwrap();
+        let bundle = root.join("bad-midcopy.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&bundle)
+            .arg("-C")
+            .arg(&root.join("stage"))
+            .arg("ui")
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let err = apply_ui_bundle(&bundle, &install, "webui");
+        assert!(err.is_err(), "dangling symlink must fail the copy phase");
+
+        // INVERTED pin: the old UI tree must be restored byte-identically.
+        assert!(
+            old_index.is_file(),
+            "old UI must still be present after a mid-apply failure (rollback)"
+        );
+        assert_eq!(
+            std::fs::read(&old_index).unwrap(),
+            old_bytes,
+            "old UI must be byte-identical after rollback"
+        );
+        // No staging/backup residue may survive a failed apply.
+        let ui_dir = install.join("ui");
+        let residue: Vec<_> = std::fs::read_dir(&ui_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".webui."))
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "no staging/backup artifacts may remain, got: {residue:?}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+}

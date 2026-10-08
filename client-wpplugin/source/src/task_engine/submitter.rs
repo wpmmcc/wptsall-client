@@ -4,7 +4,9 @@ use reqwest::Client;
 use serde_json::Value;
 use url::Url;
 
-
+#[cfg(test)]
+#[path = "../../../../tests/modules/client-wpplugin/unit/encrypted_upload_assets.rs"]
+mod encrypted_upload_assets;
 
 /// AF-04 (opus5): the WP client API is secret-scoped — every client route
 /// lives under `/{secret}/client/...`, so the resolved URL must carry the
@@ -108,7 +110,225 @@ pub(crate) fn validate_i18n_callback_ack(
     Ok(value)
 }
 
+#[cfg(test)]
+mod callback_receipt_tests {
+    use super::*;
 
+    #[tokio::test]
+    #[ignore = "requires explicitly prepared, verified owned WP callback fixture"]
+    async fn callback_receipt_owned_wp_signed_encrypted_six_batch_lanes() {
+        let _key = crate::db::owned_mock_bindings_key();
+        let path = std::env::var("WPTSALL_OWNED_CALLBACK_HTTP_FIXTURE")
+            .expect("explicit owned callback fixture required");
+        let fixture: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(fixture["format"], "owned-callback-http-v1");
+        let url = reqwest::Url::parse(fixture["wp_base"].as_str().unwrap()).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        let owner = fixture["owner"].as_str().unwrap();
+        let name = fixture["container"].as_str().unwrap();
+        assert!(
+            name == format!("wptsall-owned-{owner}-a")
+                || name == format!("wptsall-owned-{owner}-b")
+        );
+        let label = std::process::Command::new("docker")
+            .args([
+                "inspect",
+                name,
+                "--format",
+                "{{index .Config.Labels \"com.wptsall.owned.run\"}}",
+            ])
+            .output()
+            .unwrap();
+        assert!(label.status.success());
+        assert_eq!(String::from_utf8(label.stdout).unwrap().trim(), owner);
+        let root = tempfile::tempdir().unwrap();
+        let _data =
+            crate::db::TestEnvVarGuard::set("WPTSALL_DATA_DIR", root.path().to_str().unwrap());
+        let _encrypt = crate::db::TestEnvVarGuard::set("WPTSALL_WP_TRANSPORT_ENCRYPT", "on");
+        let client = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 6);
+        for case in cases {
+            let payload: crate::types::I18nCallbackPayload =
+                serde_json::from_value(case["payload"].clone()).unwrap();
+            let mut first_id = None;
+            for replay in [false, true] {
+                let result = send_i18n_translation_callback(
+                    &client,
+                    url.as_str(),
+                    fixture["token"].as_str().unwrap(),
+                    &payload.worker_id,
+                    fixture["device_id"].as_str().unwrap(),
+                    &payload.client_task_id,
+                    &payload,
+                )
+                .await;
+                assert!(
+                    result.is_ok(),
+                    "owned {} callback refused (details stay private)",
+                    payload.business_line
+                );
+                let receipt = result.unwrap();
+                assert_eq!(receipt["result_status"], "synced");
+                assert_eq!(receipt["entries_updated"], 2);
+                assert_eq!(receipt["entries_rejected"], 0);
+                if replay {
+                    assert_eq!(receipt["idempotent"], true);
+                    assert_eq!(first_id.as_ref(), Some(&receipt["result_id"]));
+                } else {
+                    first_id = Some(receipt["result_id"].clone());
+                }
+            }
+        }
+        let content_cases = fixture["content_cases"].as_array().unwrap();
+        assert_eq!(content_cases.len(), 2);
+        for (index, case) in content_cases.iter().enumerate() {
+            let payload: crate::types::TranslationCallbackPayload =
+                serde_json::from_value(case["payload"].clone()).unwrap();
+            let mut first_id = None;
+            for replay in [false, true] {
+                let result = send_translation_callback(
+                    &client,
+                    url.as_str(),
+                    fixture["token"].as_str().unwrap(),
+                    &payload.worker_id,
+                    fixture["device_id"].as_str().unwrap(),
+                    &payload.client_task_id,
+                    &payload,
+                )
+                .await;
+                assert!(
+                    result.is_ok(),
+                    "owned content callback refused (details stay private)"
+                );
+                let receipt = result.unwrap();
+                assert_eq!(
+                    receipt["result_status"],
+                    if index == 0 { "synced" } else { "partial" }
+                );
+                assert!(receipt["sync_result"]["success"].as_bool().unwrap());
+                if replay {
+                    assert_eq!(receipt["idempotent"], true);
+                    assert_eq!(first_id.as_ref(), Some(&receipt["result_id"]));
+                } else {
+                    first_id = Some(receipt["result_id"].clone());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn callback_receipt_rejects_accepted_but_unapplied_queue() {
+        let ack = serde_json::json!({
+            "success": true, "result_id": 42, "sync_task_id": 7, "queued": true,
+            "protocol": "v2", "result_status": "pending"
+        });
+        assert!(
+            validate_translation_callback_ack(ack).is_err(),
+            "an accepted pending queue is not applied content"
+        );
+    }
+
+    #[test]
+    fn callback_receipt_rejects_explicit_write_back_failure() {
+        let ack = serde_json::json!({
+            "success": true, "result_id": 42, "protocol": "v2",
+            "result_status": "synced", "sync_result": {"success": false}
+        });
+        assert!(
+            validate_translation_callback_ack(ack).is_err(),
+            "contradictory write-back evidence must not mark the paid result done"
+        );
+    }
+
+    #[test]
+    fn callback_receipt_rejects_missing_durable_result_state() {
+        assert!(
+            validate_translation_callback_ack(serde_json::json!({
+                "success": true, "result_id": 42, "protocol": "v2"
+            }))
+            .is_err(),
+            "an arbitrary positive result id is not a durable write-back receipt"
+        );
+    }
+
+    #[test]
+    fn callback_receipt_accepts_terminal_applied_partial_and_skip() {
+        for status in ["synced", "completed", "partial", "cancelled"] {
+            let ack = serde_json::json!({
+                "success": true, "result_id": 42, "protocol": "v2",
+                "result_status": status
+            });
+            assert!(validate_translation_callback_ack(ack).is_ok(), "{status}");
+        }
+    }
+
+    #[test]
+    fn callback_receipt_i18n_requires_exact_complete_batch_counts() {
+        let ack = serde_json::json!({
+            "success":true,"result_id":42,"protocol":"v2","result_status":"synced",
+            "entries_updated":2,"entries_rejected":0
+        });
+        assert!(validate_i18n_callback_ack(ack.clone(), 2).is_ok());
+        for expected in [0, 1, 3] {
+            assert!(validate_i18n_callback_ack(ack.clone(), expected).is_err());
+        }
+        for (key, value) in [
+            ("entries_updated", serde_json::json!(1)),
+            ("entries_updated", serde_json::json!("2")),
+            ("entries_rejected", serde_json::json!(1)),
+            ("entries_rejected", serde_json::json!(-1)),
+            ("result_status", serde_json::json!("partial")),
+        ] {
+            let mut invalid = ack.clone();
+            invalid[key] = value;
+            assert!(validate_i18n_callback_ack(invalid, 2).is_err(), "{key}");
+        }
+        for missing in ["entries_updated", "entries_rejected"] {
+            let mut invalid = ack.clone();
+            invalid.as_object_mut().unwrap().remove(missing);
+            assert!(validate_i18n_callback_ack(invalid, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn callback_receipt_refuses_wrong_protocol_invalid_ids_and_terminal_flags() {
+        let ack = serde_json::json!({
+            "success":true,"result_id":42,"protocol":"v2","result_status":"synced"
+        });
+        for (key, value) in [
+            ("success", serde_json::json!("true")),
+            ("result_id", serde_json::json!(0)),
+            ("result_id", serde_json::json!(-1)),
+            ("result_id", serde_json::json!("42")),
+            ("protocol", serde_json::json!("path-b")),
+            ("protocol", Value::Null),
+            ("result_status", serde_json::json!("failed")),
+            ("result_status", Value::Null),
+            ("partial", serde_json::json!(true)),
+            ("partial", serde_json::json!("true")),
+            ("skipped", serde_json::json!(true)),
+            ("skipped", serde_json::json!("true")),
+            ("sync_result", Value::Null),
+            (
+                "sync_result",
+                serde_json::json!({"success":true,"partial":true}),
+            ),
+            (
+                "sync_result",
+                serde_json::json!({"success":true,"skipped":true}),
+            ),
+        ] {
+            let mut invalid = ack.clone();
+            invalid[key] = value;
+            assert!(validate_translation_callback_ack(invalid).is_err(), "{key}");
+        }
+    }
+}
 use serde_json::json;
 
 use crate::auth::wp_post_with_transport_and_headers;
@@ -880,7 +1100,630 @@ fn parse_retry_after_ms_from_error(err: &anyhow::Error) -> Option<u64> {
     None
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn attachment_source_copy_requires_configured_wordpress_origin() {
+        assert!(is_configured_wp_origin(
+            "http://127.0.0.1:9083/wp-json/wptsall/v2/test/client",
+            "http://127.0.0.1:9083/wp-content/uploads/2026/08/source.jpg"
+        ));
+        assert!(!is_configured_wp_origin(
+            "https://example.com/wp-json/wptsall/v2/test/client",
+            "https://attacker.example/wp-content/uploads/source.jpg"
+        ));
+        assert!(!is_configured_wp_origin(
+            "https://example.com/wp-json/wptsall/v2/test/client",
+            "https://user:pass@example.com/wp-content/uploads/source.jpg"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // AF-04 (opus5): the secret-scoped base is an explicit precondition, not
+    // an implicit convention — the dead `route_secret` params are gone and
+    // a base without the `/{secret}/client` segment fails fast instead of
+    // silently 404ing against the unsecreted path.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn secret_client_base_guard_accepts_secret_scoped_base() {
+        assert!(ensure_secret_client_base(
+            "https://example.com/wp-json/wptsall/v2/abc123/client/translation-callback",
+            "translation-callback"
+        )
+        .is_ok());
+        assert!(ensure_secret_client_base(
+            "https://example.com/wp-json/wptsall/v2/abc123/client/media-upload",
+            "media-upload"
+        )
+        .is_ok());
+        // Trailing slashes are tolerated.
+        assert!(ensure_secret_client_base(
+            "https://example.com/wp-json/wptsall/v2/abc123/client/",
+            "media-upload"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn secret_client_base_guard_rejects_unsecreted_base_with_explicit_error() {
+        let err = ensure_secret_client_base(
+            "https://example.com/wp-json/wptsall/v2/translation-callback",
+            "translation-callback",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("route secret missing"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = ensure_secret_client_base("https://example.com", "media-upload").unwrap_err();
+        assert!(
+            err.to_string().contains("route secret missing"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn send_translation_callback_rejects_unsecreted_base_before_any_request() {
+        let payload = crate::types::I18nCallbackPayload {
+            business_line: "plugin_i18n".to_string(),
+            relation_id: 1,
+            client_task_id: "af04-guard".to_string(),
+            worker_id: "worker-test".to_string(),
+            source_lang: "en".to_string(),
+            target_lang: "zh".to_string(),
+            entries: vec![],
+        };
+        let err = send_i18n_translation_callback(
+            &Client::new(),
+            "https://example.com/wp-json/wptsall/v2",
+            "token",
+            "worker-test",
+            "worker-test",
+            "af04-guard",
+            &payload,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("route secret missing"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_retryable_error (m3 audit fix: tightened retry classification)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn retryable_timeout_errors() {
+        let cases = vec![
+            "operation timed out",
+            "request timeout while waiting for response",
+            "connection timed out after 30s",
+        ];
+        for msg in cases {
+            let err = anyhow::anyhow!("{}", msg);
+            assert!(is_retryable_error(&err), "expected retryable for: {}", msg);
+        }
+    }
+
+    #[test]
+    fn retryable_connection_errors() {
+        let cases = vec![
+            "connection refused",
+            "connection reset by peer",
+            "connection closed before response",
+            "connection aborted unexpectedly",
+        ];
+        for msg in cases {
+            let err = anyhow::anyhow!("{}", msg);
+            assert!(is_retryable_error(&err), "expected retryable for: {}", msg);
+        }
+    }
+
+    #[test]
+    fn retryable_server_errors() {
+        let cases = vec![
+            "HTTP status=429 Too Many Requests",
+            "HTTP status 500 Internal Server Error",
+            "server returned status=502",
+            "status 503 Service Unavailable",
+            "upstream status=504 Gateway Timeout",
+        ];
+        for msg in cases {
+            let err = anyhow::anyhow!("{}", msg);
+            assert!(is_retryable_error(&err), "expected retryable for: {}", msg);
+        }
+    }
+
+    #[test]
+    fn non_retryable_client_errors() {
+        let cases = vec![
+            "HTTP status=400 Bad Request",
+            "HTTP status=401 Unauthorized",
+            "HTTP status=403 Forbidden",
+            "HTTP status=404 Not Found",
+            "HTTP status=422 Unprocessable Entity",
+            "invalid JSON in response body",
+            "missing required field",
+        ];
+        for msg in cases {
+            let err = anyhow::anyhow!("{}", msg);
+            assert!(
+                !is_retryable_error(&err),
+                "expected NOT retryable for: {}",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn non_retryable_generic_connection_word() {
+        // "connection" alone (without refused/reset/closed/aborted) should NOT be retryable
+        let err = anyhow::anyhow!("bad connection pool state");
+        assert!(
+            !is_retryable_error(&err),
+            "generic 'connection' should not be retryable"
+        );
+    }
+
+    #[test]
+    fn non_retryable_request_failed() {
+        // "request failed" alone should NOT be retryable (too broad)
+        let err = anyhow::anyhow!("request failed: invalid payload");
+        assert!(
+            !is_retryable_error(&err),
+            "'request failed' should not be retryable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_backoff_ms
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backoff_cap_respected() {
+        // When base_ms > max_ms, the result must still be <= max_ms (the cap).
+        // Previously `.min(max_ms.max(base_ms))` would use base_ms as the cap
+        // when base_ms > max_ms, causing the cap to be silently raised.
+        let result = compute_backoff_ms(0, 6000, 5000);
+        assert!(
+            result <= 5000,
+            "backoff exceeded max_ms cap: got {result}, expected <= 5000"
+        );
+
+        // Verify cap is never exceeded for any attempt count.
+        for attempt in 0..=20 {
+            let ms = compute_backoff_ms(attempt, 6000, 5000);
+            assert!(
+                ms <= 5000,
+                "attempt={attempt}: backoff {ms} exceeded max_ms cap of 5000"
+            );
+        }
+
+        // Normal case: base_ms < max_ms — cap still applies at max_ms.
+        for attempt in 0..=20 {
+            let ms = compute_backoff_ms(attempt, 400, 5000);
+            assert!(
+                ms <= 5000,
+                "attempt={attempt}: backoff {ms} exceeded max_ms cap of 5000"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_ms_from_error_works() {
+        let e1 = anyhow::anyhow!("wp transport non-2xx status=429 retry_after=30");
+        assert_eq!(parse_retry_after_ms_from_error(&e1), Some(30_000));
+
+        let e2 = anyhow::anyhow!("component api non-2xx status=429 retry_after_ms=1800");
+        assert_eq!(parse_retry_after_ms_from_error(&e2), Some(1800));
+
+        let e3 = anyhow::anyhow!("status=503");
+        assert_eq!(parse_retry_after_ms_from_error(&e3), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // L3 fault injection through the real component + retry path (plan §7
+    // TEST-NETWORK-RESILIENCE-001; failure-modes FM-HTTP-429 / FM-HTTP-403 /
+    // FM-RETRY-EXHAUSTION). A counting mock provider answers every request
+    // with a fixed status; retry_with_backoff drives
+    // translate_text_via_component, so attempt counts and backoff waits are
+    // observed end-to-end, not inferred from the classifier alone.
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    /// Counting mock provider: every request gets `status_line` + optional
+    /// `extra_headers` + a plain-text `body`. Returns (port, request count).
+    async fn start_status_counting_server(
+        status_line: &'static str,
+        extra_headers: &'static str,
+        body: &'static str,
+    ) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(socket);
+                    let mut content_length: usize = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                        let lower = line.to_lowercase();
+                        if lower.starts_with("content-length:") {
+                            content_length =
+                                lower["content-length:".len()..].trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body_buf = vec![0u8; content_length];
+                    if content_length > 0 {
+                        let _ = reader.read_exact(&mut body_buf).await;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let resp = format!(
+                        "HTTP/1.1 {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status_line,
+                        extra_headers,
+                        body.len(),
+                        body
+                    );
+                    let _ = reader.get_mut().write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        (port, count)
+    }
+
+    #[tokio::test]
+    async fn durable_uploaded_local_result_is_retained_for_callback_recovery() {
+        let _key = crate::db::owned_mock_bindings_key();
+        let root = tempfile::tempdir().unwrap();
+        let _data =
+            crate::db::TestEnvVarGuard::set("WPTSALL_DATA_DIR", root.path().to_str().unwrap());
+        let asset = root.path().join("owned-paid-result.bin");
+        std::fs::write(&asset, b"owned-paid-bytes").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let observed = count.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if line.to_ascii_lowercase().starts_with("content-length:") {
+                    length = line
+                        .split_once(':')
+                        .unwrap()
+                        .1
+                        .trim()
+                        .parse::<usize>()
+                        .unwrap();
+                }
+                headers.push_str(&line);
+            }
+            let mut bytes = vec![0; length];
+            reader.read_exact(&mut bytes).await.unwrap();
+            observed.fetch_add(1, Ordering::SeqCst);
+            let body =
+                crate::web_ui::test_support::media_operation_response_from_headers(&headers, 321)
+                    .to_string();
+            let signature = crate::web_ui::test_support::sign_wp_plaintext_response(
+                "owned-token",
+                body.as_bytes(),
+            );
+            let response=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-WPTSALL-Response-Signature: {signature}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+            reader
+                .get_mut()
+                .write_all(response.as_bytes())
+                .await
+                .unwrap();
+        });
+        let mut payload: TranslationCallbackPayload = serde_json::from_value(json!({
+            "relation_id":7,"business_line":"content_translation","object_type":"post_type",
+            "post_type":"post","object_id":42,"translated_fields":{},"translated_meta":{},
+            "media_mappings":[{"source_id":9,"translated_ref":format!("file://{}",asset.display())}],
+            "client_task_id":"owned-paid","worker_id":"owned-worker","source_lang":"en",
+            "target_lang":"zh","execution_time_ms":0
+        })).unwrap();
+        upload_pending_media(
+            &Client::builder().no_proxy().build().unwrap(),
+            &format!("http://127.0.0.1:{port}/wp-json/wptsall/v2/owned-secret/client"),
+            "owned-token",
+            "owned-worker",
+            "owned-device",
+            1,
+            7,
+            &mut payload,
+            "/dev/null",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            payload.media_mappings[0].attachment_id,
+            Some(321),
+            "real signed upload must succeed"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+        assert_eq!(
+            std::fs::read(&asset).unwrap(),
+            b"owned-paid-bytes",
+            "successful upload is not authorization to delete a retained result"
+        );
+    }
+
+    #[test]
+    fn chunk_scratch_same_source_filename_cannot_overwrite_another_upload() {
+        let _key = crate::db::owned_mock_bindings_key();
+        let root = tempfile::tempdir().unwrap();
+        let first =
+            stage_chunk_upload_bytes(root.path().to_str().unwrap(), 9, "owned.bin", b"first")
+                .unwrap();
+        let second =
+            stage_chunk_upload_bytes(root.path().to_str().unwrap(), 9, "owned.bin", b"second")
+                .unwrap();
+        assert_ne!(
+            first, second,
+            "parallel object/relation uploads need private scratch files"
+        );
+        assert_eq!(crate::retained_assets::read(&first, 5).unwrap(), b"first");
+        assert_eq!(crate::retained_assets::read(&second, 6).unwrap(), b"second");
+        assert_ne!(std::fs::read(first).unwrap(), b"first");
+        assert_ne!(std::fs::read(second).unwrap(), b"second");
+    }
+
+    fn retry_worker_config(retry_max: u32, retry_base_ms: u64, retry_max_ms: u64) -> WorkerConfig {
+        WorkerConfig {
+            worker_id: "test-worker".to_string(),
+            device_id: "test-worker".to_string(),
+            task_pull_statuses: vec![],
+            task_concurrency: 1,
+            retry_max,
+            retry_base_ms,
+            retry_max_ms,
+            component_fallback_enabled: false,
+            default_max_input_chars: 10_000,
+            default_split_strategy: "paragraph".to_string(),
+            discovery_mode: false,
+            discovery_max_items_per_run: 100,
+            review_mode: false,
+        }
+    }
+
+    fn status_runtime(port: u16) -> ComponentRuntime {
+        use crate::types::{ComponentRequest, ComponentResponse, ComponentTemplate};
+        let template = ComponentTemplate {
+            id: "status-fault-injection".to_string(),
+            name: "Status Fixture".to_string(),
+            version: "1.0.0".to_string(),
+            kind: "text_translation".to_string(),
+            client_contract: None,
+            default_values: None,
+            auth: None,
+            prepare: None,
+            request: ComponentRequest {
+                http_limits: None,
+                method: "POST".to_string(),
+                url: format!("http://127.0.0.1:{}", port),
+                headers: None,
+                body: Some(json!({"text": "{{input.text}}"})),
+                body_type: Some("json".to_string()),
+                response_type: None,
+            },
+            response: ComponentResponse {
+                translated_text_path: Some("data.translated".to_string()),
+                error_path: Some("error.message".to_string()),
+                translated_ref_path: None,
+                translated_media_ref_path: None,
+                translated_image_ref_path: None,
+                translated_video_ref_path: None,
+                translated_audio_ref_path: None,
+                translated_document_ref_path: None,
+            },
+            async_poll: None,
+            source_upload: None,
+            sign: None,
+            constraints: None,
+            editable_params: vec![],
+            translation_modes: vec![],
+        };
+        ComponentRuntime {
+            template,
+            auth_values: std::collections::HashMap::new(),
+            supported_business_lines: vec![],
+            language_map: std::collections::HashMap::new(),
+            supported_content_formats: vec![],
+            supported_formats: vec![],
+            key_pool: None,
+            oauth_pool: None,
+            oauth_manager: None,
+            runtime_max_concurrent_requests: 0,
+            runtime_min_interval_ms: 0,
+            runtime_concurrency_sem: None,
+            runtime_last_request_at: None,
+            proxy_profile_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_429_honors_retry_after_and_bounds_attempts() {
+        // FM-HTTP-429 L3: the rate-limited provider is retried exactly
+        // max_attempts times, the wait honors Retry-After (1000ms dominates
+        // the 10ms base), and the final 429 error surfaces.
+        let (port, count) = start_status_counting_server(
+            "429 Too Many Requests",
+            "Retry-After: 1\r\n",
+            "rate limited",
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let comp = status_runtime(port);
+        let wc = retry_worker_config(2, 10, 20);
+        let started = Instant::now();
+
+        let result = retry_with_backoff("fm-429", 1, "/dev/null", &wc, |_| {
+            crate::component_rt::runner::translate_text_via_component(
+                &client, &comp, "Hello", "en", "zh",
+            )
+        })
+        .await;
+
+        let err = result.expect_err("429 provider must end in an error");
+        assert!(
+            err.to_string().contains("status=429"),
+            "final error should carry the 429 status, got: {err}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "retry_max=2 must cap attempts at 3"
+        );
+        assert!(
+            started.elapsed().as_millis() >= 1000,
+            "Retry-After (1s) must dominate the 10ms base backoff; elapsed {}ms",
+            started.elapsed().as_millis()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_403_is_not_retried() {
+        // FM-HTTP-403 L3: a forbidden provider answer is terminal — exactly
+        // one request, no retry storm against the rate-limiting endpoint.
+        let (port, count) = start_status_counting_server("403 Forbidden", "", "forbidden").await;
+        let client = reqwest::Client::new();
+        let comp = status_runtime(port);
+        let wc = retry_worker_config(5, 10, 20);
+
+        let result = retry_with_backoff("fm-403", 2, "/dev/null", &wc, |_| {
+            crate::component_rt::runner::translate_text_via_component(
+                &client, &comp, "Hello", "en", "zh",
+            )
+        })
+        .await;
+
+        let err = result.expect_err("403 provider must end in an error");
+        assert!(
+            err.to_string().contains("status=403"),
+            "final error should carry the 403 status, got: {err}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "403 is not retryable: exactly one attempt expected"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_bounds_attempts_and_preserves_last_error() {
+        // FM-RETRY-EXHAUSTION L3: a persistently failing 5xx provider is
+        // attempted exactly max_attempts times, and the returned error is
+        // the LAST failure (preserved, no zombie success/panic).
+        let (port, count) =
+            start_status_counting_server("500 Internal Server Error", "", "boom").await;
+        let client = reqwest::Client::new();
+        let comp = status_runtime(port);
+        let wc = retry_worker_config(2, 5, 10);
+
+        let result = retry_with_backoff("fm-exhaustion", 3, "/dev/null", &wc, |_| {
+            crate::component_rt::runner::translate_text_via_component(
+                &client, &comp, "Hello", "en", "zh",
+            )
+        })
+        .await;
+
+        let err = result.expect_err("persistent 500 must end in an error");
+        assert!(
+            err.to_string().contains("status=500"),
+            "the LAST error must be preserved, got: {err}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "retry_max=2 must cap attempts at 3"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_classifies_context_wrapped_transport_5xx_as_retryable() {
+        // FL-17 L3: WP callback submissions wrap transport errors with
+        // .with_context() ("i18n translation callback failed
+        // (relation_id=N)") — the retryable "status=500" lives in the
+        // CAUSE chain, not the outermost message. The classifier must
+        // walk the full chain or every callback 5xx is single-shot
+        // despite the retry_with_backoff wrap.
+        let (port, count) =
+            start_status_counting_server("500 Internal Server Error", "", "boom").await;
+        let client = reqwest::Client::new();
+        let comp = status_runtime(port);
+        let wc = retry_worker_config(2, 1, 2);
+
+        let result: anyhow::Result<()> =
+            retry_with_backoff("fm-ctx-500", 9, "/dev/null", &wc, |_| {
+                let client = client.clone();
+                let comp = comp.clone();
+                async move {
+                    crate::component_rt::runner::translate_text_via_component(
+                        &client, &comp, "Hello", "en", "zh",
+                    )
+                    .await
+                    .map(|_| ())
+                    .with_context(|| "wrapped submission failed (relation_id=9)")
+                }
+            })
+            .await;
+
+        let err = result.expect_err("persistent context-wrapped 500 must end in an error");
+        // The OUTER context is what plain Display shows — it must NOT be
+        // mistaken for the whole classification input.
+        assert_eq!(
+            err.to_string(),
+            "wrapped submission failed (relation_id=9)",
+            "outermost context stays the display message"
+        );
+        assert!(
+            format!("{:#}", err).contains("status=500"),
+            "the cause chain carries the transport status, got: {err:#}"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            3,
+            "context-wrapped 5xx must exhaust max_attempts=3, not single-shot"
+        );
+    }
+}
 
 fn is_retryable_error(err: &anyhow::Error) -> bool {
     // FL-17: classify on the FULL error chain, not the outermost context.

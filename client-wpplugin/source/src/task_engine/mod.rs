@@ -1,5 +1,8 @@
 pub(crate) mod backoff;
+pub(crate) mod content_class;
+pub(crate) mod delivery_policy;
 pub mod discoverer;
+pub(crate) mod field_action;
 pub(crate) mod event_waiter;
 pub(crate) mod executor;
 pub(crate) mod pipeline;

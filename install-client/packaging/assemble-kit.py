@@ -55,6 +55,18 @@ def assemble(product: str, binary: Path, ui: Path, version: str, platform: str,
         shutil.copy2(INSTALL / "shared/PRODUCTION-FIRST-LAUNCH-AUTHORIZATION.md",
                      tree / "FIRST-LAUNCH-AUTHORIZATION.md")
         (tree / "FIRST-LAUNCH-AUTHORIZATION.md").chmod(0o644)
+        harden = INSTALL / "shared/secure-harden-release.sh"
+        subprocess.run(["bash", str(harden), str(tree)], check=True)
+        obfuscate = INSTALL / "hooks/obfuscate-kit.sh"
+        if obfuscate.is_file():
+            subprocess.run(["bash", str(obfuscate), str(tree)], check=True)
+        else:
+            (tree / "OBFUSCATION.txt").write_text("diversify=skipped\n", encoding="utf-8")
+        (tree / "HARDENING.txt").write_text(
+            "strip=build-profile\nobfuscation="
+            + ("applied" if (tree / "OBFUSCATION.txt").is_file() else "none")
+            + f"\nproduct_entry=wptsall-client\nversion={version}\nplatform={platform}\n",
+            encoding="utf-8")
         if not platform.startswith("windows-"):
             launcher = tree / "bin" / ("wptsall-webui-start" if product == "webui"
                                        else "wptsall-start")

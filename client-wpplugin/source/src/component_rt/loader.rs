@@ -2300,3 +2300,5 @@ pub(crate) fn build_component_pools(
 
     Ok((key_pool, oauth_pool))
 }
+#[cfg(test)]
+mod tests;

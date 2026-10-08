@@ -1,0 +1,4765 @@
+{
+  "version": "builtin-3",
+  "count": 112,
+  "entries": [
+    {
+      "entry_id": "baidu",
+      "vendor_id": "baidu",
+      "family": "http_mt",
+      "name": "Baidu Translate (Open API)",
+      "method": "POST",
+      "url": "https://fanyi-api.baidu.com/api/trans/vip/translate",
+      "host": "fanyi-api.baidu.com",
+      "path": "/api/trans/vip/translate",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body_keys": [
+        "appid",
+        "from",
+        "q",
+        "salt",
+        "sign",
+        "to"
+      ],
+      "body": {
+        "appid": "{{auth.app_id}}",
+        "from": "{{input.source_lang}}",
+        "q": "{{input.text}}",
+        "salt": "{{computed.salt}}",
+        "sign": "{{computed.sign}}",
+        "to": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "app_id",
+        "api_key"
+      ],
+      "sign_algo": "md5",
+      "sign": {
+        "algorithm": "md5",
+        "salt_type": "random_int",
+        "concat": [
+          "auth.app_id",
+          "input.text",
+          "computed.salt",
+          "auth.api_key"
+        ]
+      },
+      "translated_text_path": "trans_result.0.dst",
+      "body_type": "form",
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/api/trans/vip/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "youdao",
+      "vendor_id": "youdao",
+      "family": "http_mt",
+      "name": "Youdao Translate",
+      "method": "POST",
+      "url": "https://openapi.youdao.com/api",
+      "host": "openapi.youdao.com",
+      "path": "/api",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body_keys": [
+        "appKey",
+        "curtime",
+        "from",
+        "q",
+        "salt",
+        "sign",
+        "signType",
+        "to"
+      ],
+      "body": {
+        "appKey": "{{auth.app_key}}",
+        "curtime": "{{computed.curtime}}",
+        "from": "{{input.source_lang}}",
+        "q": "{{input.text}}",
+        "salt": "{{computed.salt}}",
+        "sign": "{{computed.sign}}",
+        "signType": "v3",
+        "to": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "app_key",
+        "app_secret"
+      ],
+      "sign_algo": "sha256",
+      "sign": {
+        "algorithm": "sha256",
+        "salt_type": "uuid",
+        "concat": [
+          "auth.app_key",
+          "computed.input_truncated",
+          "computed.salt",
+          "computed.curtime",
+          "auth.app_secret"
+        ]
+      },
+      "translated_text_path": "translation.0",
+      "error_path": "errorCode",
+      "body_type": "form",
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/api",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "hmac-generic",
+      "vendor_id": "hmac_generic",
+      "family": "http_mt",
+      "name": "Generic HMAC-SHA256 Translate",
+      "method": "POST",
+      "url": "https://example.com/api/hmac/translate",
+      "host": "example.com",
+      "path": "/api/hmac/translate",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "api_key",
+        "sign",
+        "source_lang",
+        "target_lang",
+        "text",
+        "timestamp"
+      ],
+      "body": {
+        "api_key": "{{auth.api_key}}",
+        "sign": "{{computed.sign}}",
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": "{{input.text}}",
+        "timestamp": "{{computed.salt}}"
+      },
+      "auth_fields": [
+        "api_key",
+        "secret_key"
+      ],
+      "sign_algo": "hmac_sha256",
+      "sign": {
+        "algorithm": "hmac_sha256",
+        "salt_type": "unix_timestamp",
+        "concat": [
+          "auth.api_key",
+          "input.text",
+          "computed.salt"
+        ]
+      },
+      "translated_text_path": "translated_text",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/api/hmac/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "tencent",
+      "vendor_id": "tencent",
+      "family": "http_mt",
+      "name": "Tencent Cloud Translate (TC3)",
+      "method": "POST",
+      "url": "https://tmt.tencentcloudapi.com",
+      "host": "tmt.tencentcloudapi.com",
+      "path": "",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-TC-Action": "TextTranslate",
+        "X-TC-Region": "ap-guangzhou",
+        "X-TC-Version": "2018-03-21"
+      },
+      "body_keys": [
+        "Source",
+        "SourceText",
+        "Target"
+      ],
+      "body": {
+        "Source": "{{input.source_lang}}",
+        "SourceText": "{{input.text}}",
+        "Target": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "secret_id",
+        "secret_key"
+      ],
+      "sign_algo": "tc3_hmac_sha256",
+      "sign": {
+        "algorithm": "tc3_hmac_sha256"
+      },
+      "translated_text_path": "Response.TargetText",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/api/tencent/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "amazon-translate",
+      "vendor_id": "amazon_translate",
+      "family": "http_mt",
+      "name": "Amazon Translate",
+      "method": "POST",
+      "url": "https://translate.us-east-1.amazonaws.com",
+      "host": "translate.us-east-1.amazonaws.com",
+      "path": "",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-amz-json-1.1",
+        "X-Amz-Target": "TranslateService.TranslateText"
+      },
+      "body_keys": [
+        "SourceLanguageCode",
+        "TargetLanguageCode",
+        "Text"
+      ],
+      "body": {
+        "SourceLanguageCode": "{{input.source_lang}}",
+        "TargetLanguageCode": "{{input.target_lang}}",
+        "Text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "access_key",
+        "secret_key"
+      ],
+      "sign_algo": "aws_sigv4",
+      "sign": {
+        "algorithm": "aws_sigv4"
+      },
+      "translated_text_path": "TranslatedText",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/api/aws/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "volcengine",
+      "vendor_id": "volcengine",
+      "family": "http_mt",
+      "name": "Volcengine Translate (SigV4 variant)",
+      "method": "POST",
+      "url": "https://translate.volcengineapi.com",
+      "host": "translate.volcengineapi.com",
+      "path": "",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "SourceLanguage",
+        "SourceText",
+        "TargetLanguage"
+      ],
+      "body": {
+        "SourceLanguage": "{{input.source_lang}}",
+        "SourceText": "{{input.text}}",
+        "TargetLanguage": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "access_key",
+        "secret_key"
+      ],
+      "sign_algo": "volcengine_hmac_sha256",
+      "sign": {
+        "algorithm": "volcengine_hmac_sha256"
+      },
+      "translated_text_path": "Translation",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/api/volcengine/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "alibaba",
+      "vendor_id": "alibaba",
+      "family": "http_mt",
+      "name": "Alibaba Cloud Translate",
+      "method": "POST",
+      "url": "https://mt.cn-hangzhou.aliyuncs.com/api/translate/web",
+      "host": "mt.cn-hangzhou.aliyuncs.com",
+      "path": "/api/translate/web",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body_keys": [
+        "AccessKeyId",
+        "Action",
+        "FormatType",
+        "Signature",
+        "SourceLanguage",
+        "SourceText",
+        "TargetLanguage"
+      ],
+      "body": {
+        "AccessKeyId": "{{auth.access_key}}",
+        "Action": "TranslateGeneral",
+        "FormatType": "text",
+        "Signature": "{{computed.sign}}",
+        "SourceLanguage": "{{input.source_lang}}",
+        "SourceText": "{{input.text}}",
+        "TargetLanguage": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "access_key",
+        "secret_key"
+      ],
+      "sign_algo": "alibaba_v1",
+      "sign": {
+        "algorithm": "alibaba_v1",
+        "concat": [
+          {
+            "ctx_key": "auth.access_key",
+            "param_name": "AccessKeyId"
+          },
+          {
+            "param_name": "Action",
+            "value": "TranslateGeneral"
+          },
+          {
+            "param_name": "FormatType",
+            "value": "text"
+          },
+          {
+            "ctx_key": "input.source_lang",
+            "param_name": "SourceLanguage"
+          },
+          {
+            "ctx_key": "input.text",
+            "param_name": "SourceText"
+          },
+          {
+            "ctx_key": "input.target_lang",
+            "param_name": "TargetLanguage"
+          }
+        ]
+      },
+      "translated_text_path": "Data.TranslatedText",
+      "body_type": "form",
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/api/alibaba/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "iflytek",
+      "vendor_id": "iflytek",
+      "family": "http_mt",
+      "name": "iFlytek Translate",
+      "method": "POST",
+      "url": "https://itrans.xf-yun.com/v1/its",
+      "host": "itrans.xf-yun.com",
+      "path": "/v1/its",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Appid": "{{auth.app_id}}",
+        "X-CheckSum": "{{computed.sign}}",
+        "X-CurTime": "{{computed.salt}}"
+      },
+      "body_keys": [
+        "from",
+        "text",
+        "to"
+      ],
+      "body": {
+        "from": "{{input.source_lang}}",
+        "text": "{{input.text}}",
+        "to": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "app_id",
+        "api_secret"
+      ],
+      "sign_algo": "md5",
+      "sign": {
+        "algorithm": "md5",
+        "salt_type": "unix_timestamp",
+        "concat": [
+          "auth.api_secret",
+          "computed.salt"
+        ]
+      },
+      "translated_text_path": "data.trans_result.dst",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/v1/its",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "niutrans",
+      "vendor_id": "niutrans",
+      "family": "http_mt",
+      "name": "NiuTrans Open API v2",
+      "method": "POST",
+      "url": "https://api.niutrans.com/NiuTransServer/translation",
+      "host": "api.niutrans.com",
+      "path": "/NiuTransServer/translation",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body_keys": [
+        "apikey",
+        "from",
+        "q",
+        "sign",
+        "to"
+      ],
+      "body": {
+        "apikey": "{{auth.api_key}}",
+        "from": "{{input.source_lang}}",
+        "q": "{{input.text}}",
+        "sign": "{{computed.sign}}",
+        "to": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": "md5",
+      "sign": {
+        "algorithm": "md5",
+        "concat": [
+          "auth.api_key",
+          "input.text",
+          "input.source_lang",
+          "input.target_lang",
+          "auth.api_key"
+        ]
+      },
+      "translated_text_path": "tgt_text",
+      "body_type": "form",
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/NiuTransServer/translation",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "kakao",
+      "vendor_id": "kakao",
+      "family": "http_mt",
+      "name": "Kakao i Translator",
+      "method": "POST",
+      "url": "https://dapi.kakao.com/v2/translation/translate",
+      "host": "dapi.kakao.com",
+      "path": "/v2/translation/translate",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "query",
+        "source_lang",
+        "target_lang"
+      ],
+      "body": {
+        "query": "{{input.text}}",
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": "kakao_api_key",
+      "sign": {
+        "algorithm": "kakao_api_key"
+      },
+      "translated_text_path": "translated_text.0.0",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/v2/translation/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "azure-cognitive",
+      "vendor_id": "azure_cognitive",
+      "family": "http_mt",
+      "name": "Azure Cognitive Services Translate",
+      "method": "POST",
+      "url": "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}",
+      "host": "api.cognitive.microsofttranslator.com",
+      "path": "/translate",
+      "query": "api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body_keys": "list",
+      "body": [
+        {
+          "Text": "{{input.text}}"
+        }
+      ],
+      "auth_fields": [
+        "subscription_key"
+      ],
+      "sign_algo": "azure_subscription_key",
+      "sign": {
+        "algorithm": "azure_subscription_key"
+      },
+      "translated_text_path": "0.translations.0.text",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/translate",
+      "mock_query": "api-version=3.0&from=en&to=zh"
+    },
+    {
+      "entry_id": "oauth-mt",
+      "vendor_id": "oauth_mt",
+      "family": "http_mt",
+      "name": "OAuth Client-Credentials Translate",
+      "method": "POST",
+      "url": "https://example.com/api/oauth/translate",
+      "host": "example.com",
+      "path": "/api/oauth/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.access_token}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "source_lang",
+        "target_lang",
+        "text"
+      ],
+      "body": {
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "client_id",
+        "client_secret",
+        "access_token"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translated_text",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/api/oauth/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "jwt-mt",
+      "vendor_id": "jwt_mt",
+      "family": "http_mt",
+      "name": "JWT Bearer (RSA) Translate",
+      "method": "POST",
+      "url": "https://example.com/api/jwt/translate",
+      "host": "example.com",
+      "path": "/api/jwt/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.jwt_token}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "source_lang",
+        "target_lang",
+        "text"
+      ],
+      "body": {
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "jwt_token"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translated_text",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "A",
+      "mock_path": "/api/jwt/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "google-translate",
+      "vendor_id": "google_translate",
+      "family": "http_mt",
+      "name": "Google Cloud Translation (Basic)",
+      "method": "POST",
+      "url": "https://translation.googleapis.com/language/translate/v2",
+      "host": "translation.googleapis.com",
+      "path": "/language/translate/v2",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json",
+        "x-goog-api-key": "{{auth.api_key}}"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "data.translations.0.translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "B",
+      "mock_path": "/language/translate/v2",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "google-advanced",
+      "vendor_id": "google_advanced",
+      "family": "http_mt",
+      "name": "Google Cloud Translation Advanced",
+      "method": "POST",
+      "url": "https://translation.googleapis.com/v3/projects/YOUR_PROJECT/locations/global:translateText",
+      "host": "translation.googleapis.com",
+      "path": "/v3/projects/YOUR_PROJECT/locations/global:translateText",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translations.0.translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "B",
+      "mock_path": "/v3/projects/demo/locations/global:translateText",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "deepl",
+      "vendor_id": "deepl",
+      "family": "http_mt",
+      "name": "DeepL API v2",
+      "method": "POST",
+      "url": "https://api-free.deepl.com/v2/translate",
+      "host": "api-free.deepl.com",
+      "path": "/v2/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "DeepL-Auth-Key {{auth.api_key}}"
+      },
+      "body_keys": [
+        "source_lang",
+        "target_lang",
+        "text"
+      ],
+      "body": {
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": [
+          "{{input.text}}"
+        ]
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translations.0.text",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "B",
+      "mock_path": "/v2/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "deepl-pro",
+      "vendor_id": "deepl_pro",
+      "family": "http_mt",
+      "name": "DeepL API Pro",
+      "method": "POST",
+      "url": "https://api.deepl.com/v2/translate",
+      "host": "api.deepl.com",
+      "path": "/v2/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "DeepL-Auth-Key {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "source_lang",
+        "target_lang",
+        "text"
+      ],
+      "body": {
+        "source_lang": "{{input.source_lang}}",
+        "target_lang": "{{input.target_lang}}",
+        "text": [
+          "{{input.text}}"
+        ]
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translations.0.text",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "B",
+      "mock_path": "/v2/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "translated-matecat",
+      "vendor_id": "translated",
+      "family": "http_mt",
+      "name": "Translated MateCat MT",
+      "method": "POST",
+      "url": "https://api.translated.com/v2/translate",
+      "host": "api.translated.com",
+      "path": "/v2/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translation",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "B",
+      "mock_path": "/v2/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "microsoft-translator",
+      "vendor_id": "microsoft_translator",
+      "family": "http_mt",
+      "name": "Microsoft Translator v3",
+      "method": "POST",
+      "url": "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}",
+      "host": "api.cognitive.microsofttranslator.com",
+      "path": "/translate",
+      "query": "api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}",
+      "headers": {
+        "Content-Type": "application/json",
+        "Ocp-Apim-Subscription-Key": "{{auth.api_key}}"
+      },
+      "body_keys": "list",
+      "body": [
+        {
+          "text": "{{input.text}}"
+        }
+      ],
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "0.translations.0.text",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "B",
+      "mock_path": "/translate",
+      "mock_query": "api-version=3.0&from=en&to=zh"
+    },
+    {
+      "entry_id": "microsoft-custom",
+      "vendor_id": "microsoft_custom",
+      "family": "http_mt",
+      "name": "Microsoft Custom Translator",
+      "method": "POST",
+      "url": "https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}&category=generalnn",
+      "host": "api.cognitive.microsofttranslator.com",
+      "path": "/translate",
+      "query": "api-version=3.0&from={{input.source_lang}}&to={{input.target_lang}}&category=generalnn",
+      "headers": {
+        "Content-Type": "application/json",
+        "Ocp-Apim-Subscription-Key": "{{auth.api_key}}"
+      },
+      "body_keys": "list",
+      "body": [
+        {
+          "Text": "{{input.text}}"
+        }
+      ],
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "0.translations.0.text",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "B",
+      "mock_path": "/translate",
+      "mock_query": "api-version=3.0&from=en&to=zh&category=generalnn"
+    },
+    {
+      "entry_id": "azure-openai",
+      "vendor_id": "azure_openai",
+      "family": "openai_compatible",
+      "name": "Azure OpenAI Chat Completions",
+      "method": "POST",
+      "url": "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT/chat/completions?api-version=2024-06-01",
+      "host": "YOUR_RESOURCE.openai.azure.com",
+      "path": "/openai/deployments/YOUR_DEPLOYMENT/chat/completions",
+      "query": "api-version=2024-06-01",
+      "headers": {
+        "Content-Type": "application/json",
+        "api-key": "{{auth.api_key}}"
+      },
+      "body_keys": [
+        "messages",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "B",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": "api-version=2024-06-01"
+    },
+    {
+      "entry_id": "papago",
+      "vendor_id": "papago",
+      "family": "http_mt",
+      "name": "Naver Papago Translate",
+      "method": "POST",
+      "url": "https://openapi.naver.com/v1/papago/n2mt",
+      "host": "openapi.naver.com",
+      "path": "/v1/papago/n2mt",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Naver-Client-Id": "{{auth.client_id}}",
+        "X-Naver-Client-Secret": "{{auth.client_secret}}"
+      },
+      "body_keys": "str",
+      "body": "source={{input.source_lang}}&target={{input.target_lang}}&text={{input.text}}",
+      "auth_fields": [
+        "client_id",
+        "client_secret"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "message.result.translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "B",
+      "mock_path": "/v1/papago/n2mt",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "yandex",
+      "vendor_id": "yandex",
+      "family": "http_mt",
+      "name": "Yandex Translate",
+      "method": "POST",
+      "url": "https://translate.yandex.net/api/v1.5/tr.json/translate",
+      "host": "translate.yandex.net",
+      "path": "/api/v1.5/tr.json/translate",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      "body_keys": "str",
+      "body": "text={{input.text}}&lang={{input.source_lang}}-{{input.target_lang}}&key={{auth.api_key}}",
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "text.0",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "B",
+      "mock_path": "/api/v1.5/tr.json/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "libretranslate",
+      "vendor_id": "libretranslate",
+      "family": "http_mt",
+      "name": "LibreTranslate (self-hosted)",
+      "method": "POST",
+      "url": "http://localhost:5000/translate",
+      "host": "localhost:5000",
+      "path": "/translate",
+      "query": "",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "api_key",
+        "q",
+        "source",
+        "target"
+      ],
+      "body": {
+        "api_key": "{{auth.api_key}}",
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "ibm-watson",
+      "vendor_id": "ibm_watson",
+      "family": "http_mt",
+      "name": "IBM Watson Language Translator v3",
+      "method": "POST",
+      "url": "https://api.us-south.language-translator.watson.cloud.ibm.com/instances/{{auth.instance_id}}/v3/translate?version=2018-05-01",
+      "host": "api.us-south.language-translator.watson.cloud.ibm.com",
+      "path": "/instances/{{auth.instance_id}}/v3/translate",
+      "query": "version=2018-05-01",
+      "headers": {
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": [
+          "{{input.text}}"
+        ]
+      },
+      "auth_fields": [
+        "api_key",
+        "instance_id"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translations.0.translation",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/instances/mock-instance/v3/translate",
+      "mock_query": "version=2018-05-01"
+    },
+    {
+      "entry_id": "systran",
+      "vendor_id": "systran",
+      "family": "http_mt",
+      "name": "Systran Translate",
+      "method": "POST",
+      "url": "https://api-translate.systran.net/translation/text/translate",
+      "host": "api-translate.systran.net",
+      "path": "/translation/text/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}"
+      },
+      "body_keys": [
+        "input",
+        "source",
+        "target"
+      ],
+      "body": {
+        "input": [
+          "{{input.text}}"
+        ],
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "outputs.0.output",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/translation/text/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "smartcat",
+      "vendor_id": "smartcat",
+      "family": "http_mt",
+      "name": "Smartcat Translate",
+      "method": "POST",
+      "url": "https://api.smartcat.com/api/v1/document/translate",
+      "host": "api.smartcat.com",
+      "path": "/api/v1/document/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "sourceLanguage",
+        "targetLanguage",
+        "text"
+      ],
+      "body": {
+        "sourceLanguage": "{{input.source_lang}}",
+        "targetLanguage": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/api/v1/document/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "phrase",
+      "vendor_id": "phrase",
+      "family": "http_mt",
+      "name": "Phrase MT",
+      "method": "POST",
+      "url": "https://api.phrase.com/v2/projects/mt/translate",
+      "host": "api.phrase.com",
+      "path": "/v2/projects/mt/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "token {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translation",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/v2/projects/mt/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "mymemory",
+      "vendor_id": "mymemory",
+      "family": "http_mt",
+      "name": "MyMemory Translate",
+      "method": "GET",
+      "url": "https://api.mymemory.translated.net/get?q={{input.text}}&langpair={{input.source_lang}}|{{input.target_lang}}",
+      "host": "api.mymemory.translated.net",
+      "path": "/get",
+      "query": "q={{input.text}}&langpair={{input.source_lang}}|{{input.target_lang}}",
+      "headers": {},
+      "body_keys": "NoneType",
+      "body": null,
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "responseData.translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/get",
+      "mock_query": "q={{input.text}}&langpair=en|zh"
+    },
+    {
+      "entry_id": "reverso",
+      "vendor_id": "reverso",
+      "family": "http_mt",
+      "name": "Reverso Translate",
+      "method": "POST",
+      "url": "https://api.reverso.net/translate/v1/translation",
+      "host": "api.reverso.net",
+      "path": "/translate/v1/translation",
+      "query": "",
+      "headers": {
+        "Api-Key": "{{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "from",
+        "input",
+        "to"
+      ],
+      "body": {
+        "from": "{{input.source_lang}}",
+        "input": [
+          "{{input.text}}"
+        ],
+        "to": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translation.0",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/translate/v1/translation",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "linguee",
+      "vendor_id": "linguee",
+      "family": "http_mt",
+      "name": "Linguee Translate",
+      "method": "GET",
+      "url": "https://api.linguee.net/api/v2/translations?query={{input.text}}&src={{input.source_lang}}&dst={{input.target_lang}}",
+      "host": "api.linguee.net",
+      "path": "/api/v2/translations",
+      "query": "query={{input.text}}&src={{input.source_lang}}&dst={{input.target_lang}}",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}"
+      },
+      "body_keys": "NoneType",
+      "body": null,
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "0.0",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/api/v2/translations",
+      "mock_query": "query={{input.text}}&src=en&dst=zh"
+    },
+    {
+      "entry_id": "custom-http-mt",
+      "vendor_id": "custom_http_mt",
+      "family": "http_mt",
+      "name": "Custom HTTP MT (user-editable)",
+      "method": "POST",
+      "url": "https://example.com/translate",
+      "host": "example.com",
+      "path": "/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "modernmt",
+      "vendor_id": "modernmt",
+      "family": "http_mt",
+      "name": "ModernMT",
+      "method": "POST",
+      "url": "https://api.modernmt.com/translate",
+      "host": "api.modernmt.com",
+      "path": "/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "data.translation",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "argos-translate",
+      "vendor_id": "argos",
+      "family": "http_mt",
+      "name": "Argos Translate (self-hosted)",
+      "method": "POST",
+      "url": "http://127.0.0.1:5001/translate",
+      "host": "127.0.0.1:5001",
+      "path": "/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "apertium",
+      "vendor_id": "apertium",
+      "family": "http_mt",
+      "name": "Apertium Translate",
+      "method": "POST",
+      "url": "https://www.apertium.org/apy/translate",
+      "host": "www.apertium.org",
+      "path": "/apy/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "langpair",
+        "q"
+      ],
+      "body": {
+        "langpair": "{{input.source_lang}}|{{input.target_lang}}",
+        "q": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "responseData.translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/apy/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "bergamot",
+      "vendor_id": "bergamot",
+      "family": "http_mt",
+      "name": "Bergamot / Firefox Translations",
+      "method": "POST",
+      "url": "http://127.0.0.1:8081/translate",
+      "host": "127.0.0.1:8081",
+      "path": "/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "lingvanex",
+      "vendor_id": "lingvanex",
+      "family": "http_mt",
+      "name": "LingvaNex Translate",
+      "method": "POST",
+      "url": "https://api-b2b.backenster.com/b1/api/v3/translate",
+      "host": "api-b2b.backenster.com",
+      "path": "/b1/api/v3/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "result",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/b1/api/v3/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "cloudtranslation",
+      "vendor_id": "cloudtranslation",
+      "family": "http_mt",
+      "name": "CloudTranslation",
+      "method": "POST",
+      "url": "https://api.cloudtranslation.com/v1/translate",
+      "host": "api.cloudtranslation.com",
+      "path": "/v1/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translations.0.text",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/v1/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "iciba",
+      "vendor_id": "iciba",
+      "family": "http_mt",
+      "name": "iCIBA Translate",
+      "method": "POST",
+      "url": "https://ifanyi.iciba.com/index.php",
+      "host": "ifanyi.iciba.com",
+      "path": "/index.php",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "content.out",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/index.php",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "sogou",
+      "vendor_id": "sogou",
+      "family": "http_mt",
+      "name": "Sogou Translate",
+      "method": "POST",
+      "url": "https://fanyi.sogou.com/api/transweb/translate",
+      "host": "fanyi.sogou.com",
+      "path": "/api/transweb/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "data.translatedText",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/api/transweb/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "huawei-nlp",
+      "vendor_id": "huawei",
+      "family": "http_mt",
+      "name": "Huawei Cloud NLP Translate",
+      "method": "POST",
+      "url": "https://nlp-ext.cn-north-4.myhuaweicloud.com/v1/infers/machine-translation/text-translation",
+      "host": "nlp-ext.cn-north-4.myhuaweicloud.com",
+      "path": "/v1/infers/machine-translation/text-translation",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translations.0.text",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/v1/infers/machine-translation/text-translation",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "crowdin-mt",
+      "vendor_id": "crowdin",
+      "family": "http_mt",
+      "name": "Crowdin MT",
+      "method": "POST",
+      "url": "https://api.crowdin.com/api/v2/machines/translations",
+      "host": "api.crowdin.com",
+      "path": "/api/v2/machines/translations",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "data.0.text",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/api/v2/machines/translations",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "lokalise-mt",
+      "vendor_id": "lokalise",
+      "family": "http_mt",
+      "name": "Lokalise MT",
+      "method": "POST",
+      "url": "https://api.lokalise.com/api2/projects/mt/translate",
+      "host": "api.lokalise.com",
+      "path": "/api2/projects/mt/translate",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translation",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/api2/projects/mt/translate",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "unbabel",
+      "vendor_id": "unbabel",
+      "family": "http_mt",
+      "name": "Unbabel MT",
+      "method": "POST",
+      "url": "https://api.unbabel.com/v1/translation",
+      "host": "api.unbabel.com",
+      "path": "/v1/translation",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "q",
+        "source",
+        "target",
+        "text"
+      ],
+      "body": {
+        "q": "{{input.text}}",
+        "source": "{{input.source_lang}}",
+        "target": "{{input.target_lang}}",
+        "text": "{{input.text}}"
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "translated_text",
+      "body_type": null,
+      "evidence_tier": "schema-only",
+      "confirm_phase": "C",
+      "mock_path": "/v1/translation",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "openai-compatible",
+      "vendor_id": "openai",
+      "family": "openai_compatible",
+      "name": "OpenAI Chat Completions",
+      "method": "POST",
+      "url": "https://api.openai.com/v1/chat/completions",
+      "host": "api.openai.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4o-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "deepseek",
+      "vendor_id": "deepseek",
+      "family": "openai_compatible",
+      "name": "DeepSeek Chat Completions",
+      "method": "POST",
+      "url": "https://api.deepseek.com/v1/chat/completions",
+      "host": "api.deepseek.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "deepseek-chat",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "groq",
+      "vendor_id": "groq",
+      "family": "openai_compatible",
+      "name": "Groq Chat Completions",
+      "method": "POST",
+      "url": "https://api.groq.com/openai/v1/chat/completions",
+      "host": "api.groq.com",
+      "path": "/openai/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "llama-3.3-70b-versatile",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "together",
+      "vendor_id": "together",
+      "family": "openai_compatible",
+      "name": "Together AI Chat Completions",
+      "method": "POST",
+      "url": "https://api.together.xyz/v1/chat/completions",
+      "host": "api.together.xyz",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "mistral",
+      "vendor_id": "mistral",
+      "family": "openai_compatible",
+      "name": "Mistral AI Chat Completions",
+      "method": "POST",
+      "url": "https://api.mistral.ai/v1/chat/completions",
+      "host": "api.mistral.ai",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "mistral-large-latest",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "perplexity",
+      "vendor_id": "perplexity",
+      "family": "openai_compatible",
+      "name": "Perplexity Chat Completions",
+      "method": "POST",
+      "url": "https://api.perplexity.ai/chat/completions",
+      "host": "api.perplexity.ai",
+      "path": "/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "sonar-pro",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "moonshot",
+      "vendor_id": "moonshot",
+      "family": "openai_compatible",
+      "name": "Moonshot AI (Kimi) Chat Completions",
+      "method": "POST",
+      "url": "https://api.moonshot.cn/v1/chat/completions",
+      "host": "api.moonshot.cn",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "moonshot-v1-8k",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "qwen-dashscope",
+      "vendor_id": "qwen",
+      "family": "openai_compatible",
+      "name": "Qwen (DashScope OpenAI-compatible) Chat Completions",
+      "method": "POST",
+      "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+      "host": "dashscope.aliyuncs.com",
+      "path": "/compatible-mode/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "qwen-max",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "openrouter",
+      "vendor_id": "openrouter",
+      "family": "openai_compatible",
+      "name": "OpenRouter Chat Completions",
+      "method": "POST",
+      "url": "https://openrouter.ai/api/v1/chat/completions",
+      "host": "openrouter.ai",
+      "path": "/api/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "openai/gpt-4o-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "cohere",
+      "vendor_id": "cohere",
+      "family": "openai_compatible",
+      "name": "Cohere Command Chat",
+      "method": "POST",
+      "url": "https://api.cohere.ai/v1/chat",
+      "host": "api.cohere.ai",
+      "path": "/v1/chat",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "command-r-plus",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "ai21",
+      "vendor_id": "ai21",
+      "family": "openai_compatible",
+      "name": "AI21 Jurassic Chat",
+      "method": "POST",
+      "url": "https://api.ai21.com/v1/chat/completions",
+      "host": "api.ai21.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "jamba-instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "novita",
+      "vendor_id": "novita",
+      "family": "openai_compatible",
+      "name": "Novita AI Chat",
+      "method": "POST",
+      "url": "https://api.novita.ai/v3/openai/chat/completions",
+      "host": "api.novita.ai",
+      "path": "/v3/openai/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4o-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "deepinfra",
+      "vendor_id": "deepinfra",
+      "family": "openai_compatible",
+      "name": "DeepInfra Chat",
+      "method": "POST",
+      "url": "https://api.deepinfra.com/v1/openai/chat/completions",
+      "host": "api.deepinfra.com",
+      "path": "/v1/openai/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "siliconflow",
+      "vendor_id": "siliconflow",
+      "family": "openai_compatible",
+      "name": "SiliconFlow Chat",
+      "method": "POST",
+      "url": "https://api.siliconflow.cn/v1/chat/completions",
+      "host": "api.siliconflow.cn",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "Qwen/Qwen2.5-72B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "fireworks",
+      "vendor_id": "fireworks",
+      "family": "openai_compatible",
+      "name": "Fireworks AI Chat",
+      "method": "POST",
+      "url": "https://api.fireworks.ai/inference/v1/chat/completions",
+      "host": "api.fireworks.ai",
+      "path": "/inference/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "accounts/fireworks/models/llama-v3p3-70b-instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "replicate",
+      "vendor_id": "replicate",
+      "family": "openai_compatible",
+      "name": "Replicate Chat",
+      "method": "POST",
+      "url": "https://api.replicate.com/v1/chat/completions",
+      "host": "api.replicate.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta/llama-3.3-70b-instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "anyscale",
+      "vendor_id": "anyscale",
+      "family": "openai_compatible",
+      "name": "Anyscale Chat",
+      "method": "POST",
+      "url": "https://api.endpoints.anyscale.com/v1/chat/completions",
+      "host": "api.endpoints.anyscale.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "upstage",
+      "vendor_id": "upstage",
+      "family": "openai_compatible",
+      "name": "Upstage Solar Chat",
+      "method": "POST",
+      "url": "https://api.upstage.ai/v1/solar/chat/completions",
+      "host": "api.upstage.ai",
+      "path": "/v1/solar/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "solar-pro",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "nvidia-nim",
+      "vendor_id": "nvidia",
+      "family": "openai_compatible",
+      "name": "NVIDIA NIM Chat",
+      "method": "POST",
+      "url": "https://integrate.api.nvidia.com/v1/chat/completions",
+      "host": "integrate.api.nvidia.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta/llama-3.3-70b-instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "cerebras",
+      "vendor_id": "cerebras",
+      "family": "openai_compatible",
+      "name": "Cerebras Chat",
+      "method": "POST",
+      "url": "https://api.cerebras.ai/v1/chat/completions",
+      "host": "api.cerebras.ai",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "llama-3.3-70b",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "sambanova",
+      "vendor_id": "sambanova",
+      "family": "openai_compatible",
+      "name": "SambaNova Chat",
+      "method": "POST",
+      "url": "https://api.sambanova.ai/v1/chat/completions",
+      "host": "api.sambanova.ai",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "Meta-Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "lepton",
+      "vendor_id": "lepton",
+      "family": "openai_compatible",
+      "name": "Lepton AI Chat",
+      "method": "POST",
+      "url": "https://api.lepton.ai/v1/chat/completions",
+      "host": "api.lepton.ai",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "grok",
+      "vendor_id": "grok",
+      "family": "openai_compatible",
+      "name": "xAI Grok Chat",
+      "method": "POST",
+      "url": "https://api.x.ai/v1/chat/completions",
+      "host": "api.x.ai",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "grok-3-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "minimax",
+      "vendor_id": "minimax",
+      "family": "openai_compatible",
+      "name": "MiniMax Chat",
+      "method": "POST",
+      "url": "https://api.minimax.chat/v1/chat/completions",
+      "host": "api.minimax.chat",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "MiniMax-Text-01",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "01-ai",
+      "vendor_id": "01_ai",
+      "family": "openai_compatible",
+      "name": "01.AI Yi Chat",
+      "method": "POST",
+      "url": "https://api.lingyiwanwu.com/v1/chat/completions",
+      "host": "api.lingyiwanwu.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "yi-large",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "zhipu",
+      "vendor_id": "zhipu",
+      "family": "openai_compatible",
+      "name": "Zhipu GLM Chat",
+      "method": "POST",
+      "url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+      "host": "open.bigmodel.cn",
+      "path": "/api/paas/v4/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "glm-4",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "baichuan",
+      "vendor_id": "baichuan",
+      "family": "openai_compatible",
+      "name": "Baichuan Chat",
+      "method": "POST",
+      "url": "https://api.baichuan-ai.com/v1/chat/completions",
+      "host": "api.baichuan-ai.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "Baichuan4",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "stepfun",
+      "vendor_id": "stepfun",
+      "family": "openai_compatible",
+      "name": "StepFun Chat",
+      "method": "POST",
+      "url": "https://api.stepfun.com/v1/chat/completions",
+      "host": "api.stepfun.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "step-2-16k",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "ollama",
+      "vendor_id": "ollama",
+      "family": "openai_compatible",
+      "name": "Ollama (local OpenAI-compatible)",
+      "method": "POST",
+      "url": "http://127.0.0.1:11434/v1/chat/completions",
+      "host": "127.0.0.1:11434",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "llama3.2",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "lmstudio",
+      "vendor_id": "lmstudio",
+      "family": "openai_compatible",
+      "name": "LM Studio Chat",
+      "method": "POST",
+      "url": "http://127.0.0.1:1234/v1/chat/completions",
+      "host": "127.0.0.1:1234",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "local-model",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "vllm",
+      "vendor_id": "vllm",
+      "family": "openai_compatible",
+      "name": "vLLM OpenAI-compatible",
+      "method": "POST",
+      "url": "http://127.0.0.1:8000/v1/chat/completions",
+      "host": "127.0.0.1:8000",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "litellm",
+      "vendor_id": "litellm",
+      "family": "openai_compatible",
+      "name": "LiteLLM Proxy",
+      "method": "POST",
+      "url": "http://127.0.0.1:4000/v1/chat/completions",
+      "host": "127.0.0.1:4000",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4o-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "huggingface",
+      "vendor_id": "huggingface",
+      "family": "openai_compatible",
+      "name": "Hugging Face Inference (OpenAI-compatible)",
+      "method": "POST",
+      "url": "https://router.huggingface.co/v1/chat/completions",
+      "host": "router.huggingface.co",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "cloudflare-ai",
+      "vendor_id": "cloudflare",
+      "family": "openai_compatible",
+      "name": "Cloudflare Workers AI Chat",
+      "method": "POST",
+      "url": "https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT/ai/v1/chat/completions",
+      "host": "api.cloudflare.com",
+      "path": "/client/v4/accounts/YOUR_ACCOUNT/ai/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "@cf/meta/llama-3.3-70b-instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "google-gemini-openai",
+      "vendor_id": "google_gemini",
+      "family": "openai_compatible",
+      "name": "Google Gemini (OpenAI-compatible)",
+      "method": "POST",
+      "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      "host": "generativelanguage.googleapis.com",
+      "path": "/v1beta/openai/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gemini-2.0-flash",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "anthropic-openai-compat",
+      "vendor_id": "anthropic",
+      "family": "openai_compatible",
+      "name": "Anthropic via OpenAI-compatible gateway",
+      "method": "POST",
+      "url": "https://api.anthropic.com/v1/chat/completions",
+      "host": "api.anthropic.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "claude-sonnet-4-20250514",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "aws-bedrock-openai",
+      "vendor_id": "aws_bedrock",
+      "family": "openai_compatible",
+      "name": "Amazon Bedrock (OpenAI-compatible proxy)",
+      "method": "POST",
+      "url": "https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/chat/completions",
+      "host": "bedrock-runtime.us-east-1.amazonaws.com",
+      "path": "/openai/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "anthropic.claude-3-5-sonnet",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "github-models",
+      "vendor_id": "github",
+      "family": "openai_compatible",
+      "name": "GitHub Models Chat",
+      "method": "POST",
+      "url": "https://models.inference.ai.azure.com/chat/completions",
+      "host": "models.inference.ai.azure.com",
+      "path": "/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4o-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "azure-ai-inference",
+      "vendor_id": "azure_ai",
+      "family": "openai_compatible",
+      "name": "Azure AI Inference Chat",
+      "method": "POST",
+      "url": "https://YOUR_RESOURCE.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview",
+      "host": "YOUR_RESOURCE.services.ai.azure.com",
+      "path": "/models/chat/completions",
+      "query": "api-version=2024-05-01-preview",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4o-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": "api-version=2024-05-01-preview"
+    },
+    {
+      "entry_id": "volcengine-ark",
+      "vendor_id": "volcengine_ark",
+      "family": "openai_compatible",
+      "name": "Volcengine Ark (Doubao OpenAI-compatible)",
+      "method": "POST",
+      "url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+      "host": "ark.cn-beijing.volces.com",
+      "path": "/api/v3/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "doubao-pro-32k",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "baidu-qianfan",
+      "vendor_id": "baidu_qianfan",
+      "family": "openai_compatible",
+      "name": "Baidu Qianfan (OpenAI-compatible)",
+      "method": "POST",
+      "url": "https://qianfan.baidubce.com/v2/chat/completions",
+      "host": "qianfan.baidubce.com",
+      "path": "/v2/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "ernie-4.0-8k",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "tencent-hunyuan",
+      "vendor_id": "tencent_hunyuan",
+      "family": "openai_compatible",
+      "name": "Tencent Hunyuan (OpenAI-compatible)",
+      "method": "POST",
+      "url": "https://hunyuan.tencentcloudapi.com/openai/v1/chat/completions",
+      "host": "hunyuan.tencentcloudapi.com",
+      "path": "/openai/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "hunyuan-turbos",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "xunfei-spark",
+      "vendor_id": "xunfei",
+      "family": "openai_compatible",
+      "name": "iFlytek Spark (OpenAI-compatible)",
+      "method": "POST",
+      "url": "https://spark-api-open.xf-yun.com/v1/chat/completions",
+      "host": "spark-api-open.xf-yun.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "generalv3.5",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "modelscope",
+      "vendor_id": "modelscope",
+      "family": "openai_compatible",
+      "name": "ModelScope Chat",
+      "method": "POST",
+      "url": "https://api-inference.modelscope.cn/v1/chat/completions",
+      "host": "api-inference.modelscope.cn",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "Qwen/Qwen2.5-72B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "ppio",
+      "vendor_id": "ppio",
+      "family": "openai_compatible",
+      "name": "PPIO Chat",
+      "method": "POST",
+      "url": "https://api.ppinfra.com/v3/openai/chat/completions",
+      "host": "api.ppinfra.com",
+      "path": "/v3/openai/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "friendli",
+      "vendor_id": "friendli",
+      "family": "openai_compatible",
+      "name": "FriendliAI Chat",
+      "method": "POST",
+      "url": "https://api.friendli.ai/serverless/v1/chat/completions",
+      "host": "api.friendli.ai",
+      "path": "/serverless/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama-3.3-70b-instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "hyperbolic",
+      "vendor_id": "hyperbolic",
+      "family": "openai_compatible",
+      "name": "Hyperbolic Chat",
+      "method": "POST",
+      "url": "https://api.hyperbolic.xyz/v1/chat/completions",
+      "host": "api.hyperbolic.xyz",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "lambdalabs",
+      "vendor_id": "lambdalabs",
+      "family": "openai_compatible",
+      "name": "Lambda Labs Chat",
+      "method": "POST",
+      "url": "https://api.lambdalabs.com/v1/chat/completions",
+      "host": "api.lambdalabs.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "llama3.3-70b-instruct-fp8",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "fal-ai",
+      "vendor_id": "fal",
+      "family": "openai_compatible",
+      "name": "fal.ai Chat",
+      "method": "POST",
+      "url": "https://fal.run/fal-ai/any-llm",
+      "host": "fal.run",
+      "path": "/fal-ai/any-llm",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/llama-3.3-70b-instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "baseten",
+      "vendor_id": "baseten",
+      "family": "openai_compatible",
+      "name": "Baseten Chat",
+      "method": "POST",
+      "url": "https://bridge.baseten.co/v1/chat/completions",
+      "host": "bridge.baseten.co",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "modal-labs",
+      "vendor_id": "modal",
+      "family": "openai_compatible",
+      "name": "Modal Labs Chat",
+      "method": "POST",
+      "url": "https://YOUR_WORKSPACE--vllm-openai.modal.run/v1/chat/completions",
+      "host": "YOUR_WORKSPACE--vllm-openai.modal.run",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "meta-llama/Llama-3.3-70B-Instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "predibase",
+      "vendor_id": "predibase",
+      "family": "openai_compatible",
+      "name": "Predibase Chat",
+      "method": "POST",
+      "url": "https://serving.app.predibase.com/v1/chat/completions",
+      "host": "serving.app.predibase.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "llama-3.3-70b",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "portkey",
+      "vendor_id": "portkey",
+      "family": "openai_compatible",
+      "name": "Portkey AI Gateway",
+      "method": "POST",
+      "url": "https://api.portkey.ai/v1/chat/completions",
+      "host": "api.portkey.ai",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4o-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "helicone",
+      "vendor_id": "helicone",
+      "family": "openai_compatible",
+      "name": "Helicone AI Gateway",
+      "method": "POST",
+      "url": "https://gateway.helicone.ai/v1/chat/completions",
+      "host": "gateway.helicone.ai",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4o-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "openai-compatible-local",
+      "vendor_id": "openai_local",
+      "family": "openai_compatible",
+      "name": "Generic local OpenAI-compatible endpoint",
+      "method": "POST",
+      "url": "http://127.0.0.1:8080/v1/chat/completions",
+      "host": "127.0.0.1:8080",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "local-model",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "qwen-intl",
+      "vendor_id": "qwen_intl",
+      "family": "openai_compatible",
+      "name": "Qwen International (DashScope)",
+      "method": "POST",
+      "url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions",
+      "host": "dashscope-intl.aliyuncs.com",
+      "path": "/compatible-mode/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "qwen-max",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "infini-ai",
+      "vendor_id": "infini",
+      "family": "openai_compatible",
+      "name": "Infini-AI Chat",
+      "method": "POST",
+      "url": "https://cloud.infini-ai.com/maas/v1/chat/completions",
+      "host": "cloud.infini-ai.com",
+      "path": "/maas/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "llama-3.3-70b-instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "skywork",
+      "vendor_id": "skywork",
+      "family": "openai_compatible",
+      "name": "Skywork Chat",
+      "method": "POST",
+      "url": "https://api.skywork.ai/v1/chat/completions",
+      "host": "api.skywork.ai",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "skywork-13b",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "360-zhinao",
+      "vendor_id": "qihoo360",
+      "family": "openai_compatible",
+      "name": "360 Zhinao Chat",
+      "method": "POST",
+      "url": "https://api.360.cn/v1/chat/completions",
+      "host": "api.360.cn",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "360gpt-pro",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "sensechat",
+      "vendor_id": "sensechat",
+      "family": "openai_compatible",
+      "name": "SenseChat",
+      "method": "POST",
+      "url": "https://api.sensenova.cn/compatible-mode/v1/chat/completions",
+      "host": "api.sensenova.cn",
+      "path": "/compatible-mode/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "SenseChat-5",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "doubao",
+      "vendor_id": "doubao",
+      "family": "openai_compatible",
+      "name": "Doubao Chat (OpenAI-compatible)",
+      "method": "POST",
+      "url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+      "host": "ark.cn-beijing.volces.com",
+      "path": "/api/v3/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "doubao-1.5-pro-32k",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "ernie-speed",
+      "vendor_id": "ernie",
+      "family": "openai_compatible",
+      "name": "ERNIE Speed (OpenAI-compatible)",
+      "method": "POST",
+      "url": "https://qianfan.baidubce.com/v2/chat/completions",
+      "host": "qianfan.baidubce.com",
+      "path": "/v2/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "ernie-speed-8k",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "watsonx-openai",
+      "vendor_id": "ibm_watsonx",
+      "family": "openai_compatible",
+      "name": "IBM watsonx.ai (OpenAI-compatible)",
+      "method": "POST",
+      "url": "https://us-south.ml.cloud.ibm.com/ml/v1/text/chat?version=2024-03-14",
+      "host": "us-south.ml.cloud.ibm.com",
+      "path": "/ml/v1/text/chat",
+      "query": "version=2024-03-14",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "ibm/granite-3-8b-instruct",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": "version=2024-03-14"
+    },
+    {
+      "entry_id": "oracle-genai",
+      "vendor_id": "oracle",
+      "family": "openai_compatible",
+      "name": "Oracle Generative AI Chat",
+      "method": "POST",
+      "url": "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com/20231130/actions/chat",
+      "host": "inference.generativeai.us-chicago-1.oci.oraclecloud.com",
+      "path": "/20231130/actions/chat",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "cohere.command-r-plus",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "deepseek-reasoner",
+      "vendor_id": "deepseek_reasoner",
+      "family": "openai_compatible",
+      "name": "DeepSeek Reasoner",
+      "method": "POST",
+      "url": "https://api.deepseek.com/v1/chat/completions",
+      "host": "api.deepseek.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "deepseek-reasoner",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "chatgpt-enterprise",
+      "vendor_id": "openai_enterprise",
+      "family": "openai_compatible",
+      "name": "ChatGPT Enterprise / API",
+      "method": "POST",
+      "url": "https://api.openai.com/v1/chat/completions",
+      "host": "api.openai.com",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "gpt-4.1-mini",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "groq-compound",
+      "vendor_id": "groq_compound",
+      "family": "openai_compatible",
+      "name": "Groq Compound Systems",
+      "method": "POST",
+      "url": "https://api.groq.com/openai/v1/chat/completions",
+      "host": "api.groq.com",
+      "path": "/openai/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "compound-beta",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    },
+    {
+      "entry_id": "mistral-codestral",
+      "vendor_id": "mistral_codestral",
+      "family": "openai_compatible",
+      "name": "Mistral Codestral",
+      "method": "POST",
+      "url": "https://api.mistral.ai/v1/chat/completions",
+      "host": "api.mistral.ai",
+      "path": "/v1/chat/completions",
+      "query": "",
+      "headers": {
+        "Authorization": "Bearer {{auth.api_key}}",
+        "Content-Type": "application/json"
+      },
+      "body_keys": [
+        "messages",
+        "model",
+        "temperature"
+      ],
+      "body": {
+        "messages": [
+          {
+            "content": "You are a professional translator. Translate the following text from {{input.source_lang}} to {{input.target_lang}}. Output only the translation.",
+            "role": "system"
+          },
+          {
+            "content": "{{input.text}}",
+            "role": "user"
+          }
+        ],
+        "model": "codestral-latest",
+        "temperature": 0.1
+      },
+      "auth_fields": [
+        "api_key"
+      ],
+      "sign_algo": null,
+      "sign": null,
+      "translated_text_path": "choices.0.message.content",
+      "body_type": null,
+      "evidence_tier": "mock-verified",
+      "confirm_phase": "D",
+      "mock_path": "/v1/chat/completions",
+      "mock_query": ""
+    }
+  ]
+}

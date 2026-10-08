@@ -386,3 +386,267 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(
+        identity: Option<PluginIdentity>,
+        verified_at: Option<&str>,
+    ) -> DomainTokenBindingEntry {
+        DomainTokenBindingEntry {
+            wp_client_token: "tok".to_string(),
+            route_secret: "sec".to_string(),
+            plugin_identity: identity,
+            identity_verified_at: verified_at.map(str::to_string),
+            identity_capabilities: None,
+        }
+    }
+
+    // ---- §1 enum: byte-exact wire strings, strict parsing ----
+
+    #[test]
+    fn plugin_identity_wire_strings_are_byte_exact() {
+        assert_eq!(PluginIdentity::WpmmccAts.as_wire_str(), "wpmmcc_ats");
+        assert_eq!(PluginIdentity::Wpmmcc.as_wire_str(), "wpmmcc");
+        assert_eq!(
+            PluginIdentity::from_wire_str("wpmmcc_ats"),
+            Some(PluginIdentity::WpmmccAts)
+        );
+        assert_eq!(
+            PluginIdentity::from_wire_str("wpmmcc"),
+            Some(PluginIdentity::Wpmmcc)
+        );
+    }
+
+    #[test]
+    fn plugin_identity_rejects_out_of_enum_values() {
+        // T-ID-6 shape: forged identity values never parse.
+        assert_eq!(PluginIdentity::from_wire_str("wpmmcc_pro"), None);
+        assert_eq!(PluginIdentity::from_wire_str("WPMMCC_ATS"), None);
+        assert_eq!(PluginIdentity::from_wire_str("wpmmcc_ats "), None);
+        assert_eq!(PluginIdentity::from_wire_str(" wpmmcc"), None);
+        assert_eq!(PluginIdentity::from_wire_str("wpmmcc-ats"), None);
+        assert_eq!(PluginIdentity::from_wire_str(""), None);
+    }
+
+    // ---- §5 gate: the three fail-closed paths ----
+
+    #[test]
+    fn gate_fresh_within_ttl() {
+        let now = now_unix();
+        let e = entry(
+            Some(PluginIdentity::WpmmccAts),
+            Some(&format_rfc3339_utc(now - 3600)),
+        );
+        assert_eq!(gate(&e, now), GateVerdict::Fresh(PluginIdentity::WpmmccAts));
+    }
+
+    #[test]
+    fn gate_stale_after_ttl() {
+        let now = now_unix();
+        let e = entry(
+            Some(PluginIdentity::WpmmccAts),
+            Some(&format_rfc3339_utc(now - IDENTITY_TTL_SECS - 1)),
+        );
+        assert_eq!(gate(&e, now), GateVerdict::Reverify { stale: true });
+    }
+
+    #[test]
+    fn gate_pending_needs_reverify_not_blocked() {
+        // v3 migration default: identity stored, verified_at null.
+        let e = entry(Some(PluginIdentity::WpmmccAts), None);
+        assert_eq!(gate(&e, now_unix()), GateVerdict::Reverify { stale: false });
+    }
+
+    #[test]
+    fn gate_legacy_missing_identity_defaults_to_ats_pending_reverify() {
+        // Contract §4: legacy v2 entry (no identity on record) defaults to
+        // wpmmcc_ats and re-verifies on the next heartbeat — the reserved
+        // identity_unknown code comes from live verification outcomes, not
+        // from static state.
+        let e = entry(None, None);
+        assert_eq!(gate(&e, now_unix()), GateVerdict::Reverify { stale: false });
+    }
+
+    // ---- verify outcome classification (three-code paths) ----
+
+    #[test]
+    fn classify_verified_matching_identity_is_ok() {
+        let e = entry(
+            Some(PluginIdentity::WpmmccAts),
+            Some("2026-09-20T10:00:00Z"),
+        );
+        let outcome = VerifyOutcome::Verified(
+            PluginIdentity::WpmmccAts,
+            IdentityCapabilities {
+                plugin_version: "2.1.4".to_string(),
+                protocol_min: None,
+                protocol_current: None,
+            },
+        );
+        assert!(matches!(
+            classify_verify_outcome(&outcome, &e),
+            Ok(PluginIdentity::WpmmccAts)
+        ));
+    }
+
+    #[test]
+    fn classify_identity_change_is_mismatch() {
+        // T-ID-5 shape: binding says ats, endpoint now says wpmmcc → freeze.
+        let e = entry(
+            Some(PluginIdentity::WpmmccAts),
+            Some("2026-09-20T10:00:00Z"),
+        );
+        let outcome =
+            VerifyOutcome::Verified(PluginIdentity::Wpmmcc, IdentityCapabilities::default());
+        assert_eq!(
+            classify_verify_outcome(&outcome, &e),
+            Err(Some(CODE_IDENTITY_MISMATCH))
+        );
+    }
+
+    #[test]
+    fn classify_first_verify_of_migrated_entry_accepts_any_identity() {
+        // T-ID-7 shape: v2→v3 default ats with null verified_at; the live
+        // ping value overwrites the migration default.
+        let e = entry(Some(PluginIdentity::WpmmccAts), None);
+        let outcome =
+            VerifyOutcome::Verified(PluginIdentity::Wpmmcc, IdentityCapabilities::default());
+        assert!(matches!(
+            classify_verify_outcome(&outcome, &e),
+            Ok(PluginIdentity::Wpmmcc)
+        ));
+    }
+
+    #[test]
+    fn classify_unknown_response_is_unknown_or_stale() {
+        let fresh = entry(
+            Some(PluginIdentity::WpmmccAts),
+            Some(&format_rfc3339_utc(now_unix())),
+        );
+        assert_eq!(
+            classify_verify_outcome(&VerifyOutcome::Unknown, &fresh),
+            Err(Some(CODE_IDENTITY_UNKNOWN))
+        );
+
+        let stale = entry(
+            Some(PluginIdentity::WpmmccAts),
+            Some(&format_rfc3339_utc(now_unix() - IDENTITY_TTL_SECS - 60)),
+        );
+        assert_eq!(
+            classify_verify_outcome(&VerifyOutcome::Unknown, &stale),
+            Err(Some(CODE_IDENTITY_STALE))
+        );
+    }
+
+    #[test]
+    fn classify_unreachable_has_no_reserved_code() {
+        let e = entry(Some(PluginIdentity::WpmmccAts), None);
+        assert_eq!(
+            classify_verify_outcome(&VerifyOutcome::Unreachable, &e),
+            Err(None)
+        );
+    }
+
+    // ---- §5 pairing hook (T-ID-5) ----
+
+    #[test]
+    fn pairing_requires_both_ends_wpmmcc() {
+        assert_eq!(
+            validate_pairing_ends(Some(PluginIdentity::Wpmmcc), Some(PluginIdentity::Wpmmcc)),
+            Ok(())
+        );
+
+        let rejection = validate_pairing_ends(
+            Some(PluginIdentity::WpmmccAts),
+            Some(PluginIdentity::Wpmmcc),
+        )
+        .unwrap_err();
+        assert_eq!(rejection.code, CODE_IDENTITY_MISMATCH);
+        assert!(rejection.message.contains("WPMMCC ATS"));
+
+        let unverified = validate_pairing_ends(None, Some(PluginIdentity::Wpmmcc)).unwrap_err();
+        assert_eq!(unverified.code, CODE_IDENTITY_MISMATCH);
+        assert!(unverified.message.contains("identity_unknown"));
+    }
+
+    // ---- RFC3339 helpers ----
+
+    #[test]
+    fn rfc3339_roundtrip_and_contract_examples() {
+        for unix in [0i64, 1_758_381_600, 1_700_000_000, -1] {
+            let formatted = format_rfc3339_utc(unix);
+            assert_eq!(
+                parse_rfc3339_utc_to_unix(&formatted),
+                Some(unix),
+                "{}",
+                formatted
+            );
+        }
+        // Contract fixture literal (domain-binding-v3.json).
+        assert_eq!(
+            parse_rfc3339_utc_to_unix("2026-09-20T10:00:00Z"),
+            Some(1_789_898_400)
+        );
+        assert_eq!(
+            parse_rfc3339_utc_to_unix("2026-09-20T10:05:00+00:00"),
+            Some(1_789_898_400 + 300)
+        );
+    }
+
+    #[test]
+    fn rfc3339_rejects_non_utc_and_garbage() {
+        assert_eq!(parse_rfc3339_utc_to_unix("2026-09-20T10:00:00+08:00"), None);
+        assert_eq!(parse_rfc3339_utc_to_unix("2026-09-20 10:00:00Z"), None);
+        assert_eq!(parse_rfc3339_utc_to_unix("not-a-time"), None);
+        assert_eq!(parse_rfc3339_utc_to_unix(""), None);
+    }
+
+    // ---- FL-3 lane-exclusion once-notices ----
+
+    #[test]
+    fn exclusion_first_notice_fires_once_per_context_domain_identity() {
+        // Distinct keys per test (same discipline as the backoff
+        // registries): the once-set is process-global and has no reset
+        // hook, so a shared domain string would couple these tests to any
+        // other test using it.
+        let domain = "https://fl3-once.example";
+        assert!(identity_exclusion_first_notice(
+            "wpmmcc_ats_lane_entry",
+            domain,
+            "wpmmcc"
+        ));
+        // Same triple again: suppressed.
+        assert!(!identity_exclusion_first_notice(
+            "wpmmcc_ats_lane_entry",
+            domain,
+            "wpmmcc"
+        ));
+        // Different context: reports independently.
+        assert!(identity_exclusion_first_notice(
+            "wpmmcc_ats_task_generation",
+            domain,
+            "wpmmcc"
+        ));
+        // Different domain: one site's exclusion never silences another's.
+        assert!(identity_exclusion_first_notice(
+            "wpmmcc_ats_lane_entry",
+            "https://fl3-other.example",
+            "wpmmcc"
+        ));
+        // Re-bind to a NEW identity: fresh state reports again (deliberate
+        // re-bind must not stay invisible).
+        assert!(identity_exclusion_first_notice(
+            "wpmmcc_ats_lane_entry",
+            domain,
+            "wpmmcc_ats"
+        ));
+        // Domain keys are trimmed, so stray whitespace cannot split a key.
+        assert!(!identity_exclusion_first_notice(
+            "wpmmcc_ats_lane_entry",
+            &format!("  {}  ", domain),
+            "wpmmcc"
+        ));
+    }
+}

@@ -343,3 +343,68 @@ fn urldecode(s: &str) -> String {
     }
     String::from_utf8_lossy(&out).to_string()
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn exchange_token_for_test(client: &Client, server_base: &str) -> anyhow::Result<String> {
+        let token_url = format!("{}/api/v1/oauth/token", server_base);
+        let token_body = json!({
+            "grant_type": "authorization_code",
+            "code": "invalid-code",
+            "redirect_uri": "http://127.0.0.1:8977/oauth/callback",
+            "code_verifier": "verifier-test",
+            "client_id": crate::config::CLIENT_ID,
+            "device_id": "device-test",
+            "product_id": crate::config::PRODUCT_ID,
+        });
+
+        let token_resp: OAuthTokenData = request_json_encrypted(
+            client.post(&token_url).json(&token_body),
+            "oauth token exchange",
+            "verifier-test",
+        )
+        .await?;
+
+        Ok(token_resp.session_token)
+    }
+
+    #[tokio::test]
+    async fn oauth_token_exchange_preserves_structured_server_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let body = r#"{"success":false,"error":{"code":"INVALID_CODE","message":"Authorization code not found or already used"}}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let client = Client::new();
+        let err = exchange_token_for_test(&client, &format!("http://{}", addr))
+            .await
+            .expect_err("oauth token exchange should surface server auth error");
+        let err_text = format!("{:#}", err);
+
+        assert!(
+            !err_text.contains("invalid json response"),
+            "structured OAuth server errors should not be collapsed into invalid json response: {}",
+            err_text
+        );
+        assert!(
+            err_text.contains("INVALID_CODE")
+                || err_text.contains("Authorization code not found or already used"),
+            "OAuth token exchange should preserve server error semantics: {}",
+            err_text
+        );
+    }
+}

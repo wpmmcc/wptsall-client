@@ -8,3 +8,17 @@ pub(crate) fn client_contract_capabilities_json() -> &'static str {
 }
 
 pub(crate) const CONTRACT_CAPABILITIES_HEADER: &str = "X-WPTSALL-Contract-Capabilities";
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capabilities_json_is_valid_and_includes_axes() {
+        let v: serde_json::Value =
+            serde_json::from_str(client_contract_capabilities_json()).expect("valid json");
+        assert_eq!(v["wp_client_protocol"], 2);
+        assert_eq!(v["content_formats"], "content-formats-v1");
+        assert_eq!(v["workflow_dsl"], "workflow-dsl-v1");
+        assert_eq!(v["workflow_policy"], "workflow-policy-v1");
+    }
+}

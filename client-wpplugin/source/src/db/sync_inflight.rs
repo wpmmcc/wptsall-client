@@ -515,3 +515,386 @@ where
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    // catalog: WEBUI-MOD-db-sync-inflight-rs
+    // oracle: L1
+    // (行级状态机生命周期契约：begin/attempts 递增/分阶段快照累积/
+    //  phase 过滤/close/GC；崩溃恢复语义——仅 shipping 行可恢复——在
+    //  此钉死，恢复路径的消费端断言在 sync_engine 侧测试。)
+    use super::*;
+
+    fn test_db() -> Arc<Mutex<Connection>> {
+        let conn = Connection::open_in_memory().expect("memory db");
+        crate::db::schema::create_tables(&conn).expect("schema");
+        Arc::new(Mutex::new(conn))
+    }
+
+    #[tokio::test]
+    async fn cli13_missing_shipping_row_cannot_report_checkpoint_saved() {
+        let db = test_db();
+        let translation = RelayTranslation {
+            title: Some("Paid".into()),
+            content: None,
+            excerpt: None,
+        };
+        assert!(
+            store_translation(&db, "missing-pair", "uuid", &translation)
+                .await
+                .is_err(),
+            "UPDATE of zero rows is not a durable paid checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli13_corrupt_checkpoint_json_is_never_replaced_with_defaults() {
+        let db = test_db();
+        begin_shipping(&db, "pair", "uuid").await.unwrap();
+        db.lock()
+            .await
+            .execute("UPDATE sync_inflight SET ctx_json='{broken'", [])
+            .unwrap();
+        let paid = RelayTranslation {
+            title: Some("Paid".into()),
+            ..Default::default()
+        };
+        assert!(store_translation(&db, "pair", "uuid", &paid).await.is_err());
+        assert!(store_translation_scope(&db, "pair", "uuid", "scope")
+            .await
+            .is_err());
+        assert!(store_media_entry(&db, "pair", "uuid", "remote", "target")
+            .await
+            .is_err());
+        assert!(store_relayed_packet(&db, "pair", "uuid", "upsert", "{}")
+            .await
+            .is_err());
+        assert!(find_shipping(&db, "pair", "uuid").await.is_err());
+        let raw: String = db
+            .lock()
+            .await
+            .query_row("SELECT ctx_json FROM sync_inflight", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw, "{broken");
+    }
+
+    #[tokio::test]
+    async fn cli13_ignored_sql_update_is_not_a_durable_checkpoint() {
+        let db = test_db();
+        begin_shipping(&db, "pair", "uuid").await.unwrap();
+        db.lock().await.execute_batch("CREATE TRIGGER ignore_checkpoint BEFORE UPDATE OF ctx_json ON sync_inflight BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        let paid = RelayTranslation {
+            title: Some("Paid".into()),
+            ..Default::default()
+        };
+        assert!(store_translation(&db, "pair", "uuid", &paid).await.is_err());
+        let row = find_shipping(&db, "pair", "uuid").await.unwrap().unwrap();
+        assert!(row.ctx.translation.is_none());
+    }
+
+    #[test]
+    fn cli13_legacy_context_and_partial_field_json_round_trip() {
+        let old: InflightCtx = serde_json::from_str(r#"{"translation":{"title":"Paid","content":null,"excerpt":null},"media_url_map":{"remote":"target"},"action":"upsert"}"#).unwrap();
+        assert!(old.translation_scope.is_empty());
+        assert_eq!(
+            old.translation.as_ref().unwrap().title.as_deref(),
+            Some("Paid")
+        );
+        let mut scoped = old;
+        scoped.translation_scope = "opaque-scope".into();
+        let reloaded: InflightCtx =
+            serde_json::from_str(&serde_json::to_string(&scoped).unwrap()).unwrap();
+        assert_eq!(reloaded.translation_scope, "opaque-scope");
+        assert!(reloaded.translation.unwrap().content.is_none());
+        assert_eq!(reloaded.media_url_map["remote"], "target");
+        assert_eq!(reloaded.action, "upsert");
+    }
+
+    #[tokio::test]
+    async fn begin_then_find_round_trips_and_increments_attempts() {
+        let db = test_db();
+        begin_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("begin 1");
+        let row = find_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("find")
+            .expect("row");
+        assert_eq!(row.attempts, 1, "fresh row begins at attempt 1");
+        assert!(row.ctx.translation.is_none());
+        assert!(row.ctx.media_url_map.is_empty());
+
+        // A re-begin after an error increments attempts but PRESERVES the
+        // paid snapshots (the recovery path must not pay twice).
+        let translation = RelayTranslation {
+            title: Some("已付".to_string()),
+            content: None,
+            excerpt: None,
+        };
+        store_translation(&db, "pair-1", "uuid-a", &translation)
+            .await
+            .expect("translation");
+        begin_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("begin 2");
+        let row = find_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("find")
+            .expect("row");
+        assert_eq!(row.attempts, 2);
+        assert_eq!(
+            row.ctx
+                .translation
+                .expect("snapshot survives re-begin")
+                .title,
+            Some("已付".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn phase_snapshots_accumulate_without_losing_each_other() {
+        let db = test_db();
+        begin_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("begin");
+
+        let translation = RelayTranslation {
+            title: Some("你好".to_string()),
+            content: Some("<p>正文</p>".to_string()),
+            excerpt: None,
+        };
+        store_translation(&db, "pair-1", "uuid-a", &translation)
+            .await
+            .expect("translation");
+        store_media_entry(
+            &db,
+            "pair-1",
+            "uuid-a",
+            "https://src/a.jpg",
+            "https://tgt/a.jpg",
+        )
+        .await
+        .expect("media a");
+        store_media_entry(
+            &db,
+            "pair-1",
+            "uuid-a",
+            "https://src/b.jpg",
+            "https://tgt/b.jpg",
+        )
+        .await
+        .expect("media b");
+
+        let row = find_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("find")
+            .expect("row");
+        let t = row
+            .ctx
+            .translation
+            .expect("translation survives media writes");
+        assert_eq!(t.title.as_deref(), Some("你好"));
+        assert_eq!(
+            row.ctx.media_url_map["https://src/a.jpg"],
+            "https://tgt/a.jpg"
+        );
+        assert_eq!(
+            row.ctx.media_url_map["https://src/b.jpg"],
+            "https://tgt/b.jpg"
+        );
+
+        // relayed packet write must not drop the translation/media snapshot.
+        store_relayed_packet(
+            &db,
+            "pair-1",
+            "uuid-a",
+            "upsert",
+            "{\"packet_id\":\"pkt-1\"}",
+        )
+        .await
+        .expect("relayed");
+        let row = find_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("find")
+            .expect("row");
+        assert_eq!(row.relayed_json, "{\"packet_id\":\"pkt-1\"}");
+        assert_eq!(row.ctx.action, "upsert");
+        assert!(
+            row.ctx.translation.is_some(),
+            "relayed write keeps translation"
+        );
+        assert_eq!(
+            row.ctx.media_url_map.len(),
+            2,
+            "relayed write keeps media map"
+        );
+    }
+
+    #[tokio::test]
+    async fn pair_sweep_lists_only_this_pairs_shipping_rows() {
+        let db = test_db();
+        begin_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("begin a");
+        begin_shipping(&db, "pair-1", "uuid-b")
+            .await
+            .expect("begin b");
+        begin_shipping(&db, "pair-2", "uuid-c")
+            .await
+            .expect("begin c");
+
+        let rows = list_pair_shipping(&db, "pair-1").await.expect("list");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|(uuid, _)| uuid == "uuid-a"));
+        assert!(rows.iter().any(|(uuid, _)| uuid == "uuid-b"));
+
+        close_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("close");
+        let rows = list_pair_shipping(&db, "pair-1").await.expect("list");
+        assert_eq!(rows.len(), 1, "closed rows leave the sweep surface");
+        assert!(find_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("find")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn note_error_keeps_row_resumable_with_snippet() {
+        let db = test_db();
+        begin_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("begin");
+        note_error(&db, "pair-1", "uuid-a", "目标站 503")
+            .await
+            .expect("note");
+        let row = find_shipping(&db, "pair-1", "uuid-a")
+            .await
+            .expect("find")
+            .expect("row");
+        assert_eq!(row.attempts, 1, "error keeps the row shipping for resume");
+    }
+
+    #[test]
+    fn inventory_retains_old_and_recent_shipping() {
+        let db = {
+            let conn = Connection::open_in_memory().expect("memory db");
+            crate::db::schema::create_tables(&conn).expect("schema");
+            // Seed directly: one recent row and one old unresolved row.
+            let now = unix_ts() as i64;
+            conn.execute(
+                "INSERT INTO sync_inflight (pair_id, canonical_uuid, phase, attempts, created_at, updated_at)
+                 VALUES ('p','live','shipping',1,?1,?1), ('p','dead','shipping',9,?2,?2)",
+                params![now, now - 7 * 24 * 3600 - 60],
+            )
+            .expect("seed");
+            conn
+        };
+        let shipping = sync_inflight_inventory(&db).expect("inventory");
+        assert_eq!(shipping, 2, "both unresolved rows remain resumable");
+    }
+
+    #[tokio::test]
+    async fn retention_aged_relay_paid_snapshot_survives_inventory() {
+        let db = test_db();
+        begin_shipping(&db, "pair", "uuid").await.unwrap();
+        store_translation(
+            &db,
+            "pair",
+            "uuid",
+            &RelayTranslation {
+                title: Some("Retained paid title".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db.lock()
+            .await
+            .execute("UPDATE sync_inflight SET updated_at=1", [])
+            .unwrap();
+        let shipping = sync_inflight_inventory(&*db.lock().await).unwrap();
+        assert_eq!(shipping, 1);
+        let row = find_shipping(&db, "pair", "uuid").await.unwrap().unwrap();
+        assert_eq!(
+            row.ctx.translation.unwrap().title.as_deref(),
+            Some("Retained paid title")
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_corrupt_relay_paid_snapshot_is_not_an_empty_list_entry() {
+        let db = test_db();
+        begin_shipping(&db, "pair", "uuid").await.unwrap();
+        db.lock()
+            .await
+            .execute("UPDATE sync_inflight SET ctx_json='{broken'", [])
+            .unwrap();
+        assert!(
+            list_pair_shipping(&db, "pair").await.is_err(),
+            "damaged paid work must refuse recovery, not become an unpaid default"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_ignored_relay_begin_is_not_success() {
+        let db = test_db();
+        db.lock()
+            .await
+            .execute_batch(
+                "CREATE TRIGGER refuse_begin BEFORE INSERT ON sync_inflight
+             BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        assert!(
+            begin_shipping(&db, "pair", "uuid").await.is_err(),
+            "ignored admission cannot authorize paid work"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_authority_ignored_packet_and_close_writes_are_not_success() {
+        for operation in ["packet", "close", "error"] {
+            let db = test_db();
+            begin_shipping(&db, "pair", "uuid").await.unwrap();
+            let event = match operation {
+                "packet" => "UPDATE OF relayed_json",
+                "close" => "DELETE",
+                _ => "UPDATE OF error",
+            };
+            db.lock()
+                .await
+                .execute_batch(&format!(
+                    "CREATE TRIGGER refuse_write BEFORE {event} ON sync_inflight
+                 BEGIN SELECT RAISE(IGNORE); END;",
+                ))
+                .unwrap();
+            let result = match operation {
+                "packet" => {
+                    store_relayed_packet(&db, "pair", "uuid", "upsert", "{\"packet_id\":\"owned\"}")
+                        .await
+                }
+                "close" => close_shipping(&db, "pair", "uuid").await,
+                _ => note_error(&db, "pair", "uuid", "owned error").await,
+            };
+            assert!(
+                result.is_err(),
+                "{operation}: ignored persistence must not report success"
+            );
+            assert!(find_shipping(&db, "pair", "uuid").await.unwrap().is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_authority_unknown_phase_is_not_a_vacant_unit() {
+        let db = test_db();
+        begin_shipping(&db, "pair", "uuid").await.unwrap();
+        db.lock()
+            .await
+            .execute("UPDATE sync_inflight SET phase='owned-damaged-phase'", [])
+            .unwrap();
+        assert!(
+            find_shipping(&db, "pair", "uuid").await.is_err(),
+            "unknown retained state must not authorize a new operation"
+        );
+    }
+}

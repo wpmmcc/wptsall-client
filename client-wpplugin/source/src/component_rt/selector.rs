@@ -468,7 +468,7 @@ pub(crate) fn select_component_with_rule_bindings<'a>(
     )
 }
 
-#[allow (dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn collect_required_task_types(
     declared_task_type: &str,
     text_field_units: &[TaskTextFieldUnit],
@@ -669,7 +669,7 @@ pub(crate) fn resolve_component_id_for_task_type<'a>(
     None
 }
 
-#[allow (dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn task_priority(task: &ClientTask) -> i32 {
     if let Some(ref p) = task.priority {
         // Handle both numeric and string priority values.
@@ -783,7 +783,7 @@ pub(crate) fn select_component_with_format_awareness<'a>(
 }
 
 /// Build a JSON summary of all component capabilities (for the Web UI).
-#[allow (dead_code)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_format_capability_summary(registry: &ComponentRuntimeRegistry) -> Value {
     let mut items = Vec::new();
     for id in &registry.ordered_ids {
@@ -896,3 +896,5 @@ fn runtime_supports_route(
     runtime_supports_business_line(runtime, business_line)
         && runtime_supports_task_type(runtime, task_type)
 }
+#[cfg(test)]
+mod tests;

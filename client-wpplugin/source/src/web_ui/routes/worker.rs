@@ -997,11 +997,8 @@ pub(super) async fn collect_worker_start_preflight(
 
             for rule in &rules {
                 summary.rules_checked += 1;
-                let translate_fields = if !rule.translate_fields.is_empty() {
-                    rule.translate_fields.clone()
-                } else {
-                    crate::task_engine::pipeline::extract_translate_fields(&rule.field_capabilities)
-                };
+                let translate_fields =
+                    crate::task_engine::field_action::plan_field_actions(rule).translate;
                 let plugin_slug = resolve_rule_plugin_slug(&relation, rule);
                 let rule_id = u64::try_from(rule.id).ok();
                 let relation_id = u64::try_from(relation.id).ok();

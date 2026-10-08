@@ -485,9 +485,23 @@ pub(crate) fn outbox_hold_remaining(wp_base: &str, outbox_id: i64) -> u64 {
     check_keyed(outbox_key(wp_base, outbox_id)).remaining_secs
 }
 
+/// Test hook: clear the registry.
+#[cfg(test)]
+pub(crate) fn clear_all() {
+    registry().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
 
-
-
+/// The registry is process-global; serialize ALL tests that mutate it OR
+/// depend on its state persisting across calls. That includes the
+/// discoverer integration tests (outbox holds, domain/scan circuits):
+/// a concurrent `clear_all()` from a backoff unit test would wipe a hold
+/// armed between two passes of an integration test and flip its
+/// convergence assertion (observed as a full-suite-only failure).
+#[cfg(test)]
+pub(crate) fn test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Clear structural (permanent) skips for one relation on a site: the
 /// identity markers AND the relation poison. Timed cooldowns are left
@@ -514,4 +528,453 @@ pub(crate) fn clear_structural_for_relation(wp_base: &str, relation_id: i64) {
 pub(crate) fn clear_structural_all() {
     let mut registry = registry().lock().unwrap_or_else(|e| e.into_inner());
     registry.retain(|_, state| !state.structural);
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `test_lock` (the process-global registry serialization lock) lives in
+    // the parent module as pub(crate) so the discoverer integration tests
+    // share the SAME lock.
+
+    const SITE: &str = "https://wp.a";
+
+    #[test]
+    fn structural_failure_blocks_permanently_until_config_change() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        let decision = record_structural_failure(SITE, 9, "post", 31);
+        assert!(
+            decision.blocked && decision.structural && !decision.circuit_open,
+            "structural failure blocks immediately with no circuit semantics"
+        );
+
+        let checked = check(SITE, 9, "post", 31);
+        assert!(
+            checked.blocked && checked.structural,
+            "structural skip never expires by time"
+        );
+
+        // A later transient record_failure on the same identity must not
+        // downgrade the permanent skip to a timed cooldown.
+        let downgraded = record_failure(SITE, 9, "post", 31);
+        assert!(
+            downgraded.blocked && downgraded.structural,
+            "record_failure preserves the structural tier"
+        );
+
+        // Other identities are untouched by a relation-scoped clear.
+        record_structural_failure(SITE, 9, "post", 32);
+        record_structural_failure(SITE, 10, "post", 33);
+        clear_structural_for_relation(SITE, 9);
+        assert!(
+            !check(SITE, 9, "post", 31).blocked,
+            "relation-scoped clear unblocks the relation's structural skips"
+        );
+        assert!(
+            !check(SITE, 9, "post", 32).blocked,
+            "relation-scoped clear covers all object ids of the relation"
+        );
+        assert!(
+            check(SITE, 10, "post", 33).blocked,
+            "other relations keep their structural skips"
+        );
+
+        // A global clear removes every structural skip.
+        clear_structural_all();
+        assert!(!check(SITE, 10, "post", 33).blocked);
+
+        // Success still clears a structural skip (the item got translated,
+        // e.g. after the user bound the missing component).
+        record_structural_failure(SITE, 9, "post", 34);
+        assert!(check(SITE, 9, "post", 34).blocked);
+        record_success(SITE, 9, "post", 34);
+        assert!(!check(SITE, 9, "post", 34).blocked);
+    }
+
+    #[test]
+    fn relation_poison_trips_after_threshold_and_lifts_on_success_or_config() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        for i in 1..RELATION_STRUCTURAL_THRESHOLD {
+            let decision = record_structural_relation_failure(SITE, 12);
+            assert!(
+                !decision.blocked,
+                "below threshold attempt {i} does not poison"
+            );
+            assert!(!check_relation(SITE, 12).blocked);
+        }
+        let tripped = record_structural_relation_failure(SITE, 12);
+        assert!(
+            tripped.blocked && tripped.structural,
+            "threshold-th structural failure poisons the relation lane"
+        );
+        assert!(check_relation(SITE, 12).blocked);
+        // Identity check for the same relation is independent (item lanes
+        // gate on identity keys, the discovery lane on the rel key).
+        assert!(!check(SITE, 12, "post", 51).blocked);
+
+        // Config-change clears: global and relation-scoped.
+        record_structural_failure(SITE, 13, "post", 61);
+        for _ in 0..RELATION_STRUCTURAL_THRESHOLD {
+            record_structural_relation_failure(SITE, 13);
+        }
+        assert!(check_relation(SITE, 13).blocked);
+        clear_structural_for_relation(SITE, 12);
+        assert!(
+            !check_relation(SITE, 12).blocked,
+            "scoped clear lifts the poison"
+        );
+        assert!(
+            check_relation(SITE, 13).blocked,
+            "other relations untouched"
+        );
+        record_structural_relation_failure(SITE, 12); // streak restarts
+        for _ in 1..RELATION_STRUCTURAL_THRESHOLD {
+            record_structural_relation_failure(SITE, 12);
+        }
+        assert!(check_relation(SITE, 12).blocked);
+        clear_structural_all();
+        assert!(
+            !check_relation(SITE, 12).blocked,
+            "global clear lifts the poison"
+        );
+
+        // Success resets the streak / lifts the poison (mixed relations
+        // never stay starved).
+        for _ in 0..RELATION_STRUCTURAL_THRESHOLD {
+            record_structural_relation_failure(SITE, 12);
+        }
+        assert!(check_relation(SITE, 12).blocked);
+        record_relation_success(SITE, 12);
+        assert!(
+            !check_relation(SITE, 12).blocked,
+            "success lifts the poison"
+        );
+
+        // A success BETWEEN structural failures keeps the relation healthy.
+        for _ in 0..(RELATION_STRUCTURAL_THRESHOLD * 3) {
+            record_structural_relation_failure(SITE, 14);
+            record_relation_success(SITE, 14);
+        }
+        assert!(
+            !check_relation(SITE, 14).blocked,
+            "interleaved success prevents poison"
+        );
+    }
+
+    #[test]
+    fn structural_classifier_matches_pipeline_error_only() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(is_structural_failure_message(
+            "no component runtime available for business_line=post_content, formats=plain_text,rich_html"
+        ));
+        assert!(is_structural_failure_message(
+            "translate step failed: no component runtime available for business_line=site_ui, formats=plain_text"
+        ));
+        // Transient failures must NOT be classified structural.
+        assert!(!is_structural_failure_message(
+            "all translatable fields failed for object 42 (relation_id=9, fields_failed=3)"
+        ));
+        assert!(!is_structural_failure_message(
+            "wp transport non-2xx (status=500)"
+        ));
+        assert!(!is_structural_failure_message("oauth token refresh failed"));
+    }
+
+    #[test]
+    fn timed_cooldowns_survive_structural_clears() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        record_failure(SITE, 11, "post", 41);
+        record_structural_failure(SITE, 11, "post", 42);
+        clear_structural_for_relation(SITE, 11);
+        assert!(
+            check(SITE, 11, "post", 41).blocked,
+            "timed cooldown survives relation-scoped structural clear"
+        );
+        assert!(!check(SITE, 11, "post", 42).blocked);
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_then_opens_circuit() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        let first = record_failure(SITE, 7, "post", 11);
+        assert_eq!(
+            (
+                first.remaining_secs,
+                first.consecutive_failures,
+                first.circuit_open
+            ),
+            (30, 1, false),
+            "first failure cools down 30s without circuit"
+        );
+        assert!(check(SITE, 7, "post", 11).blocked);
+
+        let second = record_failure(SITE, 7, "post", 11);
+        assert_eq!(
+            (
+                second.remaining_secs,
+                second.consecutive_failures,
+                second.circuit_open
+            ),
+            (60, 2, false),
+            "second failure doubles the cooldown"
+        );
+
+        let third = record_failure(SITE, 7, "post", 11);
+        assert_eq!(
+            (
+                third.remaining_secs,
+                third.consecutive_failures,
+                third.circuit_open
+            ),
+            (1800, 3, true),
+            "third failure trips the circuit breaker for the max cooldown"
+        );
+
+        let fourth = record_failure(SITE, 7, "post", 11);
+        assert_eq!((fourth.remaining_secs, fourth.circuit_open), (1800, true));
+    }
+
+    #[test]
+    fn success_clears_cooldown_and_identities_are_isolated() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        record_failure(SITE, 7, "post", 21);
+        assert!(check(SITE, 7, "post", 21).blocked);
+        // Other object / relation / site stays independent, and the object
+        // type is normalized so both loops hit the same entry.
+        assert!(!check(SITE, 8, "post", 21).blocked);
+        assert!(!check(SITE, 7, "term", 21).blocked);
+        assert!(!check(SITE, 7, "post", 22).blocked);
+        assert!(!check("https://wp.b", 7, "post", 21).blocked);
+        assert!(
+            check(SITE, 7, "Post", 21).blocked,
+            "type is case-insensitive"
+        );
+
+        record_success(SITE, 7, "post", 21);
+        let cleared = check(SITE, 7, "post", 21);
+        assert!(!cleared.blocked);
+        assert_eq!(cleared.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn check_does_not_mutate_state() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        record_failure(SITE, 7, "post", 31);
+        let before = check(SITE, 7, "post", 31);
+        let _ = check(SITE, 7, "post", 31);
+        let after = check(SITE, 7, "post", 31);
+        assert_eq!(before.consecutive_failures, after.consecutive_failures);
+        assert_eq!(before.remaining_secs, after.remaining_secs);
+    }
+
+    #[test]
+    fn component_domain_is_independent_of_identities_and_circuits() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+        // An identity cooldown must not affect the component domain and vice
+        // versa; component ids are case-insensitive.
+        record_failure(SITE, 7, "post", 41);
+        assert!(!check_component("comp-bad").blocked);
+        assert!(!check(SITE, 7, "post", 41 - 41).blocked);
+
+        let first = record_component_failure("comp-bad");
+        assert_eq!(
+            (
+                first.remaining_secs,
+                first.consecutive_failures,
+                first.circuit_open
+            ),
+            (30, 1, false)
+        );
+        assert!(
+            check_component("Comp-BAD").blocked,
+            "component ids are case-insensitive"
+        );
+
+        let _ = record_component_failure("comp-bad");
+        let third = record_component_failure("comp-bad");
+        assert!(
+            third.circuit_open,
+            "third component failure opens the circuit"
+        );
+
+        record_component_success("comp-bad");
+        assert!(
+            !check_component("comp-bad").blocked,
+            "success resets the component circuit"
+        );
+        // Identity entry from this test is untouched by component success.
+        assert!(check(SITE, 7, "post", 41).blocked);
+    }
+
+    #[test]
+    fn domain_transport_circuit_trips_on_third_consecutive_failure() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        let first = record_domain_transport_failure(SITE);
+        assert!(!first.blocked && first.consecutive_failures == 1);
+        let second = record_domain_transport_failure(SITE);
+        assert!(!second.blocked && second.consecutive_failures == 2);
+        let third = record_domain_transport_failure(SITE);
+        assert!(
+            third.blocked && third.circuit_open,
+            "third consecutive transport failure opens the dead-domain circuit"
+        );
+        assert!(check_domain(SITE).blocked);
+        // Other domains are independent.
+        assert!(!check_domain("https://wp.b").blocked);
+        // A success lifts the circuit.
+        record_domain_success(SITE);
+        assert!(!check_domain(SITE).blocked);
+        // A success between failures keeps the domain alive (blips ≠ dead).
+        record_domain_transport_failure(SITE);
+        record_domain_transport_failure(SITE);
+        record_domain_success(SITE);
+        record_domain_transport_failure(SITE);
+        assert!(
+            !check_domain(SITE).blocked,
+            "interleaved success resets the streak"
+        );
+    }
+
+    #[test]
+    fn domain_scan_circuit_trips_immediately_and_keeps_outbox_lane_independent() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        let decision = record_domain_scan_permanent_failure(SITE);
+        assert!(decision.blocked && decision.circuit_open);
+        assert!(
+            check_domain_scan(SITE).blocked,
+            "scan circuit opens immediately on a permanent route status"
+        );
+        // The whole-domain transport circuit is NOT tripped by a scan 404:
+        // the outbox lane (different endpoint family) stays active.
+        assert!(!check_domain(SITE).blocked);
+        // The scan circuit is per-domain.
+        assert!(!check_domain_scan("https://wp.b").blocked);
+    }
+
+    #[test]
+    fn permanent_http_failure_classifier_matches_route_missing_statuses_only() {
+        assert!(is_permanent_http_failure_message(
+            "wp transport non-2xx (status=404)"
+        ));
+        assert!(is_permanent_http_failure_message(
+            "wp transport non-2xx (status=405)"
+        ));
+        assert!(is_permanent_http_failure_message(
+            "wp transport non-2xx (status=410)"
+        ));
+        assert!(!is_permanent_http_failure_message(
+            "wp transport non-2xx (status=500)"
+        ));
+        assert!(!is_permanent_http_failure_message(
+            "wp transport non-2xx (status=429)"
+        ));
+        assert!(!is_permanent_http_failure_message(
+            "oauth token refresh failed"
+        ));
+    }
+
+    #[test]
+    fn outbox_hold_is_per_row_and_expires_by_time() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        note_outbox_hold("https://hold-a.example", 7, 60);
+        assert!(
+            outbox_hold_remaining("https://hold-a.example", 7) > 0,
+            "fresh hold is active"
+        );
+        assert_eq!(
+            outbox_hold_remaining("https://hold-a.example", 8),
+            0,
+            "other rows are untouched"
+        );
+        // Holds are domain-scoped: outbox ids are per-site integers, so a
+        // hold on one site's row must never touch another site's row with
+        // the same id (SIM-lane regression: every mock site numbers its
+        // outbox from 7000 and site A's holds suppressed site B's rows).
+        assert_eq!(
+            outbox_hold_remaining("https://hold-b.example", 7),
+            0,
+            "another domain's row with the same id is untouched"
+        );
+        // Zero-second holds are a no-op.
+        note_outbox_hold("https://hold-a.example", 9, 0);
+        assert_eq!(outbox_hold_remaining("https://hold-a.example", 9), 0);
+
+        note_outbox_hold("https://hold-a.example", 11, 1);
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(
+            outbox_hold_remaining("https://hold-a.example", 11),
+            0,
+            "hold expires by time"
+        );
+        // The still-active hold from this test is unaffected.
+        assert!(outbox_hold_remaining("https://hold-a.example", 7) > 0);
+    }
+
+    /// 批 C: sync-pair cooldown domain — a total-failure run cools the
+    /// pair down (30s ladder), consecutive failures escalate, any success
+    /// resets, and the domain never leaks into identity/component keys.
+    #[test]
+    fn sync_pair_domain_cools_down_and_resets_on_success() {
+        let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        clear_all();
+
+        assert!(
+            !check_sync_pair("pair-a").blocked,
+            "fresh pair is never blocked"
+        );
+
+        let d1 = record_sync_pair_failure("pair-a");
+        assert!(
+            d1.blocked && d1.remaining_secs >= BASE_BACKOFF_SECS,
+            "first failure: {d1:?}"
+        );
+        let checked = check_sync_pair("pair-a");
+        // as_secs() truncates the live remaining duration — a fresh
+        // BASE_BACKOFF_SECS cooldown reads back one second short.
+        assert!(
+            checked.blocked && checked.remaining_secs + 1 >= BASE_BACKOFF_SECS,
+            "{checked:?}"
+        );
+
+        // Escalation: consecutive failures double the cooldown.
+        let d2 = record_sync_pair_failure("pair-a");
+        assert!(
+            d2.remaining_secs > d1.remaining_secs,
+            "cooldown must escalate: {d1:?} -> {d2:?}"
+        );
+        assert_eq!(d2.consecutive_failures, 2);
+
+        // The sync domain never touches identity/component keys.
+        assert!(!check(SITE, 21, "post", 77).blocked);
+        assert!(!check_component("pair-a").blocked);
+        // And other pairs are untouched.
+        assert!(!check_sync_pair("pair-b").blocked);
+
+        // A success (any packet synced) resets the ladder entirely.
+        record_sync_pair_success("pair-a");
+        let after = check_sync_pair("pair-a");
+        assert!(
+            !after.blocked && after.consecutive_failures == 0,
+            "{after:?}"
+        );
+
+        // Pair ids are trimmed (defensive, same as other domains).
+        record_sync_pair_failure("  pair-c  ");
+        assert!(check_sync_pair("pair-c").blocked);
+    }
 }

@@ -293,3 +293,49 @@ fn classify_provider_test_error(message: &str) -> (&'static str, &'static str) {
         "Provider probe failed — see error message for details",
     )
 }
+#[cfg(test)]
+mod tests {
+    use super::{classify_provider_test_error, resolve_probe_vendor};
+
+    #[test]
+    fn classifies_auth_network_and_ssrf_errors() {
+        assert_eq!(
+            classify_provider_test_error("401 unauthorized").0,
+            "AUTH_REJECTED"
+        );
+        assert_eq!(
+            classify_provider_test_error("connection timed out").0,
+            "NETWORK_FAILED"
+        );
+        assert_eq!(
+            classify_provider_test_error("URL blocked by SSRF guard").0,
+            "PROVIDER_URL_BLOCKED"
+        );
+        assert_eq!(
+            classify_provider_test_error("model not found").0,
+            "PROVIDER_TEST_FAILED"
+        );
+    }
+
+    /// Y-6: no more "unknown" fallback — the probe's vendor attribution
+    /// fails closed when neither vendor_id nor a reverse-lookup key
+    /// provides an anchor.
+    #[test]
+    fn resolve_probe_vendor_requires_an_anchor() {
+        // Non-empty vendor_id passes through (trimmed).
+        assert_eq!(
+            resolve_probe_vendor(" openai ", None).as_deref(),
+            Ok("openai")
+        );
+        // Empty vendor_id + reverse-lookup hit resolves to the key's vendor.
+        assert_eq!(
+            resolve_probe_vendor("", Some("deepseek")).as_deref(),
+            Ok("deepseek")
+        );
+        // Empty vendor_id + no reverse-lookup fails closed — never "unknown".
+        assert_eq!(resolve_probe_vendor("", None), Err(()));
+        // Whitespace-only or empty stored vendor on the key is no anchor.
+        assert_eq!(resolve_probe_vendor("", Some("   ")), Err(()));
+        assert_eq!(resolve_probe_vendor("", Some("")), Err(()));
+    }
+}

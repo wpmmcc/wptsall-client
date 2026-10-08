@@ -1,0 +1,5 @@
+{
+  "title": "WPTSALL Mock JSON Document",
+  "body": "This file is used by document translation templates that accept JSON input.",
+  "items": ["alpha", "beta", "gamma"]
+}

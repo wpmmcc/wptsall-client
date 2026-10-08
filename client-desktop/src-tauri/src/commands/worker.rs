@@ -161,3 +161,19 @@ pub async fn run_worker_once(request: WorkerRunOnceRequest) -> Result<Value, Str
     )
     .await
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn maps_webui_worker_status() {
+        let status = map_worker_status(&json!({
+            "worker_loop_running": true,
+            "worker_last_summary": { "tasks_succeeded": 12 }
+        }));
+        assert!(status.running);
+        assert_eq!(status.active_tasks, 1);
+        assert_eq!(status.completed_total, 12);
+    }
+}

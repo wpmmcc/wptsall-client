@@ -282,3 +282,37 @@ pub async fn test_connection(site_id: String) -> Result<bool, String> {
     .await
     .map(|_| true)
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_full_protocol_v2_client_url() {
+        let (base, secret) = parse_site_binding_input(
+            "http://127.0.0.1:9181/wp-json/wptsall/v2/abc123/client",
+            None,
+        );
+        assert_eq!(base, "http://127.0.0.1:9181");
+        assert_eq!(secret, "abc123");
+    }
+
+    #[test]
+    fn parses_wpmmcc_route_marker() {
+        let (base, secret) = parse_site_binding_input(
+            "https://sync.example.com/wp-json/wpmmcc/v1/sync/ping",
+            None,
+        );
+        assert_eq!(base, "https://sync.example.com");
+        assert_eq!(secret, "sync");
+    }
+
+    #[test]
+    fn explicit_route_secret_overrides_url_secret() {
+        let (base, secret) = parse_site_binding_input(
+            "https://example.test/wp-json/wptsall/v2/from-url/client",
+            Some("from-form"),
+        );
+        assert_eq!(base, "https://example.test");
+        assert_eq!(secret, "from-form");
+    }
+}

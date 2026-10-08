@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
-
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -53,7 +54,11 @@ use self::bindings::{
     handle_rule_component_bindings_upsert, handle_site_connections_import,
     handle_task_type_components_delete, handle_task_type_components_upsert,
 };
-
+#[cfg(test)]
+use self::components::{
+    backfill_local_components_from_server, invalid_task_override_paths,
+    patch_template_snapshot_for_local_kind,
+};
 use self::components::{
     build_local_component_runtime_for_task, component_exists_in_local_doc,
     fetch_signing_key_from_server, find_server_component_by_template_id,
@@ -119,7 +124,8 @@ use crate::bindings::{
     domain_token_binding_status_items, normalize_domain_base, rule_component_binding_status_items,
     task_type_component_binding_status_items,
 };
-
+#[cfg(test)]
+use crate::bindings::{load_components_local, save_components_local};
 use crate::logging::{session_token_prefix, unix_ts};
 use crate::types::*;
 use crate::web_ui::{
@@ -1634,7 +1640,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         == 0
 }
 
-
+#[cfg(test)]
+mod tests;
 
 // ── update-check (lightweight, polls wptsall-server releases manifest) ─────
 

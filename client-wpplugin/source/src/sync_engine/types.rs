@@ -100,6 +100,18 @@ impl Default for SyncPairStatus {
     }
 }
 
+/// One core field on a sync-and-translate pair.
+/// Empty `field_actions` keeps the old behavior: translate title, content
+/// and excerpt with `translate_component_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncFieldAction {
+    pub field: String,
+    /// `translate`, `copy` / `as_is`, or `skip` / `exclude`.
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SyncPair {
     pub id: String,
@@ -138,11 +150,14 @@ pub struct SyncPair {
     pub last_sync_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
-    /// Translation component used when `sync_mode == SyncAndTranslate`.
-    /// Required for that mode; the engine translates `post_title`,
-    /// `post_content`, `post_excerpt` through this component before push.
+    /// Default translation component when a field action does not name one.
+    /// Required only when at least one field action is `translate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translate_component_id: Option<String>,
+    /// Per-field translate / copy / skip. Empty means the historical three
+    /// text fields are all translated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_actions: Vec<SyncFieldAction>,
     /// When true, pull(+translate) parks packets for human Diff approve
     /// before push. Default false preserves auto-push behavior.
     #[serde(default)]

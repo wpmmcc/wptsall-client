@@ -255,35 +255,46 @@ pub async fn sync_pair_run(
         .unwrap_or(source_base.as_str())
         .to_string();
 
-    // --- Translation cascade gate: mode requires a configured component
-    // and a usable runtime; otherwise the run stops with an explicit error
-    // instead of silently shipping untranslated content.
-    let translator = match pair.sync_mode {
-        SyncMode::SyncAndTranslate => {
-            let component_id = pair.translate_component_id.as_deref().unwrap_or("").trim();
-            if component_id.is_empty() {
+    // Translation runs only for fields the pair marks translate. Copy and
+    // skip do not require a component and must not call one.
+    let sync_plan = super::field_plan::plan_sync_fields(&pair);
+    let translator = if sync_plan
+        .iter()
+        .any(|row| row.action == super::field_plan::SyncFieldKind::Translate)
+    {
+        let needs_default = sync_plan.iter().any(|row| {
+            row.action == super::field_plan::SyncFieldKind::Translate && row.component_id.is_empty()
+        });
+        if needs_default {
+            return finish_with_error(
+                &pairs_path,
+                &pair,
+                &mut report,
+                "sync_and_translate 需要配置翻译组件（translate_component_id）",
+                log_file,
+            );
+        }
+        match translator {
+            Some(runtime) => Some(runtime),
+            None if sync_plan.iter().all(|row| {
+                row.action != super::field_plan::SyncFieldKind::Translate
+                    || !row.component_id.is_empty()
+            }) =>
+            {
+                None
+            }
+            None => {
                 return finish_with_error(
                     &pairs_path,
                     &pair,
                     &mut report,
-                    "sync_and_translate 需要配置翻译组件（translate_component_id）",
+                    "翻译组件未能加载运行时，无法执行级联翻译",
                     log_file,
-                );
-            }
-            match translator {
-                Some(t) => Some(t),
-                None => {
-                    return finish_with_error(
-                        &pairs_path,
-                        &pair,
-                        &mut report,
-                        &format!("翻译组件 '{component_id}' 未能加载运行时，无法执行级联翻译"),
-                        log_file,
-                    )
-                }
+                )
             }
         }
-        SyncMode::SyncOnly => None,
+    } else {
+        None
     };
 
     let shipper = Shipper::new(client.clone())?.with_source_confirmation(
@@ -1206,24 +1217,23 @@ async fn ship_one_packet_inner(
     // partial snapshot reuses only completed fields, not the whole cascade.
     let mut translation: Option<RelayTranslation> =
         inflight.and_then(|row| row.ctx.translation.clone());
-    if let Some(t) = translator {
+    let sync_plan = super::field_plan::plan_sync_fields(pair);
+    let preserved_fields: Vec<String> = sync_plan
+        .iter()
+        .filter(|row| row.action == super::field_plan::SyncFieldKind::Skip)
+        .map(|row| row.field.clone())
+        .collect();
+    let translate_fields: Vec<_> = sync_plan
+        .iter()
+        .filter(|row| row.action == super::field_plan::SyncFieldKind::Translate)
+        .cloned()
+        .collect();
+    if !translate_fields.is_empty() {
         let db = inflight_db.ok_or_else(|| "收费翻译缺少持久化权限".to_string())?;
-        let scope = paid_snapshot_scope(packet, pair, Some(t))?;
+        let scope = paid_snapshot_scope(packet, pair, translator)?;
         let source_id = i64::try_from(packet.entity.source_id)
             .map_err(|_| "同步对象 ID 超出安全范围；未执行收费操作".to_string())?;
-        let env = |field: &str| crate::db::async_jobs::AsyncJobEnv {
-            db: db.clone(),
-            domain: pair.source_domain.clone(),
-            relation_id: 0,
-            object_type: format!("wpmmcc-relay:{}", packet.entity.object_type),
-            object_id: source_id,
-            field_name: format!("{field}@relay-{}", pair.id),
-            chunk_index: 0,
-            lane: "text",
-            source_snapshot: Some(json!({"pair":pair.id,"uuid":uuid,"scope":scope})),
-            resume_binding: None,
-        };
-        let field = |name: &str| -> String {
+        let field_value = |name: &str| -> String {
             packet
                 .entity
                 .core_fields
@@ -1232,65 +1242,111 @@ async fn ship_one_packet_inner(
                 .unwrap_or_default()
                 .to_string()
         };
-        let title = field("post_title");
-        let content = field("post_content");
-        let excerpt = field("post_excerpt");
         let mut relay = translation.take().unwrap_or_default();
-        if !title.trim().is_empty() && relay.title.is_none() {
-            relay.title = Some(
-                translate_text_via_component_with_env(
-                    &t.vendor_client,
-                    &t.runtime,
-                    &title,
-                    &pair.source_lang,
-                    &pair.target_lang,
-                    Some(env("post_title")),
-                )
-                .await
-                .map_err(|e| format!("翻译标题失败 ({uuid}): {e:#}"))?,
-            );
-            if let Some(db) = inflight_db {
-                crate::db::sync_inflight::store_translation(db, &pair.id, &uuid, &relay)
-                    .await
-                    .map_err(|error| format!("保存标题翻译快照失败 ({uuid}): {error:#}"))?;
+        let mut loaded: HashMap<String, TranslatorHandle> = HashMap::new();
+        let default_id = pair
+            .translate_component_id
+            .clone()
+            .unwrap_or_default();
+        for planned in &translate_fields {
+            let source = field_value(&planned.field);
+            let already_saved = match planned.field.as_str() {
+                "post_title" => relay.title.is_some(),
+                "post_content" => relay.content.is_some(),
+                "post_excerpt" => relay.excerpt.is_some(),
+                _ => true,
+            };
+            if source.trim().is_empty() || already_saved {
+                continue;
             }
-        }
-        if !content.trim().is_empty() && relay.content.is_none() {
-            relay.content = Some(
-                translate_text_via_component_with_env(
-                    &t.vendor_client,
-                    &t.runtime,
-                    &content,
-                    &pair.source_lang,
-                    &pair.target_lang,
-                    Some(env("post_content")),
-                )
-                .await
-                .map_err(|e| format!("翻译正文失败 ({uuid}): {e:#}"))?,
-            );
-            if let Some(db) = inflight_db {
-                crate::db::sync_inflight::store_translation(db, &pair.id, &uuid, &relay)
-                    .await
-                    .map_err(|error| format!("保存正文翻译快照失败 ({uuid}): {error:#}"))?;
+            let component_id = if planned.component_id.is_empty() {
+                default_id.clone()
+            } else {
+                planned.component_id.clone()
+            };
+            if component_id.is_empty() {
+                return Err(format!("字段 {} 没有翻译组件，未调用服务商", planned.field));
             }
-        }
-        if !excerpt.trim().is_empty() && relay.excerpt.is_none() {
-            relay.excerpt = Some(
+            let env = crate::db::async_jobs::AsyncJobEnv {
+                db: db.clone(),
+                domain: pair.source_domain.clone(),
+                relation_id: 0,
+                object_type: format!("wpmmcc-relay:{}", packet.entity.object_type),
+                object_id: source_id,
+                field_name: format!("{}@relay-{}", planned.field, pair.id),
+                chunk_index: 0,
+                lane: "text",
+                source_snapshot: Some(json!({"pair":pair.id,"uuid":uuid,"scope":scope})),
+                resume_binding: None,
+            };
+            let translated_text = if component_id == default_id {
+                if let Some(runtime) = translator {
+                    translate_text_via_component_with_env(
+                        &runtime.vendor_client,
+                        &runtime.runtime,
+                        &source,
+                        &pair.source_lang,
+                        &pair.target_lang,
+                        Some(env),
+                    )
+                    .await
+                    .map_err(|error| format!("翻译{}失败 ({uuid}): {error:#}", planned.field))?
+                } else {
+                    if !loaded.contains_key(&component_id) {
+                        let built = build_translator(shipper.http_client(), &component_id, log_file)
+                            .await
+                            .map_err(|error| {
+                                format!("加载字段 {} 的组件失败: {error:#}", planned.field)
+                            })?;
+                        loaded.insert(component_id.clone(), built);
+                    }
+                    let runtime = loaded.get(&component_id).ok_or_else(|| {
+                        format!("字段 {} 的组件没有运行时", planned.field)
+                    })?;
+                    translate_text_via_component_with_env(
+                        &runtime.vendor_client,
+                        &runtime.runtime,
+                        &source,
+                        &pair.source_lang,
+                        &pair.target_lang,
+                        Some(env),
+                    )
+                    .await
+                    .map_err(|error| format!("翻译{}失败 ({uuid}): {error:#}", planned.field))?
+                }
+            } else {
+                if !loaded.contains_key(&component_id) {
+                    let built = build_translator(shipper.http_client(), &component_id, log_file)
+                        .await
+                        .map_err(|error| {
+                            format!("加载字段 {} 的组件失败: {error:#}", planned.field)
+                        })?;
+                    loaded.insert(component_id.clone(), built);
+                }
+                let runtime = loaded
+                    .get(&component_id)
+                    .ok_or_else(|| format!("字段 {} 的组件没有运行时", planned.field))?;
                 translate_text_via_component_with_env(
-                    &t.vendor_client,
-                    &t.runtime,
-                    &excerpt,
+                    &runtime.vendor_client,
+                    &runtime.runtime,
+                    &source,
                     &pair.source_lang,
                     &pair.target_lang,
-                    Some(env("post_excerpt")),
+                    Some(env),
                 )
                 .await
-                .map_err(|e| format!("翻译摘要失败 ({uuid}): {e:#}"))?,
-            );
+                .map_err(|error| format!("翻译{}失败 ({uuid}): {error:#}", planned.field))?
+            };
+            match planned.field.as_str() {
+                "post_title" => relay.title = Some(translated_text),
+                "post_content" => relay.content = Some(translated_text),
+                "post_excerpt" => relay.excerpt = Some(translated_text),
+                _ => {}
+            }
             if let Some(db) = inflight_db {
                 crate::db::sync_inflight::store_translation(db, &pair.id, &uuid, &relay)
                     .await
-                    .map_err(|error| format!("保存摘要翻译快照失败 ({uuid}): {error:#}"))?;
+                    .map_err(|error| format!("保存{}翻译快照失败 ({uuid}): {error:#}", planned.field))?;
             }
         }
         translation = Some(relay);
@@ -1355,7 +1411,13 @@ async fn ship_one_packet_inner(
         serde_json::from_str(&row.relayed_json)
             .map_err(|e| format!("在途包反序列化失败 ({uuid}): {e:#}"))?
     } else {
-        let relayed = relay_packet_for_target(packet, pair, translation.clone(), &media_url_map);
+        let relayed = relay_packet_for_target(
+            packet,
+            pair,
+            translation.clone(),
+            &media_url_map,
+            &preserved_fields,
+        );
         if let Some(db) = inflight_db {
             let relayed_json = serde_json::to_string(&relayed)
                 .map_err(|e| format!("在途包序列化失败 ({uuid}): {e:#}"))?;

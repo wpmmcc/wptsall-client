@@ -117,3 +117,24 @@ mod hex {
         bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_expiry() {
+        let t = SessionToken {
+            token: "abc".into(),
+            expires_at: 0,
+            scopes: vec![],
+        };
+        assert!(t.is_expired());
+    }
+
+    #[test]
+    fn request_signature_deterministic() {
+        let sig1 = sign_api_request("secret", "GET", "/api/v1/client/domains", b"", 123).unwrap();
+        let sig2 = sign_api_request("secret", "GET", "/api/v1/client/domains", b"", 123).unwrap();
+        assert_eq!(sig1, sig2);
+    }
+}

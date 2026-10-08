@@ -1181,3 +1181,95 @@ pub(crate) fn default_auth_strategy() -> KeySelectionStrategy {
 pub(crate) fn default_bindings_version() -> u32 {
     1
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_selection_strategy_accepts_version_editor_values_and_keeps_snapshot_wire() {
+        for (wire, expected) in [
+            ("round_robin", KeySelectionStrategy::RoundRobin),
+            ("random", KeySelectionStrategy::Random),
+            ("weighted", KeySelectionStrategy::Weighted),
+        ] {
+            let parsed: KeySelectionStrategy = serde_json::from_value(serde_json::json!(wire))
+                .expect("version editor strategy must remain usable");
+            assert_eq!(parsed, expected);
+            let canonical = serde_json::to_value(&expected).unwrap();
+            assert_eq!(
+                serde_json::from_value::<KeySelectionStrategy>(canonical).unwrap(),
+                parsed
+            );
+        }
+        for invalid in ["", "round-robin", "unsupported"] {
+            assert!(
+                serde_json::from_value::<KeySelectionStrategy>(serde_json::json!(invalid)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn component_item_decodes_provider_id_when_present() {
+        // Server returns a component bound to a specific WP provider.
+        let json = r#"{
+            "id": "official-baidu-translate-v1",
+            "name": "Baidu Translate",
+            "owner_type": "official",
+            "version": "1.0.0",
+            "type": "text_translation",
+            "product_id": "wptsall",
+            "provider_id": "baidu-translate"
+        }"#;
+        let item: ComponentItem = serde_json::from_str(json).expect("decode");
+        assert_eq!(item.product_id, "wptsall");
+        assert_eq!(item.provider_id.as_deref(), Some("baidu-translate"));
+    }
+
+    #[test]
+    fn component_item_provider_id_defaults_to_none_when_absent() {
+        // Backward compat: old server payloads (pre provider_id column)
+        // should still decode and report provider_id = None.
+        let json = r#"{
+            "id": "official-claude-haiku-translate-v1",
+            "name": "Claude Haiku Translate",
+            "owner_type": "official",
+            "version": "1.0.0",
+            "type": "text_translation",
+            "product_id": "wptsall"
+        }"#;
+        let item: ComponentItem = serde_json::from_str(json).expect("decode");
+        assert_eq!(item.product_id, "wptsall");
+        assert!(item.provider_id.is_none());
+    }
+
+    #[test]
+    fn component_item_product_id_defaults_to_wptsall_when_absent() {
+        // Old server payloads (pre product_id column) should default to "wptsall".
+        let json = r#"{
+            "id": "official-google-translate-v1",
+            "name": "Google Translate",
+            "owner_type": "official",
+            "version": "1.0.0",
+            "type": "text_translation"
+        }"#;
+        let item: ComponentItem = serde_json::from_str(json).expect("decode");
+        assert_eq!(item.product_id, "wptsall");
+        assert!(item.provider_id.is_none());
+    }
+
+    #[test]
+    fn component_item_provider_id_null_decodes_as_none() {
+        // Explicit JSON null must decode as None, not panic.
+        let json = r#"{
+            "id": "official-aws-translate-v1",
+            "name": "AWS Translate",
+            "owner_type": "official",
+            "version": "1.0.0",
+            "type": "text_translation",
+            "product_id": "wptsall",
+            "provider_id": null
+        }"#;
+        let item: ComponentItem = serde_json::from_str(json).expect("decode");
+        assert!(item.provider_id.is_none());
+    }
+}

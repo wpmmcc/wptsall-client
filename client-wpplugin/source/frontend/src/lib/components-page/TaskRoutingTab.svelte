@@ -28,6 +28,12 @@
     ruleBindFieldId,
   } from './helpers';
   import { _ } from 'svelte-i18n';
+
+  function fieldActionLabel(action: string): string {
+    if (action === 'copy') return $_('task_routing.field_action_copy');
+    if (action === 'skip') return $_('task_routing.field_action_skip');
+    return $_('task_routing.field_action_translate');
+  }
   import type {
     LocalComp,
     RuleDiscoveryIssue,
@@ -568,6 +574,7 @@
                         <div class="min-w-0">
                           <div class="text-xs font-mono text-gray-700 break-all">{field.field_name}</div>
                           <div class="mt-1 flex flex-wrap gap-2 text-[11px]">
+                            <span class="text-gray-500">{fieldActionLabel(field.action)}</span>
                             <span class="text-gray-500">{formatCapabilityLabel(field.content_format)}</span>
                             <span class="text-gray-400">{$_('task_routing.field_role')}: {formatSourceRoleLabel(field.source_role)}</span>
                             <span class="text-gray-400">{$_('task_routing.field_storage')}: {field.storage}</span>
