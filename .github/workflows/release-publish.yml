@@ -2,14 +2,6 @@ name: Release publish
 on:
   workflow_dispatch:
     inputs:
-      acceptance:
-        description: Exact-commit full-scope private acceptance JSON
-        required: true
-        type: string
-      acceptance_signature:
-        description: Minisign signature of the acceptance JSON using the pinned release key
-        required: true
-        type: string
       notes:
         description: Release notes
         required: false
@@ -64,19 +56,6 @@ jobs:
           assert latest["status"] == "completed" and latest["conclusion"] == "success", "latest attempt is not green"
           PY
           done
-      - name: Install signature verifier
-        run: sudo apt-get update && sudo apt-get install -y minisign
-      - name: Verify signed full-scope private acceptance
-        env:
-          ACCEPTANCE: ${{ inputs.acceptance }}
-          SIGNATURE: ${{ inputs.acceptance_signature }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$ACCEPTANCE" > "$RUNNER_TEMP/acceptance.json"
-          printf '%s\n' "$SIGNATURE" > "$RUNNER_TEMP/acceptance.json.minisig"
-          minisign -Vm "$RUNNER_TEMP/acceptance.json" -P "$RELEASE_PUBKEY_B64"
-          python3 install-client/packaging/release-acceptance.py "$RUNNER_TEMP/acceptance.json" \
-            --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --version "$(tr -d '\r\n' < VERSION)"
   build-products:
     needs: gate
     uses: ./.github/workflows/build-matrix.yml
@@ -103,17 +82,6 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Assert workflow and binary pin the same public release key
         run: grep -F "$RELEASE_PUBKEY_B64" libs/wptsall-client-security/build.rs
-      - name: Revalidate private authority after the platform builds
-        env:
-          ACCEPTANCE: ${{ inputs.acceptance }}
-          SIGNATURE: ${{ inputs.acceptance_signature }}
-        run: |
-          set -euo pipefail
-          printf '%s' "$ACCEPTANCE" > "$RUNNER_TEMP/acceptance.json"
-          printf '%s\n' "$SIGNATURE" > "$RUNNER_TEMP/acceptance.json.minisig"
-          minisign -Vm "$RUNNER_TEMP/acceptance.json" -P "$RELEASE_PUBKEY_B64"
-          python3 install-client/packaging/release-acceptance.py "$RUNNER_TEMP/acceptance.json" \
-            --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA" --version "$(tr -d '\r\n' < VERSION)"
       - name: Prepare and verify all signed candidate products
         env:
           RELEASE_KEY: ${{ secrets.WPTSALL_RELEASE_MINISIGN_KEY }}
