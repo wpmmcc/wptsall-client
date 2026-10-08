@@ -124,9 +124,9 @@ echo "signature verified: $asset"
 
 stop_client() {
   if [ -f "$pidfile" ]; then
-    pid="$(cat "$pidfile")"
+    pid="$(tr -d '[:space:]' < "$pidfile")"
     if [ "$RUNNER_OS" = Windows ]; then
-      powershell.exe -NoProfile -Command "Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue"
+      powershell.exe -NoProfile -Command "Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue" || true
     else
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -134,7 +134,7 @@ stop_client() {
     rm -f "$pidfile"
   fi
   if [ "$RUNNER_OS" = Windows ]; then
-    powershell.exe -NoProfile -Command "Get-Process wptsall-client,wptsall-client-webui -ErrorAction SilentlyContinue | Stop-Process -Force"
+    powershell.exe -NoProfile -Command "Get-Process wptsall-client,wptsall-client-webui -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; exit 0" || true
   fi
 }
 
@@ -272,7 +272,8 @@ case "$KIND" in
     [ ! -e "$app" ] || fail "app survived uninstall"
     ;;
   nsis)
-    MSYS_NO_PATHCONV=1 "$(cygpath -w "$install_root/uninstall.exe")" /S
+    MSYS_NO_PATHCONV=1 "$(cygpath -w "$install_root/uninstall.exe")" /S \
+      || fail "Windows uninstaller exited $?"
     for _ in $(seq 1 60); do
       [ ! -e "$install_root/bin/wptsall-client.exe" ] && break
       sleep 1
