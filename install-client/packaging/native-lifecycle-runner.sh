@@ -182,9 +182,18 @@ PY
       ;;
     nsis)
       programs="$APPDATA/Microsoft/Windows/Start Menu/Programs"
-      [ -f "$programs/$expected.lnk" ] || fail "Start Menu shortcut $expected missing"
-      [ ! -e "$programs/WPTSALL Client.lnk" ] || fail "old WPTSALL Client shortcut remains"
-      [ ! -e "$programs/WPTSALL Webui.lnk" ] || fail "old WPTSALL Webui shortcut remains"
+      # Start Menu paths are case-insensitive, so "WPTSALL WebUI.lnk" also
+      # satisfies a test for the old "WPTSALL Webui.lnk". Compare the real name.
+      shortcut_names="$(powershell.exe -NoProfile -Command "Get-ChildItem -LiteralPath '$(cygpath -w "$programs")' -Filter '*.lnk' | ForEach-Object { \$_.Name }")"
+      shortcut_names="$(printf '%s\n' "$shortcut_names" | tr -d '\r')"
+      printf '%s\n' "$shortcut_names" | grep -qx "${expected}.lnk" \
+        || fail "Start Menu shortcut $expected missing"
+      printf '%s\n' "$shortcut_names" | grep -qx "WPTSALL Client.lnk" \
+        && fail "old WPTSALL Client shortcut remains"
+      if [ "$expected" != "WPTSALL Webui" ]; then
+        printf '%s\n' "$shortcut_names" | grep -qx "WPTSALL Webui.lnk" \
+          && fail "old WPTSALL Webui shortcut remains"
+      fi
       display="$(powershell.exe -NoProfile -Command "(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${pkg}').DisplayName")"
       display="$(printf '%s' "$display" | tr -d '\r')"
       [ "$display" = "$expected" ] || fail "uninstall display name is '$display'"
