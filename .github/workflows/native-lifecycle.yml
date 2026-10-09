@@ -42,5 +42,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: native-lifecycle-${{ matrix.product }}-${{ matrix.platform }}
-          path: native-lifecycle.json
+          path: |
+            native-lifecycle.json
+            native-lifecycle-brand.png
           if-no-files-found: warn

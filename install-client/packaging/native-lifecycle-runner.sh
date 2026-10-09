@@ -55,6 +55,8 @@ Path(os.environ["EVIDENCE"]).write_text(json.dumps({
     "update_action": os.environ.get("UPDATE_ACTION") or "",
     "uninstall": "passed" if flag("UNINSTALL_OK") else "not_passed",
     "per_user_data_preserved": flag("DATA_PRESERVED"),
+    "display_name": os.environ.get("BRAND_NAME", ""),
+    "icon_sha256": os.environ.get("BRAND_ICON_SHA", ""),
 }, indent=2) + "\n")
 PY
 }
@@ -67,6 +69,136 @@ fail() {
     tail -n 80 "$log" >&2 || true
   fi
   exit 1
+}
+
+brand_expected_name() {
+  if [ "$PRODUCT" = webui ]; then
+    printf '%s' "WPTSALL WebUI"
+  else
+    printf '%s' "WPTSALL Desktop"
+  fi
+}
+
+render_brand_png() {
+  icon_path="$1"
+  title="$2"
+  shot="${GITHUB_WORKSPACE}/native-lifecycle-brand.png"
+  case "$RUNNER_OS" in
+    Linux)
+      sudo apt-get install -y --no-install-recommends python3-pil fonts-dejavu-core >/dev/null
+      "$PY" - "$icon_path" "$title" "$shot" <<'PY'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+icon = Image.open(sys.argv[1]).convert("RGBA").resize((128, 128))
+title, out = sys.argv[2], sys.argv[3]
+canvas = Image.new("RGB", (360, 220), (36, 36, 36))
+canvas.paste(icon, (116, 20), icon)
+draw = ImageDraw.Draw(canvas)
+font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+box = draw.textbbox((0, 0), title, font=font)
+draw.text(((360 - (box[2] - box[0])) / 2, 164), title, fill=(255, 255, 255), font=font)
+canvas.save(out)
+PY
+      ;;
+    macOS)
+      sips -s format png "$icon_path" --out "$work/brand-icon.png" >/dev/null
+      cat > "$work/brand.swift" <<'SWIFT'
+import AppKit
+import Foundation
+let icon = NSImage(contentsOfFile: CommandLine.arguments[1])!
+let title = CommandLine.arguments[2]
+let out = CommandLine.arguments[3]
+let size = NSSize(width: 360, height: 220)
+let image = NSImage(size: size)
+image.lockFocus()
+NSColor(calibratedWhite: 0.16, alpha: 1).setFill()
+NSBezierPath(rect: NSRect(origin: .zero, size: size)).fill()
+icon.draw(in: NSRect(x: 116, y: 64, width: 128, height: 128))
+let attrs: [NSAttributedString.Key: Any] = [
+    .font: NSFont.systemFont(ofSize: 18),
+    .foregroundColor: NSColor.white
+]
+let text = NSString(string: title)
+let textSize = text.size(withAttributes: attrs)
+text.draw(at: NSPoint(x: (size.width - textSize.width) / 2, y: 28), withAttributes: attrs)
+image.unlockFocus()
+let rep = NSBitmapImageRep(data: image.tiffRepresentation!)!
+try rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))
+SWIFT
+      swift "$work/brand.swift" "$work/brand-icon.png" "$title" "$shot"
+      ;;
+    Windows)
+      icon_win="$(cygpath -w "$icon_path")"
+      shot_win="$(cygpath -w "$shot")"
+      powershell.exe -NoProfile -Command "
+        Add-Type -AssemblyName System.Drawing
+        \$src = New-Object System.Drawing.Icon '${icon_win}'
+        \$mark = \$src.ToBitmap()
+        \$canvas = New-Object System.Drawing.Bitmap 360, 220
+        \$g = [System.Drawing.Graphics]::FromImage(\$canvas)
+        \$g.Clear([System.Drawing.Color]::FromArgb(36, 36, 36))
+        \$g.DrawImage(\$mark, 116, 20, 128, 128)
+        \$font = New-Object System.Drawing.Font 'Segoe UI', 14
+        \$brush = [System.Drawing.Brushes]::White
+        \$size = \$g.MeasureString('${title}', \$font)
+        \$g.DrawString('${title}', \$font, \$brush, (360 - \$size.Width) / 2, 160)
+        \$canvas.Save('${shot_win}', [System.Drawing.Imaging.ImageFormat]::Png)
+      "
+      ;;
+  esac
+  [ -s "$shot" ] || fail "brand screenshot was not written"
+}
+
+record_brand() {
+  expected="$(brand_expected_name)"
+  case "$KIND" in
+    deb)
+      entry="/usr/share/applications/${pkg}.desktop"
+      BRAND_NAME="$(grep '^Name=' "$entry" | head -1 | cut -d= -f2-)"
+      icon_key="$(grep '^Icon=' "$entry" | head -1 | cut -d= -f2-)"
+      terminal="$(grep '^Terminal=' "$entry" | head -1 | cut -d= -f2-)"
+      [ "$BRAND_NAME" = "$expected" ] || fail "menu name is '$BRAND_NAME', expected '$expected'"
+      [ "$icon_key" = "$pkg" ] || fail "menu icon is '$icon_key'"
+      [ "$terminal" = "false" ] || fail "menu entry opens in a terminal"
+      icon="/usr/share/icons/hicolor/128x128/apps/${pkg}.png"
+      [ -f "$icon" ] || fail "installed icon missing: $icon"
+      if [ "$PRODUCT" = desktop ]; then
+        [ ! -e "$HOME/.local/share/applications/wptsall-client.desktop" ] \
+          || fail "old WPTSALL Client menu entry still hides the package"
+        [ ! -e "$HOME/.local/share/applications/wptsall-desktop.desktop" ] \
+          || fail "duplicate desktop menu entry remains"
+      fi
+      ;;
+    dmg)
+      BRAND_NAME="$("$PY" - "$app/Contents/Info.plist" <<'PY'
+import plistlib, sys
+info = plistlib.load(open(sys.argv[1], "rb"))
+print(info.get("CFBundleDisplayName") or "")
+PY
+)"
+      [ "$BRAND_NAME" = "$expected" ] || fail "bundle name is '$BRAND_NAME', expected '$expected'"
+      icon="$app/Contents/Resources/AppIcon.icns"
+      [ -f "$icon" ] || fail "AppIcon.icns missing"
+      ;;
+    nsis)
+      programs="$APPDATA/Microsoft/Windows/Start Menu/Programs"
+      [ -f "$programs/$expected.lnk" ] || fail "Start Menu shortcut $expected missing"
+      [ ! -e "$programs/WPTSALL Client.lnk" ] || fail "old WPTSALL Client shortcut remains"
+      [ ! -e "$programs/WPTSALL Webui.lnk" ] || fail "old WPTSALL Webui shortcut remains"
+      display="$(powershell.exe -NoProfile -Command "(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\${pkg}').DisplayName")"
+      display="$(printf '%s' "$display" | tr -d '\r')"
+      [ "$display" = "$expected" ] || fail "uninstall display name is '$display'"
+      BRAND_NAME="$expected"
+      icon="$install_root/brand.ico"
+      [ -f "$icon" ] || fail "brand.ico missing"
+      lnk_icon="$(powershell.exe -NoProfile -Command "\$s=(New-Object -ComObject WScript.Shell).CreateShortcut('$(cygpath -w "$programs/$expected.lnk")'); \$s.IconLocation")"
+      printf '%s' "$lnk_icon" | grep -q 'brand.ico' || fail "shortcut icon is '$lnk_icon'"
+      ;;
+  esac
+  BRAND_ICON_SHA="$(sha256sum "$icon" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$icon" | awk '{print $1}')"
+  export BRAND_NAME BRAND_ICON_SHA
+  render_brand_png "$icon" "$BRAND_NAME"
+  echo "brand ok: $BRAND_NAME $BRAND_ICON_SHA"
 }
 
 actual="$(echo "$RUNNER_OS-$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]' \
@@ -200,6 +332,19 @@ start_client() {
 stage="install"
 case "$KIND" in
   deb)
+    if [ "$PRODUCT" = desktop ]; then
+      mkdir -p "$HOME/.local/share/applications"
+      cat > "$HOME/.local/share/applications/wptsall-client.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=WPTSALL Client
+Exec=/tmp/old-wptsall
+Icon=wptsall-client
+Terminal=false
+EOF
+      ln -sfn "$HOME/.local/share/applications/wptsall-client.desktop" \
+        "$HOME/.local/share/applications/wptsall-desktop.desktop"
+    fi
     sudo apt-get update || true
     sudo apt-get install -y "$work/assets/$asset"
     [ -x "/usr/bin/$pkg" ] || fail "launcher /usr/bin/$pkg missing after install"
@@ -216,6 +361,10 @@ case "$KIND" in
     ;;
   nsis)
     install_root="$(cygpath -u "$LOCALAPPDATA/Programs/$pkg")"
+    programs="$APPDATA/Microsoft/Windows/Start Menu/Programs"
+    mkdir -p "$programs"
+    printf 'legacy shortcut\n' > "$programs/WPTSALL Client.lnk"
+    printf 'legacy shortcut\n' > "$programs/WPTSALL Webui.lnk"
     MSYS_NO_PATHCONV=1 "$work/assets/$asset" /S
     for _ in $(seq 1 60); do
       [ -f "$install_root/uninstall.exe" ] && break
@@ -227,6 +376,7 @@ case "$KIND" in
 esac
 install_ok=true
 echo "install ok: $PRODUCT $PLATFORM"
+record_brand
 
 stage="update"
 start_client
@@ -276,6 +426,30 @@ if [ "$PRODUCT" = desktop ] && [ "$KIND" = deb ] && [ "$PLATFORM" = linux-x86_64
     -p "$web_asset" -p "${web_asset}.minisig" -D "$work/assets"
   minisign -Vm "$work/assets/$web_asset" -P "$PUB" -x "$work/assets/$web_asset.minisig"
   sudo apt-get install -y "$work/assets/$web_asset"
+  web_name="$(grep '^Name=' /usr/share/applications/wptsall-client-webui.desktop | head -1 | cut -d= -f2-)"
+  web_icon="/usr/share/icons/hicolor/128x128/apps/wptsall-client-webui.png"
+  [ "$web_name" = "WPTSALL WebUI" ] || fail "WebUI menu name is '$web_name'"
+  [ -f "$web_icon" ] || fail "WebUI icon missing"
+  web_sha="$(sha256sum "$web_icon" | awk '{print $1}')"
+  [ "$web_sha" != "$BRAND_ICON_SHA" ] || fail "Desktop and WebUI icons are the same file"
+  "$PY" - "/usr/share/icons/hicolor/128x128/apps/wptsall-client.png" "$web_icon" \
+    "${GITHUB_WORKSPACE}/native-lifecycle-brand.png" <<'PY'
+import sys
+from PIL import Image, ImageDraw, ImageFont
+font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
+canvas = Image.new("RGB", (560, 220), (36, 36, 36))
+draw = ImageDraw.Draw(canvas)
+for index, (path, title) in enumerate((
+    (sys.argv[1], "WPTSALL Desktop"),
+    (sys.argv[2], "WPTSALL WebUI"),
+)):
+    icon = Image.open(path).convert("RGBA").resize((128, 128))
+    x = 70 + index * 280
+    canvas.paste(icon, (x, 20), icon)
+    box = draw.textbbox((0, 0), title, font=font)
+    draw.text((x + (128 - (box[2] - box[0])) / 2, 164), title, fill=(255, 255, 255), font=font)
+canvas.save(sys.argv[3])
+PY
   webdata="$work/webui-data"
   mkdir -p "$webdata"
   echo "WebUI coexistence sentinel." > "$webdata/preservation-sentinel.txt"

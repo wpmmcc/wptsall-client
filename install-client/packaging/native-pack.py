@@ -96,11 +96,34 @@ Comment={comment}
 Exec={name}
 Icon={name}
 StartupWMClass={name}
-Terminal={'true' if product == 'webui' else 'false'}
+Terminal=false
 Type=Application
 Categories=Utility;
 """)
-    # No maintainer scripts, automatic service enable, or user-data removal.
+    # A same-id file in the user's applications directory hides this package.
+    # The old local installer left "WPTSALL Client" there, so the app grid kept
+    # the previous name and icon after the deb was installed. User data is not
+    # removed. Both products are normal application entries, not terminals.
+    legacy = ""
+    if name == "wptsall-client":
+        legacy = '    rm -f "$apps/wptsall-desktop.desktop"\n'
+    write(root / "DEBIAN/postinst", f"""#!/bin/sh
+set -eu
+if [ "$1" = "configure" ]; then
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+  fi
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database /usr/share/applications >/dev/null 2>&1 || true
+  fi
+  for home in /root /home/*; do
+    apps="$home/.local/share/applications"
+    [ -d "$apps" ] || continue
+    rm -f "$apps/{name}.desktop"
+{legacy}  done
+fi
+exit 0
+""", 0o755)
     run("dpkg-deb", "--root-owner-group", "--build", str(root), str(asset))
     run("dpkg-deb", "--info", str(asset))
     run("dpkg-deb", "--contents", str(asset))
@@ -210,6 +233,12 @@ set "WPTSALL_WEB_UI_BIND=127.0.0.1:8977"
     shutil.copy2(brand_icon(product, "icon.ico"), icon)
     install += ['SetOutPath "$INSTDIR"', f'File "{nsis_path(icon)}"']
     uninstall += ['Delete "$INSTDIR\\brand.ico"']
+    # Older installers used these Start Menu names. Leaving them beside the
+    # new shortcut makes the two clients look unchanged after an upgrade.
+    legacy_shortcuts = [
+        r'Delete "$SMPROGRAMS\WPTSALL Client.lnk"',
+        r'Delete "$SMPROGRAMS\WPTSALL Webui.lnk"',
+    ]
     script = f"""Unicode true
 RequestExecutionLevel user
 Name "{name}"
@@ -225,6 +254,7 @@ Section
 SetShellVarContext current
 {chr(10).join(install)}
 WriteUninstaller "$INSTDIR\\uninstall.exe"
+{chr(10).join(legacy_shortcuts)}
 CreateShortcut "$SMPROGRAMS\\{name}.lnk" "{command}" "{args}" "$INSTDIR\\brand.ico"
 WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{ident}" "DisplayName" "{name}"
 WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{ident}" "DisplayVersion" "{version}"
@@ -235,6 +265,7 @@ Section "Uninstall"
 SetShellVarContext current
 {chr(10).join(uninstall)}
 Delete "$SMPROGRAMS\\{name}.lnk"
+{chr(10).join(legacy_shortcuts)}
 Delete "$INSTDIR\\uninstall.exe"
 RMDir "$INSTDIR"
 DeleteRegKey HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{ident}"
