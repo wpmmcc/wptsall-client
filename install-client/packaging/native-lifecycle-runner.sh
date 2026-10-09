@@ -20,6 +20,12 @@ pidfile="${work}/client.pid"
 mkdir -p "$work" "$data"
 echo "Owned runner lifecycle sentinel. Not user content." > "$data/preservation-sentinel.txt"
 
+if [ "$PRODUCT" = desktop ]; then
+  PORT=8978
+else
+  PORT=8977
+fi
+
 stage="setup"
 install_ok=false
 update_ok=false
@@ -141,7 +147,7 @@ stop_client() {
 wait_status() {
   ready=0
   for _ in $(seq 1 90); do
-    if curl -fsS "http://127.0.0.1:8977/api/status" -o "$work/status.json" 2>/dev/null \
+    if curl -fsS "http://127.0.0.1:$PORT/api/status" -o "$work/status.json" 2>/dev/null \
         && grep -q '"success":true' "$work/status.json"; then
       ready=1
       break
@@ -225,7 +231,17 @@ echo "install ok: $PRODUCT $PLATFORM"
 stage="update"
 start_client
 wait_status
-curl -fsS "http://127.0.0.1:8977/api/update-check" -o "$work/update-check.json" \
+case "$RUNNER_OS" in
+  Linux) ss -ltn | awk -v p=":$PORT\$" '$4 ~ p {found=1} END{exit found?0:1}' ;;
+  macOS) lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null ;;
+  Windows) powershell.exe -NoProfile -Command "if (-not (Get-NetTCPConnection -LocalPort $PORT -State Listen -ErrorAction SilentlyContinue)) { exit 1 }" ;;
+esac || fail "installed client is not listening on $PORT"
+if [ "$PRODUCT" = desktop ] && [ "$RUNNER_OS" = Linux ]; then
+  if ss -ltn | awk '$4 ~ /:8977$/ {found=1} END{exit found?0:1}'; then
+    fail "desktop took the WebUI port 8977"
+  fi
+fi
+curl -fsS "http://127.0.0.1:$PORT/api/update-check" -o "$work/update-check.json" \
   || fail "update-check request failed"
 "$PY" - "$work/update-check.json" "$VERSION" <<'PY'
 import json, sys
@@ -240,7 +256,7 @@ if data.get("update_available") is not False:
 print("update-check ok", data.get("product_id"), data.get("current_version"))
 PY
 update_ok=true
-curl -sS -o "$work/perform-update.json" -X POST "http://127.0.0.1:8977/api/perform-update" \
+curl -sS -o "$work/perform-update.json" -X POST "http://127.0.0.1:$PORT/api/perform-update" \
   || true
 "$PY" - "$work/perform-update.json" <<'PY'
 import json, sys
@@ -252,6 +268,51 @@ print("perform-update ok", code)
 PY
 update_action="already_up_to_date"
 echo "update ok: already current $VERSION"
+
+if [ "$PRODUCT" = desktop ] && [ "$KIND" = deb ] && [ "$PLATFORM" = linux-x86_64 ]; then
+  stage="coexist"
+  web_asset="wptsall-client-webui-${VERSION}-${PLATFORM}.deb"
+  gh release download "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
+    -p "$web_asset" -p "${web_asset}.minisig" -D "$work/assets"
+  minisign -Vm "$work/assets/$web_asset" -P "$PUB" -x "$work/assets/$web_asset.minisig"
+  sudo apt-get install -y "$work/assets/$web_asset"
+  webdata="$work/webui-data"
+  mkdir -p "$webdata"
+  echo "WebUI coexistence sentinel." > "$webdata/preservation-sentinel.txt"
+  WPTSALL_DATA_DIR="$webdata" \
+  WPTSALL_DB_PATH="$webdata/client.db" \
+  WPTSALL_LOG_FILE="$work/webui.log" \
+    /usr/bin/wptsall-client-webui >"$work/webui-stdout.log" 2>&1 &
+  echo $! > "$work/webui.pid"
+  web_ready=0
+  for _ in $(seq 1 90); do
+    if curl -fsS "http://127.0.0.1:8977/api/status" >/dev/null 2>&1; then
+      web_ready=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$web_ready" = 1 ] || fail "WebUI did not listen on 8977 while Desktop held $PORT"
+  curl -fsS "http://127.0.0.1:$PORT/api/status" >/dev/null \
+    || fail "Desktop stopped answering on $PORT after WebUI started"
+  web_pid="$(cat "$work/webui.pid")"
+  kill "$web_pid" 2>/dev/null || true
+  wait "$web_pid" 2>/dev/null || true
+  web_before="$("$PY" - "$webdata/preservation-sentinel.txt" <<'PY'
+import hashlib, sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+PY
+)"
+  sudo dpkg --remove wptsall-client-webui
+  [ ! -e /opt/wptsall-client-webui/bin/wptsall-client ] || fail "WebUI binary survived uninstall"
+  web_after="$("$PY" - "$webdata/preservation-sentinel.txt" <<'PY'
+import hashlib, sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())
+PY
+)"
+  [ "$web_before" = "$web_after" ] || fail "removing WebUI changed its per-user data"
+  echo "coexist ok: Desktop :$PORT and WebUI :8977"
+fi
 
 stage="uninstall"
 stop_client

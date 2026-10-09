@@ -5,6 +5,10 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before the window loads, so the UI talks to this process and not a
+    // WebUI client already bound to 8977.
+    commands::agent::pin_desktop_default_port();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

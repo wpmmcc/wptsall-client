@@ -3,6 +3,32 @@ use tokio_util::sync::CancellationToken;
 
 static AGENT_TOKEN: std::sync::OnceLock<CancellationToken> = std::sync::OnceLock::new();
 
+/// WebUI keeps 8977. Desktop uses a different loopback port so both products
+/// can be installed and running on one machine.
+pub const DESKTOP_AGENT_PORT: u16 = 8978;
+
+static USER_PINNED_PORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record whether the operator chose a port, then pin the desktop default.
+/// Call this before the window is created. A later bind failure may still
+/// move off 8978; an operator-supplied port is left unchanged.
+pub fn pin_desktop_default_port() {
+    let pinned = user_pinned_web_ui_port();
+    let _ = USER_PINNED_PORT.set(pinned);
+    if pinned {
+        return;
+    }
+    std::env::set_var(
+        "WPTSALL_WEB_UI_BIND",
+        format!("127.0.0.1:{DESKTOP_AGENT_PORT}"),
+    );
+    std::env::set_var("WPTSALL_WEB_UI_PORT", DESKTOP_AGENT_PORT.to_string());
+}
+
+fn operator_pinned_port() -> bool {
+    *USER_PINNED_PORT.get().unwrap_or(&false)
+}
+
 /// How many times the embedded agent may retry on a fresh loopback port
 /// after a bind conflict before surfacing the failure.
 const MAX_BIND_RETRIES: u8 = 3;
@@ -50,15 +76,10 @@ fn ensure_data_dir(handle: &AppHandle) {
 /// SQLite persistence, component bindings, and relation-scoped outbox path
 /// as the standalone WebUI client.
 ///
-/// Port-conflict resilience: when the default loopback port (8977) is
-/// already taken — typically by the standalone WebUI daemon running on the
-/// same machine — the runtime's `TcpListener::bind` fails and, without
-/// this, the agent would die while the window stayed open showing
-/// "desktop agent unavailable" on every call. When the user has NOT
-/// pinned an explicit port/bind via env, transparently retry on the next
-/// free loopback port (the proxy follows `WPTSALL_WEB_UI_PORT`). Explicit
-/// env configuration is never overridden: a pinned port that cannot bind
-/// must fail loudly, not silently drift.
+/// Port-conflict resilience: Desktop starts on 8978 so it does not take the
+/// WebUI port. If that port is already taken and the operator did not pin
+/// one, retry on the next free loopback port. An explicit port that cannot
+/// bind must fail loudly, not silently drift.
 pub async fn start_agent(handle: AppHandle) -> anyhow::Result<()> {
     let token = shutdown_token().clone();
     tracing::info!("Desktop agent starting...");
@@ -71,7 +92,7 @@ pub async fn start_agent(handle: AppHandle) -> anyhow::Result<()> {
     // disagree on JSON vs SQLite and installed components disappear.
     wptsall_client::web_ui::ensure_web_ui_storage_mode();
 
-    let user_pinned_port = user_pinned_web_ui_port();
+    let user_pinned_port = operator_pinned_port();
     let mut bind_conflicts = 0u8;
     loop {
         let result =

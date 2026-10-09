@@ -28,12 +28,13 @@ jobs:
         shell: bash
     env:
       GH_TOKEN: ${{ github.token }}
-      VERSION: "2.1.5"
       PRODUCT: ${{ matrix.product }}
       PLATFORM: ${{ matrix.platform }}
       KIND: ${{ matrix.kind }}
     steps:
       - uses: actions/checkout@v4
+      - name: Use the repository version
+        run: echo "VERSION=$(tr -d '\r\n' < VERSION)" >> "$GITHUB_ENV"
       - name: Install, update-check, and uninstall the published package
         run: bash install-client/packaging/native-lifecycle-runner.sh
       - name: Upload lifecycle evidence

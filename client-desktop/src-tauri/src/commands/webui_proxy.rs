@@ -2,7 +2,7 @@ use reqwest::Method;
 use serde_json::Value;
 use std::time::Duration;
 
-const DEFAULT_WEB_UI_PORT: u16 = 8977;
+const DEFAULT_WEB_UI_PORT: u16 = crate::commands::agent::DESKTOP_AGENT_PORT;
 
 fn web_ui_port() -> u16 {
     std::env::var("WPTSALL_WEB_UI_PORT")
