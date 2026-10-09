@@ -90,6 +90,8 @@
     onNavigate={handleNavigate}
     onLogout={handleLogout}
     mobileOpen={mobileOpen}
+    productTitle={$_('app.desktop_title')}
+    productHint={$_('app.desktop_hint')}
   />
 
   <main class="flex-1 overflow-auto flex flex-col min-w-0 min-h-0">

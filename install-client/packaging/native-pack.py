@@ -18,6 +18,27 @@ import time
 import zipfile
 
 INSTALL = Path(__file__).resolve().parents[1]
+ROOT = INSTALL.parent
+BRAND = Path(__file__).resolve().parent / "brand"
+DESKTOP_ICONS = ROOT / "client-desktop/src-tauri/icons"
+DISPLAY_NAME = {"desktop": "WPTSALL Desktop", "webui": "WPTSALL WebUI"}
+
+
+def brand_icon(product: str, name: str) -> Path:
+    """Desktop keeps the blue mark. WebUI uses the teal mark with a W badge."""
+    if product == "webui":
+        path = BRAND / "webui" / name
+    else:
+        path = {
+            "32.png": DESKTOP_ICONS / "32x32.png",
+            "64.png": DESKTOP_ICONS / "64x64.png",
+            "128.png": DESKTOP_ICONS / "128x128.png",
+            "icon.ico": DESKTOP_ICONS / "icon.ico",
+            "icon.icns": DESKTOP_ICONS / "icon.icns",
+        }[name]
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
 
 
 def run(*args: str, **kwargs) -> None:
@@ -63,9 +84,18 @@ export WPTSALL_DATA_DIR="${{WPTSALL_DATA_DIR:-${{XDG_DATA_HOME:-$HOME/.local/sha
         launcher += 'export WPTSALL_WEB_UI=1\nexport WPTSALL_WEB_UI_BIND=127.0.0.1:8977\n'
     launcher += f'exec /opt/{name}/bin/wptsall-client "$@"\n'
     write(root / "usr/bin" / name, launcher, 0o755)
+    title = DISPLAY_NAME[product]
+    comment = "Browser translation client" if product == "webui" else "Desktop translation client"
+    for size, filename in (("32x32", "32.png"), ("64x64", "64.png"), ("128x128", "128.png")):
+        destination = root / "usr/share/icons/hicolor" / size / "apps" / f"{name}.png"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(brand_icon(product, filename), destination)
     write(root / "usr/share/applications" / f"{name}.desktop", f"""[Desktop Entry]
-Name=WPTSALL {product.capitalize()}
+Name={title}
+Comment={comment}
 Exec={name}
+Icon={name}
+StartupWMClass={name}
 Terminal={'true' if product == 'webui' else 'false'}
 Type=Application
 Categories=Utility;
@@ -99,7 +129,7 @@ def create_dmg(volume: Path, stage: Path, asset: Path, title: str) -> None:
 
 
 def dmg(tree: Path, stage: Path, asset: Path, product: str, version: str, auth: Path) -> None:
-    title = f"WPTSALL {product.capitalize()}"
+    title = DISPLAY_NAME[product]
     volume = stage / "volume"
     app = volume / f"{title}.app" / "Contents"
     (app / "MacOS").mkdir(parents=True)
@@ -127,8 +157,11 @@ exec "$HERE/../Resources/kit/bin/wptsall-client" "$@"
             "CFBundleShortVersionString": version,
             "CFBundleExecutable": executable,
             "CFBundlePackageType": "APPL",
+            "CFBundleIconFile": "AppIcon",
             "LSMinimumSystemVersion": "11.0",
         }, stream)
+    (app / "Resources").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(brand_icon(product, "icon.icns"), app / "Resources" / "AppIcon.icns")
     shutil.copy2(auth, volume / auth.name)
     (volume / "Applications").symlink_to("/Applications", target_is_directory=True)
     create_dmg(volume, stage, asset, title)
@@ -144,7 +177,7 @@ def nsis_path(path: Path | str) -> str:
 
 
 def nsis(tree: Path, stage: Path, asset: Path, product: str, version: str) -> None:
-    name = f"WPTSALL {product.capitalize()}"
+    name = DISPLAY_NAME[product]
     ident = "wptsall-client-webui" if product == "webui" else "wptsall-client"
     # Per-user, non-elevated installation. A manifest enumerates only package
     # members for uninstall; config/data created by the app are never removed.
@@ -173,6 +206,10 @@ set "WPTSALL_WEB_UI_BIND=127.0.0.1:8977"
         command = r"$INSTDIR\launch-webui.cmd"
     else:
         command = r"$INSTDIR\bin\wptsall-client.exe"
+    icon = stage / "brand.ico"
+    shutil.copy2(brand_icon(product, "icon.ico"), icon)
+    install += ['SetOutPath "$INSTDIR"', f'File "{nsis_path(icon)}"']
+    uninstall += ['Delete "$INSTDIR\\brand.ico"']
     script = f"""Unicode true
 RequestExecutionLevel user
 Name "{name}"
@@ -188,9 +225,10 @@ Section
 SetShellVarContext current
 {chr(10).join(install)}
 WriteUninstaller "$INSTDIR\\uninstall.exe"
-CreateShortcut "$SMPROGRAMS\\{name}.lnk" "{command}" "{args}"
+CreateShortcut "$SMPROGRAMS\\{name}.lnk" "{command}" "{args}" "$INSTDIR\\brand.ico"
 WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{ident}" "DisplayName" "{name}"
 WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{ident}" "DisplayVersion" "{version}"
+WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{ident}" "DisplayIcon" "$INSTDIR\\brand.ico"
 WriteRegStr HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{ident}" "UninstallString" '$\\"$INSTDIR\\uninstall.exe$\\"'
 SectionEnd
 Section "Uninstall"

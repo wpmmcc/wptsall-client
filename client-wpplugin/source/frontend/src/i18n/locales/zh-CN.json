@@ -1,6 +1,11 @@
 {
   "app": {
-    "title": "WPTSALL Client"
+    "title": "WPTSALL Client",
+    "hint": "翻译与同步",
+    "desktop_title": "WPTSALL 桌面端",
+    "desktop_hint": "桌面",
+    "webui_title": "WPTSALL 网页端",
+    "webui_hint": "浏览器"
   },
   "header": {
     "title": "WPTSALL 客户端 Web UI (MVP)"

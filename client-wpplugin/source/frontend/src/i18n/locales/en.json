@@ -1,6 +1,11 @@
 {
   "app": {
-    "title": "WPTSALL Client"
+    "title": "WPTSALL Client",
+    "hint": "Translate & Sync",
+    "desktop_title": "WPTSALL Desktop",
+    "desktop_hint": "Desktop",
+    "webui_title": "WPTSALL WebUI",
+    "webui_hint": "Browser"
   },
   "header": {
     "title": "WPTSALL Client Web UI (MVP)"

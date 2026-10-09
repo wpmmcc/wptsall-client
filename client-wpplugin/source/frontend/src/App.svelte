@@ -99,6 +99,8 @@
       onNavigate={handleNavigate}
       onLogout={handleLogout}
       mobileOpen={mobileOpen}
+      productTitle={$_('app.webui_title')}
+      productHint={$_('app.webui_hint')}
     />
 
     <!-- 主内容 -->

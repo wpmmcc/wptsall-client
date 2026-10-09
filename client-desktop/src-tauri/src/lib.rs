@@ -180,7 +180,7 @@ fn pin_window_icon(app: &tauri::App) {
 
         // Align X11 WM_CLASS and Wayland app_id to match wptsall-client.desktop
         gtk::glib::set_prgname(Some("wptsall-client"));
-        gtk::glib::set_application_name("WPTSALL Client");
+        gtk::glib::set_application_name("WPTSALL Desktop");
         gtk::Window::set_default_icon_name("wptsall-client");
 
         let png: &[u8] = include_bytes!("../icons/128x128.png");

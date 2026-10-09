@@ -6,11 +6,13 @@
   import { setLocale } from '../i18n';
   import BrandLogo from './BrandLogo.svelte';
 
-  let { currentPage, onNavigate, onLogout, mobileOpen = false }: {
+  let { currentPage, onNavigate, onLogout, mobileOpen = false, productTitle = '', productHint = '' }: {
     currentPage: string;
     onNavigate: (page: string) => void;
     onLogout: () => void;
     mobileOpen?: boolean;
+    productTitle?: string;
+    productHint?: string;
   } = $props();
 
   let currentLocale = $derived($locale ?? 'en');
@@ -46,8 +48,8 @@
   <div class="px-4 py-4 border-b border-gray-200 flex items-center gap-3">
     <BrandLogo size={32} className="shadow-sm rounded-lg" />
     <div class="min-w-0">
-      <h1 class="text-gray-950 font-bold text-sm tracking-tight truncate">{$_('app.title')}</h1>
-      <p class="text-[10px] text-gray-500 font-medium leading-tight truncate">Translate &amp; Sync</p>
+      <h1 class="text-gray-950 font-bold text-sm tracking-tight truncate">{productTitle || $_('app.title')}</h1>
+      <p class="text-[10px] text-gray-500 font-medium leading-tight truncate">{productHint || $_('app.hint')}</p>
     </div>
   </div>
 
