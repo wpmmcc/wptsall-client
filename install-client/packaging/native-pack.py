@@ -81,11 +81,40 @@ umask 077
 export WPTSALL_DATA_DIR="${{WPTSALL_DATA_DIR:-${{XDG_DATA_HOME:-$HOME/.local/share}}/{name}}}"
 """
     if product == "webui":
-        launcher += 'export WPTSALL_WEB_UI=1\nexport WPTSALL_WEB_UI_BIND=127.0.0.1:8977\n'
-    launcher += f'exec /opt/{name}/bin/wptsall-client "$@"\n'
+        # The page is the user's browser. Default listen address is this
+        # machine; the WebUI access setting can open it to the LAN or the
+        # public internet. Do not replace a bind the operator already set,
+        # and do not open a window of our own.
+        launcher += """export WPTSALL_WEB_UI=1
+if [ -z "${WPTSALL_WEB_UI_BIND:-}" ]; then
+  export WPTSALL_WEB_UI_BIND=127.0.0.1:8977
+fi
+port="${WPTSALL_WEB_UI_BIND##*:}"
+"/opt/%s/bin/wptsall-client" "$@" &
+child=$!
+trap 'kill "$child" 2>/dev/null || true' EXIT INT TERM
+i=0
+while [ "$i" -lt 50 ]; do
+  if ! kill -0 "$child" 2>/dev/null; then
+    wait "$child"
+    exit $?
+  fi
+  if command -v curl >/dev/null 2>&1 && curl -fsS "http://127.0.0.1:${port}/api/status" >/dev/null 2>&1; then
+    break
+  fi
+  i=$((i + 1))
+  sleep 0.2
+done
+if command -v xdg-open >/dev/null 2>&1; then
+  xdg-open "http://127.0.0.1:${port}/" >/dev/null 2>&1 || true &
+fi
+wait "$child"
+""" % name
+    else:
+        launcher += f'exec /opt/{name}/bin/wptsall-client "$@"\n'
     write(root / "usr/bin" / name, launcher, 0o755)
     title = DISPLAY_NAME[product]
-    comment = "Browser translation client" if product == "webui" else "Desktop translation client"
+    comment = "Open the translation client in a browser" if product == "webui" else "Desktop translation client"
     for size, filename in (("32x32", "32.png"), ("64x64", "64.png"), ("128x128", "128.png")):
         destination = root / "usr/share/icons/hicolor" / size / "apps" / f"{name}.png"
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -168,8 +197,15 @@ umask 077
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 export WPTSALL_DATA_DIR="${WPTSALL_DATA_DIR:-$HOME/Library/Application Support/cc.wpmm.wptsall-webui}"
 export WPTSALL_WEB_UI=1
-export WPTSALL_WEB_UI_BIND=127.0.0.1:8977
-exec "$HERE/../Resources/kit/bin/wptsall-client" "$@"
+if [ -z "${WPTSALL_WEB_UI_BIND:-}" ]; then
+  export WPTSALL_WEB_UI_BIND=127.0.0.1:8977
+fi
+port="${WPTSALL_WEB_UI_BIND##*:}"
+"$HERE/../Resources/kit/bin/wptsall-client" "$@" &
+child=$!
+trap 'kill "$child" 2>/dev/null || true' EXIT INT TERM
+open "http://127.0.0.1:${port}/" >/dev/null 2>&1 || true
+wait "$child"
 """, 0o755)
     with (app / "Info.plist").open("xb") as stream:
         plistlib.dump({
@@ -221,7 +257,9 @@ def nsis(tree: Path, stage: Path, asset: Path, product: str, version: str) -> No
 setlocal
 if not defined WPTSALL_DATA_DIR set "WPTSALL_DATA_DIR=%LOCALAPPDATA%\\{ident}\\data"
 set "WPTSALL_WEB_UI=1"
-set "WPTSALL_WEB_UI_BIND=127.0.0.1:8977"
+if not defined WPTSALL_WEB_UI_BIND set "WPTSALL_WEB_UI_BIND=127.0.0.1:8977"
+for /f "tokens=2 delims=:" %%P in ("%WPTSALL_WEB_UI_BIND%") do set "WPTSALL_WEB_UI_PORT_OPEN=%%P"
+start "" "http://127.0.0.1:%WPTSALL_WEB_UI_PORT_OPEN%/"
 "%~dp0bin\\wptsall-client.exe" %*
 """)
         install += ['SetOutPath "$INSTDIR"', f'File "{nsis_path(stage / "launch-webui.cmd")}"']

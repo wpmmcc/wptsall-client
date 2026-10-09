@@ -147,6 +147,13 @@ pub(crate) fn web_ui_loopback_origin() -> String {
     format!("http://127.0.0.1:{}", web_ui_effective_port())
 }
 
+/// Desktop sets this so its window cannot be published on a LAN or the
+/// public internet. The browser WebUI leaves it unset and uses the access
+/// setting instead.
+pub(crate) fn web_ui_local_only() -> bool {
+    crate::config::env_bool("WPTSALL_LOCAL_ONLY", false)
+}
+
 /// Force SQLite-backed WebUI storage for the in-process WebUI/Desktop agent.
 ///
 /// `main` only enters `run_web_ui` when `WPTSALL_WEB_UI` is already truthy, but
@@ -298,10 +305,13 @@ pub async fn run_web_ui(
     crate::logging::set_log_min_level(&log_min_level);
     init_runtime_log_file(&log_file)?;
 
-    // Load access control settings from DB
-    let external_access = crate::db::system::get_system_config(&db_conn, "web_ui_external_access")
-        .map(|v| v == "true")
-        .unwrap_or(false);
+    // Load access control settings from DB. The desktop client is local-only
+    // even if an older database still has external access enabled.
+    let local_only = web_ui_local_only();
+    let external_access = !local_only
+        && crate::db::system::get_system_config(&db_conn, "web_ui_external_access")
+            .map(|v| v == "true")
+            .unwrap_or(false);
     let allowed_ips_str =
         crate::db::system::get_system_config(&db_conn, "web_ui_allowed_ips").unwrap_or_default();
     let extra_ips: Vec<IpAddr> = allowed_ips_str
@@ -310,10 +320,12 @@ pub async fn run_web_ui(
         .collect();
     let access_control = AccessControl::new(external_access, &extra_ips);
 
-    // Determine bind address: if external_access is enabled, bind to 0.0.0.0;
-    // otherwise respect the env var (default 127.0.0.1).
-    let bind_addr = if external_access {
-        // Extract port from env-configured address, bind to all interfaces
+    // WebUI: external access listens on every interface so a browser on the
+    // LAN or the public internet can open the URL. Desktop stays on loopback.
+    let bind_addr = if local_only {
+        let port = bind_addr_env.rsplit(':').next().unwrap_or("8978");
+        format!("127.0.0.1:{}", port)
+    } else if external_access {
         let port = bind_addr_env.rsplit(':').next().unwrap_or("8977");
         format!("0.0.0.0:{}", port)
     } else {

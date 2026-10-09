@@ -29,6 +29,9 @@
 
   type Tab = 'proxy' | 'worker' | 'log' | 'access' | 'about';
   let activeTab = $state<Tab>('proxy');
+  // Desktop is a local window. Intranet and public URLs are a WebUI setting.
+  const desktopShell =
+    typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
   function handleBackdropKeydown(event: KeyboardEvent, close: () => void) {
     if (event.key === 'Escape' || event.key === 'Enter' || event.key === ' ') {
@@ -603,7 +606,7 @@
 
 <!-- Tabs -->
 <div class="flex border-b border-gray-200 mb-4">
-  {#each [['proxy', $_('settings.tab_proxy')],['worker', $_('settings.tab_worker')],['log', $_('settings.tab_log')],['access', $_('settings.tab_access')],['about', $_('settings.tab_about')]] as [id, label]}
+  {#each [['proxy', $_('settings.tab_proxy')],['worker', $_('settings.tab_worker')],['log', $_('settings.tab_log')],['access', $_('settings.tab_access')],['about', $_('settings.tab_about')]].filter(([id]) => id !== 'access' || !desktopShell) as [id, label]}
     <button
       data-testid={`settings-tab-${id}`}
       onclick={() => activeTab = id as Tab}

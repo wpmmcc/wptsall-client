@@ -13,6 +13,9 @@ static USER_PINNED_PORT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// Call this before the window is created. A later bind failure may still
 /// move off 8978; an operator-supplied port is left unchanged.
 pub fn pin_desktop_default_port() {
+    // The desktop window is this machine only. Intranet and public access
+    // belong to the browser WebUI, not to this process.
+    std::env::set_var("WPTSALL_LOCAL_ONLY", "1");
     let pinned = user_pinned_web_ui_port();
     let _ = USER_PINNED_PORT.set(pinned);
     if pinned {

@@ -55,6 +55,8 @@ export const updateLogSettings = (enabled: boolean, level: string) =>
 export const getAccessControl = () =>
   apiFetch<{
     external_access: boolean;
+    /** Desktop window: listen on this machine only. WebUI omits or sends false. */
+    local_only?: boolean;
     allowed_ips: string[];
     current_bind: string;
     /** Actual listen port reported by the backend (env override → bind parse → 8977). */

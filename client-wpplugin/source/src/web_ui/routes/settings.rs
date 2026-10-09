@@ -162,12 +162,14 @@ pub(super) async fn handle_access_control_get(
     // external peer already presenting the token — so echoing it here
     // leaks nothing the caller does not already hold or already trust.
     let access_token = webui_access_token(state).await.ok();
+    let local_only = crate::web_ui::web_ui_local_only();
     let payload = json!({
         "success": true,
         "data": {
-            "external_access": external_access,
+            "external_access": external_access && !local_only,
+            "local_only": local_only,
             "allowed_ips": allowed_ips,
-            "current_bind": current_bind,
+            "current_bind": if local_only { "127.0.0.1".to_string() } else { current_bind },
             // Actual listen port (env override → bind-addr parse → default).
             // The UI renders this verbatim; before this field existed it
             // hard-coded `:8977` and misreported any custom-port deployment.
@@ -225,6 +227,14 @@ pub(super) async fn handle_access_control_update(
     // no usable remote allowlist.
     let (current_external, _) = access_control.get_settings().await;
     let external_access = new_external.unwrap_or(current_external);
+    if crate::web_ui::web_ui_local_only() && external_access {
+        return write_error_response(
+            socket,
+            "LOCAL_ONLY",
+            "the desktop client listens on this machine only",
+        )
+        .await;
+    }
     let has_non_loopback = parsed_ips.iter().any(|ip| !ip.is_loopback());
     if external_access && !has_non_loopback {
         return write_error_response(
