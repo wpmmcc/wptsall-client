@@ -69,7 +69,7 @@
 {/if}
 
 <!-- 主界面：默认进入本地控制面；官网 OAuth 不再是运行时前置条件。 -->
-<div class="relative flex min-h-screen bg-white">
+<div class="relative flex h-screen min-h-0 bg-white">
     <!-- 移动菜单按钮 -->
     <button
       onclick={() => mobileOpen = !mobileOpen}
@@ -102,7 +102,7 @@
     />
 
     <!-- 主内容 -->
-    <main class="flex-1 overflow-auto">
+    <main class="flex-1 min-h-0 overflow-auto">
       <div class="max-w-5xl mx-auto px-6 pt-20 pb-6 lg:pt-6">
         {#if $status?.storage_paused && $status.database_available === false}
           <StoragePaused />

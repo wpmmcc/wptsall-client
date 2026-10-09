@@ -39,7 +39,7 @@
 </script>
 
 <nav
-  class={`w-[200px] min-h-screen bg-white border-r border-gray-200 text-gray-700 flex flex-col shrink-0
+  class={`w-[200px] h-full min-h-0 bg-white border-r border-gray-200 text-gray-700 flex flex-col shrink-0
     fixed lg:static inset-0 z-40 transition-transform
     ${mobileOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0'}`}
   aria-label={$_('a11y.main_navigation')}>

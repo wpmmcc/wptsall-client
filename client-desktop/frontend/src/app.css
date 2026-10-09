@@ -6,6 +6,19 @@
   --color-primary-hover: #1d4ed8;
 }
 
+html,
+body,
+#app {
+  height: 100%;
+  min-height: 0;
+}
+
+/* 长页面在窗口里滚动，滚动条保持可见，避免内容被窗口裁掉却看不出还能往下翻。 */
+#app main,
+#app main > div {
+  scrollbar-width: thin;
+}
+
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;

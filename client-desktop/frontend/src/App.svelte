@@ -76,7 +76,7 @@
   });
 </script>
 
-<div class="relative flex h-screen bg-white">
+<div class="relative flex h-full min-h-0 bg-white">
   <!-- 移动菜单背景（<lg 窗口宽）：遮罩点击收起，与 WebUI 壳同构 -->
   {#if mobileOpen}
     <div
@@ -92,7 +92,7 @@
     mobileOpen={mobileOpen}
   />
 
-  <main class="flex-1 overflow-auto flex flex-col min-w-0">
+  <main class="flex-1 overflow-auto flex flex-col min-w-0 min-h-0">
     <header class="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between gap-4 shrink-0">
       <div class="flex items-center gap-2 min-w-0">
         <!-- 汉堡钮内联在 header 流内（WebUI 壳无 header 用 fixed；桌面壳有
@@ -122,7 +122,7 @@
       </button>
     </header>
 
-    <div class="flex-1 overflow-y-auto">
+    <div class="flex-1 min-h-0 overflow-y-auto">
       <div class="max-w-5xl mx-auto px-6 py-6">
         {#if $status?.storage_paused && $status.database_available === false}
           <StoragePaused />
