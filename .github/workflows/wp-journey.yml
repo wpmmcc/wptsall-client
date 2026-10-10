@@ -1012,18 +1012,17 @@ jobs:
           await page.locator('#log-container .font-mono > div').first()
             .waitFor({ state: 'visible', timeout: 15000 });
           await page.getByTestId('logs-keyword-filter').fill('item_translated');
-          // Rendered detail is the JSON.stringify'd detail object, so the
-          // post id appears as "object_id":N (trailing , or } keeps an
-          // exact-value match: 6 cannot match 61).
+          // The log view flattens each JSON line to key=value. A trailing
+          // boundary keeps object_id=6 from matching object_id=61.
           const logLines = page.locator('#log-container .font-mono > div');
           const translatedCount = await logLines
-            .filter({ hasText: /"object_id":\d+/ }).count();
+            .filter({ hasText: /object_id=\d+/ }).count();
           step(`discovery item_translated events visible (${translatedCount} lines)`,
             translatedCount > 0);
           let postOk = false;
           try {
             await logLines
-              .filter({ hasText: new RegExp('"object_id":' + POST_ID + '[,}]') })
+              .filter({ hasText: new RegExp('object_id=' + POST_ID + '(?!\\d)') })
               .first().waitFor({ state: 'visible', timeout: 10000 });
             postOk = true;
           } catch { postOk = false; }
