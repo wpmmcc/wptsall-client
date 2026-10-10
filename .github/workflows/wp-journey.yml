@@ -126,7 +126,11 @@ jobs:
 
       - name: Install Playwright chromium
         working-directory: client-wpplugin/source/frontend
-        run: npx playwright install --with-deps chromium
+        run: |
+          # Production package.json does not depend on Playwright. The journey
+          # imports it to render translated plugin pages, without changing the lock.
+          npm install --no-save --no-audit --no-fund @playwright/test
+          npx playwright install --with-deps chromium
 
       - uses: dtolnay/rust-toolchain@stable
 
