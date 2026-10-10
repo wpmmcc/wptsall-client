@@ -949,6 +949,9 @@ jobs:
           rm -f "$ROOT/client-wpplugin/source/frontend/journey-plugins.tmp.mjs"
           echo "plugins leg OK: 19 content plugins installed -> scanned -> translated -> WP-verified -> browser-rendered"
 
+          echo "client audit events:"
+          grep -oE '"event":"(discovery|pipeline)\.[^"]+"' /tmp/journey-a/client.log | sort | uniq -c || true
+
           # --- UI ops leg: real browser against the served WebUI ------------
           cat > "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs" <<'EOF'
           import { chromium } from '@playwright/test';
@@ -1010,7 +1013,7 @@ jobs:
           await page.locator('#logs-limit-input').fill('1000');
           // Later plugin runs fill the tail. Ask for this event by name so
           // the original post is not pushed out of the newest page.
-          await page.getByTestId('logs-event-filter').fill('discovery.item_translated');
+          await page.getByTestId('logs-event-filter').fill('discovery.callback_sent');
           await page.getByRole('button', { name: 'Load Logs', exact: true }).click();
           await page.locator('#log-container .font-mono > div').first()
             .waitFor({ state: 'visible', timeout: 15000 });
@@ -1019,7 +1022,7 @@ jobs:
           const logLines = page.locator('#log-container .font-mono > div');
           const translatedCount = await logLines
             .filter({ hasText: /"object_id":\d+/ }).count();
-          step(`discovery item_translated events visible (${translatedCount} lines)`,
+          step(`discovery callback_sent events visible (${translatedCount} lines)`,
             translatedCount > 0);
           let postOk = false;
           try {
@@ -1028,7 +1031,7 @@ jobs:
               .first().waitFor({ state: 'visible', timeout: 10000 });
             postOk = true;
           } catch { postOk = false; }
-          step(`client log shows item_translated for post ${POST_ID}`, postOk);
+          step(`client log shows callback_sent for post ${POST_ID}`, postOk);
           await page.screenshot({ path: OUT_TASKS, fullPage: true });
           await page.getByRole('button', { name: 'Overview', exact: true }).click();
           await page.waitForTimeout(300);
