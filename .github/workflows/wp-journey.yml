@@ -1008,21 +1008,23 @@ jobs:
           await logsNav.waitFor({ state: 'visible', timeout: 15000 });
           await logsNav.click();
           await page.locator('#logs-limit-input').fill('1000');
+          // Later plugin runs fill the tail. Ask for this event by name so
+          // the original post is not pushed out of the newest page.
+          await page.getByTestId('logs-event-filter').fill('discovery.item_translated');
           await page.getByRole('button', { name: 'Load Logs', exact: true }).click();
           await page.locator('#log-container .font-mono > div').first()
             .waitFor({ state: 'visible', timeout: 15000 });
-          await page.getByTestId('logs-keyword-filter').fill('item_translated');
-          // The log view flattens each JSON line to key=value. A trailing
-          // boundary keeps object_id=6 from matching object_id=61.
+          // The row flattens to detail={...}, and that object still has
+          // "object_id":N. The following comma or brace keeps 6 from matching 61.
           const logLines = page.locator('#log-container .font-mono > div');
           const translatedCount = await logLines
-            .filter({ hasText: /object_id=\d+/ }).count();
+            .filter({ hasText: /"object_id":\d+/ }).count();
           step(`discovery item_translated events visible (${translatedCount} lines)`,
             translatedCount > 0);
           let postOk = false;
           try {
             await logLines
-              .filter({ hasText: new RegExp('object_id=' + POST_ID + '(?!\\d)') })
+              .filter({ hasText: new RegExp('"object_id":' + POST_ID + '[,}]') })
               .first().waitFor({ state: 'visible', timeout: 10000 });
             postOk = true;
           } catch { postOk = false; }
