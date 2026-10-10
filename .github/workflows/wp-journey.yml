@@ -1,0 +1,1094 @@
+name: WP + plugin + client journey
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      plugin_ref:
+        description: 'wpmmcc/wpmmcc-ats ref to test against (default: main)'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The end-to-end lane the unit/CI jobs cannot be: a real WordPress site and
+# the real plugin installed on the runner, with BOTH client UI agents
+# (WebUI + desktop-agent parity instance) installed from kit layout,
+# paired via production connection packs, and driven through real UI
+# operations in a browser, then uninstalled and checked for residue.
+#
+# What each leg proves:
+#   install    - kit layout (bin + ui + version stamps) extracted, client
+#                first-run serves the embedded WebUI and answers /api/status
+#   pair       - production pack issuance (wptsall_create_site_connection_pack,
+#                device-bound) + client /api/site-connections/import + WP-side
+#                single-claim verification + live site_status=active round trip
+#   translate  - the full product flow against an inline OpenAI-compatible
+#                mock (bounded runner port of the Lab mock-translate-api):
+#                WP translation side provisioned (zh_CN language, virtual
+#                site, relation, post rule, fresh source post) → client
+#                component bound to the mock + quick-test → discovery
+#                bootstrap → worker run-once until translated → WP-side
+#                post mapping + published target + 【zh_CN】 markers in
+#                title/content → plugin FRONTEND access check (virtual site
+#                route /zh-rt/<slug>/ renders 200 with markers, no route
+#                errors). The client's own REST surface (validate-token /
+#                site-relations / rules / content / translation-callback,
+#                secret-prefixed, device-token authed) IS the backend access
+#                the whole flow runs over.
+#   plugins    - the local Lab content-plugin matrix's full plugin set (19
+#                third-party plugins from wordpress.org, per the local
+#                project-specs.json; the 20th project is wptsall itself,
+#                already covered by the translate leg): install + activate
+#                → incremental re-scan → ONE dedicated relation (virtual
+#                site /zh-plugins/) binding every plugin model → 16
+#                plugins translate their OWN CPT (product/download/topic/
+#                courses/lp_course/tribe_events/job_listing/envira/podcast/
+#                wprm_recipe/site-review/give_forms/at_biz_dir/course/event/
+#                hp_listing), elementor/wordpress-seo/advanced-custom-fields
+#                translate the standard CPTs they integrate with (page/
+#                post/product, mirroring the local project specs) → the
+#                same worker/mock loop translates all 19 items → WP-side
+#                per-plugin verifier (mapping + published target + markers,
+#                content gated on the CPT's editor support) → Playwright
+#                renders EVERY translated plugin page in a real browser
+#                (static subresources aborted — the assertion targets the
+#                server-rendered document) and asserts the zh_CN markers in
+#                the DOM, with one screenshot per plugin page.
+#   ui ops     - Playwright (chromium) drives the served SPA: nav to Sites,
+#                the paired site is listed, nav to Tasks, the translation
+#                job card with done items, nav to Logs, the discovery
+#                item_translated trace for the source post; nav round trip;
+#                screenshot artifacts
+#   uninstall  - both clients stopped, no process residue on the exact
+#                install paths, install roots + data dirs removed, ports freed
+#
+# Out of scope on purpose:
+#   update/self-replace - proven by wptsall-client.ota-upgrade.yml (signed
+#   manifest + kit, positive/negative/recovery rounds) on this same repo;
+#   desktop GUI window smoke (Xvfb + tauri-driver + WebKitWebDriver) stays on
+#   the local Lab lane (desktop runner coverage = compile + unit tests +
+#   headless integration via ci.yml);
+#   the full multi-vendor mock-translate-api (per-vendor auth algorithms,
+#   media, fault profiles) stays on the local Lab lanes — the runner mock is
+#   the bounded OpenAI-compatible subset this flow needs (same request/
+#   response contract, same 【lang】 markers).
+#
+# The plugin under test is the PUBLISHED public repo (wpmmcc/wpmmcc-ats),
+# so this lane continuously proves the client works against the released
+# plugin, not just the in-tree development copy.
+jobs:
+  wp-client-journey:
+    name: WP 7.1 + plugin + dual client agents (pair / UI / uninstall)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --host=localhost -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      WP_PATH: /tmp/wp
+      WP_URL: http://127.0.0.1:8080
+      JOURNEY_A_PORT: '18140'
+      JOURNEY_B_PORT: '18141'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out published plugin (wpmmcc/wpmmcc-ats)
+        uses: actions/checkout@v4
+        with:
+          repository: wpmmcc/wpmmcc-ats
+          ref: ${{ github.event.inputs.plugin_ref || 'main' }}
+          path: plugin-src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client-wpplugin/source/frontend/package-lock.json
+
+      - name: Build WebUI frontend (embedded dist)
+        working-directory: client-wpplugin/source/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Playwright chromium
+        working-directory: client-wpplugin/source/frontend
+        run: npx playwright install --with-deps chromium
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client-wpplugin/source
+
+      - name: Release build (core binary)
+        run: cargo build --release --bin wptsall-client --manifest-path client-wpplugin/source/Cargo.toml
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mysqli
+          coverage: none
+
+      - name: Install wp-cli
+        run: |
+          curl -sSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /tmp/wp-cli.phar
+          sudo install -m 0755 /tmp/wp-cli.phar /usr/local/bin/wp
+          wp --allow-root --info | sed -n '1,4p'
+
+      - name: Install WordPress 7.1 + published plugin
+        run: |
+          set -euo pipefail
+          wp core download --version=7.1 --path="$WP_PATH" --allow-root
+          wp config create --path="$WP_PATH" --dbname=wp --dbuser=root --dbpass=root \
+            --dbhost=127.0.0.1:3306 --allow-root
+          wp db create --path="$WP_PATH" --allow-root
+          wp core install --path="$WP_PATH" --url="$WP_URL" --title=WPTSALLJourney \
+            --admin_user=admin --admin_password=journey-admin-pw \
+            --admin_email=ci@example.com --skip-email --allow-root
+          wp core version --path="$WP_PATH" --allow-root
+          mkdir -p "$WP_PATH/wp-content/plugins/wpmmcc-ats"
+          tar -C "$GITHUB_WORKSPACE/plugin-src" --exclude=./.git -cf - . \
+            | tar -C "$WP_PATH/wp-content/plugins/wpmmcc-ats" -xf -
+          wp plugin activate wpmmcc-ats --path="$WP_PATH" --allow-root
+          wp rewrite structure '/%postname%/' --hard --path="$WP_PATH" --allow-root
+          wp post create --post_title='Journey seed' --post_status=publish \
+            --post_content='Journey lane seed post.' --path="$WP_PATH" --allow-root
+
+      # One step on purpose: every long-running process (php -S, both
+      # clients) must live inside the step that asserts against them —
+      # background processes are not reliable across step boundaries.
+      - name: Run the journey (pair both agents, drive the WebUI, uninstall)
+        run: |
+          set -euo pipefail
+          ROOT="$GITHUB_WORKSPACE"
+          DIST="$ROOT/client-wpplugin/source/frontend/dist"
+          BIN="$ROOT/client-wpplugin/source/target/release/wptsall-client"
+
+          # --- WordPress served via php -S (index.php as router) -----------
+          PHP_CLI_SERVER_WORKERS=4 nohup php -S 127.0.0.1:8080 \
+            -t "$WP_PATH" "$WP_PATH/index.php" > /tmp/wp-server.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf -o /dev/null "$WP_URL/" && break; sleep 1
+          done
+          curl -sf -o /dev/null "$WP_URL/" || { cat /tmp/wp-server.log; exit 1; }
+          echo "wp server up: $WP_URL"
+
+          # --- install leg: both agents from kit layout ---------------------
+          for inst in a b; do
+            mkdir -p "/tmp/journey-install-$inst/bin" \
+                     "/tmp/journey-install-$inst/ui/webui" \
+                     "/tmp/journey-$inst/data"
+            cp "$BIN" "/tmp/journey-install-$inst/bin/"
+            cp -r "$DIST/." "/tmp/journey-install-$inst/ui/webui/"
+            echo ci > "/tmp/journey-install-$inst/VERSION-WEBUI"
+          done
+          for inst in a b; do
+            port_var="JOURNEY_$(echo "$inst" | tr 'ab' 'AB')_PORT"
+            port="${!port_var}"
+            setsid env WPTSALL_WEB_UI=1 \
+              WPTSALL_WEB_UI_BIND="127.0.0.1:$port" \
+              WPTSALL_WEB_UI_PORT="$port" \
+              WPTSALL_DATA_DIR="/tmp/journey-$inst/data" \
+              WPTSALL_DB_PATH="/tmp/journey-$inst/wptsall.db" \
+              WPTSALL_LOG_FILE="/tmp/journey-$inst/client.log" \
+              WPTSALL_INSTALL_ROOT="/tmp/journey-install-$inst" \
+              WPTSALL_PROVIDER_ALLOWLIST="127.0.0.1,localhost" \
+              WPTSALL_LOG_ENABLED="1" \
+              "/tmp/journey-install-$inst/bin/wptsall-client" \
+              > "/tmp/journey-$inst/stdout.log" 2>&1 &
+            echo $! > "/tmp/journey-$inst/pid"
+          done
+          for port in "$JOURNEY_A_PORT" "$JOURNEY_B_PORT"; do
+            for _ in $(seq 1 30); do
+              curl -fsS "http://127.0.0.1:$port/api/status" -o /dev/null 2>/dev/null && break
+              sleep 1
+            done
+            curl -fsS "http://127.0.0.1:$port/api/status" -o /dev/null \
+              || { cat /tmp/journey-a/stdout.log /tmp/journey-b/stdout.log 2>/dev/null || true
+                   echo "client on :$port did not come up" >&2; exit 1; }
+          done
+          echo "both client agents up (webui :$JOURNEY_A_PORT, desktop-agent parity :$JOURNEY_B_PORT)"
+
+          # --- pair leg: production pack per device, import, claim ----------
+          # Packs are device-bound (PAIRING_DEVICE_MISMATCH otherwise), so the
+          # client device ids are read FIRST and baked into the issuance.
+          cat > /tmp/issue-pack.php <<'PHP'
+          <?php
+          $device = getenv( 'JOURNEY_DEVICE_ID' );
+          $slug   = getenv( 'JOURNEY_PACK_SLUG' );
+          if ( empty( $device ) || empty( $slug ) ) {
+            fwrite( STDERR, "JOURNEY_DEVICE_ID / JOURNEY_PACK_SLUG missing\n" ); exit( 1 );
+          }
+          if ( ! function_exists( 'wptsall_create_site_connection_pack' ) ) {
+            fwrite( STDERR, "pack API unavailable\n" ); exit( 1 );
+          }
+          $pack = wptsall_create_site_connection_pack( $device, 'CI Journey ' . $slug, 600 );
+          $dir = getenv( 'WP_PATH' );
+          file_put_contents( $dir . "/journey-pack-$slug.json",
+            wp_json_encode( $pack, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) );
+          echo "pack-issued-for: $device\n";
+          PHP
+          cat > /tmp/verify-claim.php <<'PHP'
+          <?php
+          $records = wptsall_load_client_pairing_codes();
+          foreach ( $records as $r ) {
+            $dev = (string) ( $r['device_id'] ?? '' );
+            if ( in_array( $dev, explode( ',', (string) getenv( 'JOURNEY_DEVICES' ) ), true )
+                 && empty( $r['claimed_at'] ) ) {
+              fwrite( STDERR, "unclaimed pairing record remains for $dev\n" ); exit( 1 );
+            }
+          }
+          echo "pairing-consumed-ok records=" . count( $records ) . "\n";
+          PHP
+          for inst in a b; do
+            port_var="JOURNEY_$(echo "$inst" | tr 'ab' 'AB')_PORT"
+            port="${!port_var}"
+            dev="$(curl -fsS "http://127.0.0.1:$port/api/status" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["device_id"])')"
+            cp /tmp/issue-pack.php "$WP_PATH/issue-pack.php"
+            JOURNEY_DEVICE_ID="$dev" JOURNEY_PACK_SLUG="$inst" \
+              wp eval-file "$WP_PATH/issue-pack.php" --path="$WP_PATH" --allow-root
+            python3 - "$inst" "$port" <<'PY'
+          import json, os, sys, urllib.request
+          inst, port = sys.argv[1], sys.argv[2]
+          pack = json.load(open(f"{os.environ['WP_PATH']}/journey-pack-{inst}.json"))
+          req = urllib.request.Request(
+              f'http://127.0.0.1:{port}/api/site-connections/import',
+              data=json.dumps({'site_connection_pack': pack}).encode(),
+              headers={'Content-Type': 'application/json'}, method='POST')
+          r = json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+          assert r.get('success') is True, r
+          assert r['data']['pairing_claimed'] is True, r
+          assert r['data']['api_base_url'] == 'http://127.0.0.1:8080', r
+          print(f'pair-ok {inst}: claimed, site bound')
+          PY
+          done
+          DEV_A="$(curl -fsS "http://127.0.0.1:$JOURNEY_A_PORT/api/status" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["device_id"])')"
+          DEV_B="$(curl -fsS "http://127.0.0.1:$JOURNEY_B_PORT/api/status" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["device_id"])')"
+          cp /tmp/verify-claim.php "$WP_PATH/verify-claim.php"
+          JOURNEY_DEVICES="$DEV_A,$DEV_B" \
+            wp eval-file "$WP_PATH/verify-claim.php" --path="$WP_PATH" --allow-root
+          for port in "$JOURNEY_A_PORT" "$JOURNEY_B_PORT"; do
+            curl -fsS "http://127.0.0.1:$port/api/status" \
+              | JOURNEY_PORT="$port" python3 -c 'import json, os, sys
+          d = json.load(sys.stdin)["data"]
+          domains = [x["api_base_url"] for x in d.get("domains", [])]
+          assert domains == ["http://127.0.0.1:8080"], domains
+          assert d["domains"][0]["site_status"] == "active", d["domains"][0]
+          print("site-active-ok :" + os.environ["JOURNEY_PORT"])'
+          done
+          echo "pair leg OK: both agents paired, packs single-claimed, sites live-active"
+
+          # --- translate leg: full product flow against an inline mock ------
+          # Bounded runner port of the Lab mock-translate-api: same
+          # OpenAI-compatible contract, same 【lang】 markers. The Lab mock
+          # (multi-vendor auth, media, fault profiles) stays local.
+          cat > /tmp/journey-mock.py <<'MOCKPY'
+          #!/usr/bin/env python3
+          import json, re, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+
+          TAG = re.compile(r'(<[^>]*>)')
+
+          def wrap(text, lang):
+              out = []
+              for part in TAG.split(text):
+                  if part.startswith('<') and part.endswith('>'):
+                      out.append(part)
+                  elif part.strip():
+                      out.append('\u3010%s\u3011%s\u3010/%s\u3011' % (lang, part, lang))
+                  else:
+                      out.append(part)
+              return ''.join(out)
+
+          class H(BaseHTTPRequestHandler):
+              def _send(self, code, payload):
+                  body = json.dumps(payload).encode()
+                  self.send_response(code)
+                  self.send_header('Content-Type', 'application/json')
+                  self.send_header('Content-Length', str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_GET(self):
+                  if self.path in ('/health', '/api/v1/health'):
+                      self._send(200, {'ok': True})
+                  else:
+                      self._send(404, {'error': 'not_found'})
+
+              def do_POST(self):
+                  if self.path != '/v1/chat/completions':
+                      self._send(404, {'error': 'not_found'})
+                      return
+                  n = int(self.headers.get('Content-Length', '0'))
+                  req = json.loads(self.rfile.read(n) or b'{}')
+                  msgs = req.get('messages') or []
+                  user = next((m.get('content', '') for m in reversed(msgs)
+                               if m.get('role') == 'user'), '')
+                  lang = 'target'
+                  for m in msgs:
+                      if m.get('role') == 'system':
+                          c = str(m.get('content', ''))
+                          # Find " to " in a lowercased COPY but slice the
+                          # ORIGINAL, so "zh_CN" keeps its case (the WP-side
+                          # verify matches the marker case-sensitively).
+                          pos = c.lower().find(' to ')
+                          if pos >= 0:
+                              cand = c[pos + 4:].split()
+                              if cand:
+                                  lang = re.sub(r'[^A-Za-z0-9_-]', '', cand[0]) or 'target'
+                          break
+                  self._send(200, {
+                      'id': 'chatcmpl-journey', 'object': 'chat.completion',
+                      'created': 0, 'model': req.get('model', 'mock'),
+                      'choices': [{
+                          'index': 0,
+                          'message': {'role': 'assistant',
+                                      'content': wrap(str(user), lang)},
+                          'finish_reason': 'stop',
+                      }],
+                      'usage': {'prompt_tokens': 0, 'completion_tokens': 0,
+                                'total_tokens': 0},
+                  })
+
+              def log_message(self, fmt, *args):
+                  sys.stderr.write('[mock] ' + (fmt % args) + '\n')
+
+          HTTPServer(('127.0.0.1', 9099), H).serve_forever()
+          MOCKPY
+          nohup python3 /tmp/journey-mock.py > /tmp/journey-mock.log 2>&1 &
+          for _ in $(seq 1 20); do
+            curl -sf "http://127.0.0.1:9099/health" -o /dev/null && break; sleep 1
+          done
+          curl -sf "http://127.0.0.1:9099/health" -o /dev/null \
+            || { cat /tmp/journey-mock.log; echo "inline mock did not come up" >&2; exit 1; }
+          echo "inline translation mock up :9099"
+
+          # WP translation side: zh_CN language, virtual site v_client_rt
+          # (path /zh-rt/), wordpress-blog model, en_US->zh_CN relation,
+          # post translation rule, fresh source post. Idempotent; emits ONE
+          # JSON line (success envelope) with the ids.
+          cat > /tmp/journey-provision.php <<'PHP'
+          <?php
+          if ( ! defined( 'ABSPATH' ) ) { fwrite( STDERR, "wp eval-file only\n" ); exit( 1 ); }
+          global $wpdb;
+          $lang_table = $wpdb->prefix . 'wptsall_languages';
+          if ( ! (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$lang_table} WHERE code = %s", 'zh_CN' ) ) ) {
+              $wpdb->insert( $lang_table, array(
+                  'code' => 'zh_CN', 'slug' => 'zh', 'name' => '简体中文',
+                  'native_name' => '简体中文', 'locale' => 'zh_CN', 'flag' => 'cn',
+                  'direction' => 'ltr', 'sort_order' => 10, 'is_default' => 0, 'status' => 'active',
+              ) );
+          }
+          $vs_table = $wpdb->prefix . 'wptsall_virtual_sites';
+          $virtual_id = 'v_client_rt';
+          if ( ! (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$vs_table} WHERE id = %s", $virtual_id ) ) ) {
+              $wpdb->insert( $vs_table, array(
+                  'id' => $virtual_id, 'site_name' => 'Journey Translate 站',
+                  'site_path' => '/zh-rt/', 'site_language' => 'zh_CN',
+                  'source_blog_id' => 1, 'enable_blog_sync' => 1, 'status' => 'enabled',
+              ) );
+          }
+          # Plugin initialization scan FIRST (the same chain the setup wizard
+          # / admin "Scan All" runs): create_rule enforces that the rule's
+          # target object exists in the model template (model_objects), which
+          # only the scanner populates — a fresh install has no template yet
+          # and create_rule fails with template_object_not_found. Incremental
+          # mode: no auto rule create/delete side effects.
+          $plugin_dir = trailingslashit( WP_PLUGIN_DIR ) . 'wpmmcc-ats';
+          $scanner_file = $plugin_dir . '/includes/models/scanners/class-model-scanner-v2.php';
+          $tracker_file = $plugin_dir . '/includes/models/scanners/class-runtime-tracker.php';
+          if ( is_readable( $scanner_file ) ) { require_once $scanner_file; }
+          if ( is_readable( $tracker_file ) ) { require_once $tracker_file; }
+          if ( ! class_exists( 'WPTSALL\Models\Scanners\Model_Scanner_V2' ) ) {
+              fwrite( STDERR, "Model_Scanner_V2 unavailable\n" ); exit( 1 );
+          }
+          if ( class_exists( 'WPTSALL\Models\Scanners\Runtime_Tracker' ) ) {
+              WPTSALL\Models\Scanners\Runtime_Tracker::init();
+          }
+          $scanner = new WPTSALL\Models\Scanners\Model_Scanner_V2();
+          $scanner->set_mode( 'incremental' );
+          $scan = $scanner->scan_all_plugins();
+          if ( (int) ( $scan['models_failed'] ?? 1 ) > 0 ) {
+              fwrite( STDERR, "model scan failed: " . wp_json_encode( $scan ) . "\n" ); exit( 1 );
+          }
+          echo "scan: models_created=" . (int) ( $scan['models_created'] ?? 0 )
+              . " models_updated=" . (int) ( $scan['models_updated'] ?? 0 ) . "\n";
+
+          $models_table = $wpdb->prefix . 'wptsall_models';
+          $model_id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$models_table} WHERE plugin_slug = %s LIMIT 1", 'wordpress-blog' ) );
+          if ( $model_id <= 0 ) {
+              $wpdb->insert( $models_table, array(
+                  'plugin_slug' => 'wordpress-blog', 'plugin_name' => 'WordPress Blog',
+                  'text_domain' => 'default', 'description' => 'WordPress Core blog functionality',
+                  'post_types' => wp_json_encode( array( 'post', 'page' ) ),
+                  'taxonomies' => wp_json_encode( array( 'category', 'post_tag' ) ),
+                  'status' => 'active', 'source_type' => 'auto', 'is_system' => 0,
+              ) );
+              $model_id = (int) $wpdb->insert_id;
+          }
+          $rel_table = $wpdb->prefix . 'wptsall_site_relations';
+          $rel_id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$rel_table} WHERE target_site_id = %s AND source_lang = %s AND target_lang = %s LIMIT 1", $virtual_id, 'en_US', 'zh_CN' ) );
+          if ( $rel_id <= 0 ) {
+              $wpdb->insert( $rel_table, array(
+                  'source_site_id' => 1, 'source_site_type' => 'wp', 'source_lang' => 'en_US',
+                  'source_theme_name' => 'Twenty Twenty-Five', 'source_theme_path' => 'twentytwentyfive',
+                  'template' => 'wordpress-blog', 'target_site_id' => $virtual_id,
+                  'target_site_type' => 'virtual', 'target_lang' => 'zh_CN',
+                  'target_theme_name' => 'Journey Translate 站', 'target_theme_path' => 'zh-rt',
+                  'media_handling' => 'copy', 'sync_mode' => 'new_only',
+                  'direction' => 'source_to_target', 'conflict_strategy' => 'source_wins',
+                  'status' => 'active',
+              ) );
+              $rel_id = (int) $wpdb->insert_id;
+          }
+          $rm_table = $wpdb->prefix . 'wptsall_relation_models';
+          if ( ! (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$rm_table} WHERE relation_id = %d AND model_id = %d", $rel_id, $model_id ) ) ) {
+              $wpdb->insert( $rm_table, array( 'relation_id' => $rel_id, 'model_id' => $model_id ) );
+          }
+          if ( ! class_exists( 'WPTSALL\Models\Services\Translation_Rule_Service' ) ) {
+              fwrite( STDERR, "Translation_Rule_Service unavailable\n" ); exit( 1 );
+          }
+          $rules_table = $wpdb->prefix . 'wptsall_translation_rules';
+          $rule_id = (int) $wpdb->get_var( $wpdb->prepare( "SELECT id FROM {$rules_table} WHERE model_id = %d AND data_type = %s AND object_name = %s LIMIT 1", $model_id, 'post', 'post' ) );
+          if ( $rule_id <= 0 ) {
+              $result = WPTSALL\Models\Services\Translation_Rule_Service::create_rule( $model_id, array(
+                  'name' => 'Journey Post Rule', 'url_pattern' => '?post_type=post&p={id}',
+                  'url_type' => 'single', 'data_type' => 'post', 'object_name' => 'post',
+                  'priority' => 10, 'is_active' => true,
+                  'field_capabilities' => array(
+                      'post_title'   => array( 'type' => 'translate', 'enabled' => true, 'content_format' => 'plain_text', 'storage' => 'post_column' ),
+                      'post_content' => array( 'type' => 'translate', 'enabled' => true, 'content_format' => 'rich_html', 'storage' => 'post_column' ),
+                      'post_excerpt' => array( 'type' => 'translate', 'enabled' => true, 'content_format' => 'plain_text', 'storage' => 'post_column' ),
+                  ),
+              ) );
+              if ( is_wp_error( $result ) ) { fwrite( STDERR, $result->get_error_message() . "\n" ); exit( 1 ); }
+              $rule_id = is_array( $result ) ? (int) ( $result['id'] ?? 0 ) : (int) $result;
+          }
+          $stamp = gmdate( 'Ymd-His' );
+          $post_title = 'Journey Translate Post ' . $stamp;
+          $post_id = wp_insert_post( array(
+              'post_title' => $post_title,
+              'post_content' => "<!-- wp:paragraph -->\n<p>This post was published after the relation and translation rule were provisioned. The client should discover it and translate it to Chinese.</p>\n<!-- /wp:paragraph -->\n",
+              'post_status' => 'publish', 'post_type' => 'post', 'post_author' => 1,
+          ), true );
+          if ( is_wp_error( $post_id ) ) { fwrite( STDERR, $post_id->get_error_message() . "\n" ); exit( 1 ); }
+          wp_send_json_success( array(
+              'relation_id' => $rel_id, 'rule_id' => $rule_id, 'model_id' => $model_id,
+              'post_id' => (int) $post_id, 'post_title' => $post_title,
+          ) );
+          PHP
+          cp /tmp/journey-provision.php "$WP_PATH/journey-provision.php"
+          PROVISION="$(wp eval-file "$WP_PATH/journey-provision.php" --path="$WP_PATH" --allow-root | tail -n 1)"
+          JOURNEY_RELATION_ID="$(echo "$PROVISION" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("success"), d; print(d["data"]["relation_id"])')"
+          JOURNEY_POST_ID="$(echo "$PROVISION" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("success"), d; print(d["data"]["post_id"])')"
+          echo "provisioned relation=$JOURNEY_RELATION_ID post=$JOURNEY_POST_ID"
+
+          # Client A: bind an openai-compatible component to the inline mock
+          # (same API sequence as the Lab client-content-roundtrip lane).
+          COMPONENT_ID="journey-openai-mock"
+          MOCK_URL="http://127.0.0.1:9099/v1/chat/completions"
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/components/local/install-from-catalog" \
+            -H 'Content-Type: application/json' \
+            -d "{\"entry_id\":\"openai-compatible\",\"local_id\":\"$COMPONENT_ID\",\"name\":\"Journey OpenAI Mock\"}" -o /dev/null
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/vendor-keys" \
+            -H 'Content-Type: application/json' \
+            -d "{\"id\":\"$COMPONENT_ID-key\",\"vendor_id\":\"openai\",\"label\":\"journey\",\"auth_values\":{\"api_key\":\"mock-translate-dev-key-2026\"},\"enabled\":true}" -o /dev/null
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/components/local/$COMPONENT_ID/versions" \
+            -H 'Content-Type: application/json' \
+            -d "{\"version\":\"v1\",\"key_ids\":[\"$COMPONENT_ID-key\"],\"auth_type\":\"key\"}" -o /dev/null || true
+          curl -sf -X PUT "http://127.0.0.1:$JOURNEY_A_PORT/api/components/local/$COMPONENT_ID" \
+            -H 'Content-Type: application/json' -d '{"enabled":true}' -o /dev/null
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/components/bindings/upsert" \
+            -H 'Content-Type: application/json' \
+            -d "{\"component_id\":\"$COMPONENT_ID\",\"auth\":{\"api_key\":\"mock-translate-dev-key-2026\"},\"key_ids\":[\"$COMPONENT_ID-key\"],\"request_overrides\":{\"url\":\"$MOCK_URL\",\"body\":{\"model\":\"mock-openai-v1\"}}}" -o /dev/null
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/rule-component-bindings/upsert" \
+            -H 'Content-Type: application/json' \
+            -d "{\"scope\":\"global\",\"slot_key\":\"plain_text\",\"component_id\":\"$COMPONENT_ID\"}" -o /dev/null
+          echo "component bound to inline mock"
+
+          # Quick-test: the component must translate through the mock and
+          # return the zh_CN markers before anything else runs.
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/components/local/$COMPONENT_ID/quick-test" \
+            -H 'Content-Type: application/json' \
+            -d "{\"api_key\":\"mock-translate-dev-key-2026\",\"auth_values\":{\"api_key\":\"mock-translate-dev-key-2026\"},\"config_overrides\":{\"request.url\":\"$MOCK_URL\",\"request.body.model\":\"mock-openai-v1\"},\"text\":\"Hello world\",\"source_lang\":\"en_US\",\"target_lang\":\"zh_CN\"}" \
+            | grep -q 'zh_CN' \
+            || { echo "quick-test did not return zh_CN mock output" >&2; exit 1; }
+          echo "quick-test ok (mock markers present)"
+
+          # WP-side verifier: post mapping + published target + markers, and
+          # the virtual frontend URL for the target post. Env-driven.
+          cat > /tmp/journey-verify-translate.php <<'PHP'
+          <?php
+          if ( ! defined( 'ABSPATH' ) ) { fwrite( STDERR, "wp eval-file only\n" ); exit( 1 ); }
+          global $wpdb;
+          $relation_id = (int) getenv( 'JOURNEY_RELATION_ID' );
+          $post_id     = (int) getenv( 'JOURNEY_POST_ID' );
+          $out = static function ( array $d ) { echo wp_json_encode( $d, JSON_UNESCAPED_SLASHES ) . "\n"; };
+          if ( $relation_id <= 0 || $post_id <= 0 ) { $out( array( 'pass' => false, 'error' => 'input' ) ); exit( 1 ); }
+          $pm_table = $wpdb->prefix . 'wptsall_post_mappings';
+          $mapping  = $wpdb->get_row( $wpdb->prepare( "SELECT * FROM {$pm_table} WHERE source_post_id = %d AND relation_id = %d LIMIT 1", $post_id, $relation_id ), ARRAY_A );
+          if ( empty( $mapping ) ) { $out( array( 'pass' => false, 'error' => 'no_mapping' ) ); exit( 1 ); }
+          $target_post_id = (int) $mapping['target_post_id'];
+          $target = get_post( $target_post_id );
+          if ( ! $target || 'publish' !== $target->post_status ) { $out( array( 'pass' => false, 'error' => 'target_not_published' ) ); exit( 1 ); }
+          $checks = array(
+              'title_marker'   => false !== mb_strpos( $target->post_title, '【zh_CN】' ),
+              'content_marker' => false !== mb_strpos( $target->post_content, '【zh_CN】' ),
+          );
+          $virtual_url = '';
+          $prefix = trim( (string) $wpdb->get_var( $wpdb->prepare( "SELECT target_theme_path FROM {$wpdb->prefix}wptsall_site_relations WHERE id = %d", $relation_id ) ), '/' );
+          if ( '' !== $prefix && '' !== (string) $target->post_name ) {
+              $virtual_url = '/' . $prefix . '/' . $target->post_name . '/';
+          }
+          $virtual_tagged = (string) get_post_meta( $target_post_id, '_wptsall_virtual_site_id', true );
+          $pass = ! in_array( false, $checks, true );
+          $out( array(
+              'pass' => $pass, 'relation_id' => $relation_id, 'post_id' => $post_id,
+              'target_post_id' => $target_post_id, 'checks' => $checks,
+              'virtual_url' => $virtual_url, 'virtual_site_tag' => $virtual_tagged,
+          ) );
+          exit( $pass ? 0 : 1 );
+          PHP
+          cp /tmp/journey-verify-translate.php "$WP_PATH/journey-verify-translate.php"
+
+          wp_translate_done() {
+            JOURNEY_RELATION_ID="$JOURNEY_RELATION_ID" JOURNEY_POST_ID="$JOURNEY_POST_ID" \
+              wp eval-file "$WP_PATH/journey-verify-translate.php" --path="$WP_PATH" --allow-root \
+              > /tmp/journey-translate-verify.json 2>/dev/null
+          }
+
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/discovery-tasks/bootstrap" -o /dev/null
+          TRANSLATED=0
+          for round in $(seq 1 8); do
+            if wp_translate_done; then TRANSLATED=1; break; fi
+            curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/worker/run-once" \
+              -H 'Content-Type: application/json' \
+              -d '{"max_iterations":15,"max_elapsed_secs":120,"max_items_per_run":60}' -o /dev/null || true
+            if wp_translate_done; then TRANSLATED=1; break; fi
+            echo "translate round $round: not yet done WP-side; continuing"
+          done
+          if [ "$TRANSLATED" != "1" ]; then
+            cat /tmp/journey-translate-verify.json 2>/dev/null || true
+            tail -n 40 /tmp/journey-a/client.log 2>/dev/null || true
+            tail -n 20 /tmp/journey-mock.log 2>/dev/null || true
+            echo "post $JOURNEY_POST_ID was not translated" >&2
+            exit 1
+          fi
+          echo "translate ok: $(cat /tmp/journey-translate-verify.json)"
+
+          # Plugin FRONTEND access: the virtual site route must render the
+          # translated post (200 + markers + no route errors).
+          VIRTUAL_URL="$(python3 -c 'import json; print(json.load(open("/tmp/journey-translate-verify.json"))["virtual_url"])')"
+          if [ -z "$VIRTUAL_URL" ]; then
+            echo "verifier produced no virtual_url" >&2; exit 1
+          fi
+          # No curl -f here on purpose: a non-200 must reach the status
+          # branch below so the log shows which status came back.
+          curl -s -o /tmp/journey-virtual-page.html -w '%{http_code}' "$WP_URL$VIRTUAL_URL" > /tmp/journey-virtual-status.txt
+          VSTATUS="$(cat /tmp/journey-virtual-status.txt)"
+          if [ "$VSTATUS" != "200" ]; then
+            echo "virtual frontend $VIRTUAL_URL -> $VSTATUS" >&2; exit 1
+          fi
+          grep -q '【zh_CN】' /tmp/journey-virtual-page.html \
+            || { echo "virtual frontend page lacks zh_CN markers; first 600 bytes:" >&2
+                 head -c 600 /tmp/journey-virtual-page.html >&2; echo >&2; exit 1; }
+          if grep -q 'url_pattern_not_registered' /tmp/journey-virtual-page.html; then
+            echo "virtual frontend page has route errors" >&2; exit 1
+          fi
+          echo "frontend access ok: $VIRTUAL_URL rendered with markers"
+          echo "translate leg OK: discovery -> mock translation -> WP write-back -> frontend render all green"
+
+          # --- content plugins leg: 19 third-party plugins, full flow ------
+          # The local Lab matrix's plugin set (project-specs.json; the 20th
+          # project is wptsall itself = the core post leg above). Real
+          # plugins from wordpress.org, installed the same way the Lab does
+          # it (latest-stable.zip + install from file): the slug-lookup path
+          # enforces the plugin's declared requiresWP, and the 2026 plugin
+          # generation already declares WP >= 7.0 — the zip path installs
+          # what the Lab actually runs. WP 7.1 matches the public
+          # compat-matrix's newest cell. Version drift is accepted: a
+          # wordpress.org plugin changing its CPT surface breaks this leg
+          # loudly and the fix is a pin.
+          PLUGIN_SLUGS="woocommerce easy-digital-downloads bbpress tutor learnpress the-events-calendar wp-job-manager envira-gallery-lite seriously-simple-podcasting wp-recipe-maker elementor wordpress-seo advanced-custom-fields site-reviews give directorist lifterlms events-manager hivepress"
+          for slug in $PLUGIN_SLUGS; do
+            curl -fsSL --max-time 180 -o "/tmp/journey-plugin-$slug.zip" \
+              "https://downloads.wordpress.org/plugin/${slug}.latest-stable.zip" \
+              || { echo "plugin download failed: $slug" >&2; exit 1; }
+            wp plugin install "/tmp/journey-plugin-$slug.zip" --activate --path="$WP_PATH" --allow-root </dev/null \
+              || { echo "plugin install failed: $slug" >&2; exit 1; }
+            echo "plugin installed+active: $slug"
+          done
+
+          # Own-CPT projects: <plugin>:<cpt>. Standard-CPT projects:
+          # elementor=page, wordpress-seo=post, advanced-custom-fields=product
+          # (advanced-custom-fields needs woocommerce active — installed above).
+          cat > /tmp/journey-provision-plugins.php <<'PHP'
+          <?php
+          if ( ! defined( 'ABSPATH' ) ) { fwrite( STDERR, "wp eval-file only\n" ); exit( 1 ); }
+          global $wpdb;
+          $own = array(
+              'woocommerce' => 'product', 'easy-digital-downloads' => 'download',
+              'bbpress' => 'topic', 'tutor' => 'courses', 'learnpress' => 'lp_course',
+              'the-events-calendar' => 'tribe_events', 'wp-job-manager' => 'job_listing',
+              'envira-gallery-lite' => 'envira', 'seriously-simple-podcasting' => 'podcast',
+              'wp-recipe-maker' => 'wprm_recipe', 'site-reviews' => 'site-review',
+              'give' => 'give_forms', 'directorist' => 'at_biz_dir',
+              'lifterlms' => 'course', 'events-manager' => 'event', 'hivepress' => 'hp_listing',
+          );
+          $out = static function ( array $d ) { echo wp_json_encode( $d, JSON_UNESCAPED_SLASHES ) . "\n"; };
+          $fail = static function ( string $m ) use ( $out ) { $out( array( 'success' => false, 'error' => $m ) ); exit( 1 ); };
+
+          # Incremental re-scan so the newly activated plugins get models
+          # (same chain as the setup wizard / core leg provision).
+          $plugin_dir = trailingslashit( WP_PLUGIN_DIR ) . 'wpmmcc-ats';
+          foreach ( array( 'models/scanners/class-model-scanner-v2.php', 'models/scanners/class-runtime-tracker.php' ) as $rel ) {
+              $f = $plugin_dir . '/includes/' . $rel;
+              if ( is_readable( $f ) ) { require_once $f; }
+          }
+          if ( ! class_exists( 'WPTSALL\Models\Scanners\Model_Scanner_V2' ) ) { $fail( 'Model_Scanner_V2 unavailable' ); }
+          if ( class_exists( 'WPTSALL\Models\Scanners\Runtime_Tracker' ) ) {
+              WPTSALL\Models\Scanners\Runtime_Tracker::init();
+          }
+          $scanner = new WPTSALL\Models\Scanners\Model_Scanner_V2();
+          $scanner->set_mode( 'incremental' );
+          $scan = $scanner->scan_all_plugins();
+          if ( (int) ( $scan['models_failed'] ?? 1 ) > 0 ) { $fail( 'scan failed: ' . wp_json_encode( $scan ) ); }
+
+          $models_table = $wpdb->prefix . 'wptsall_models';
+          $model_id = static function ( string $slug ) use ( $wpdb, $models_table ): int {
+              return (int) $wpdb->get_var( $wpdb->prepare(
+                  "SELECT id FROM {$models_table} WHERE plugin_slug = %s ORDER BY is_system ASC, id ASC LIMIT 1", $slug ) );
+          };
+
+          # Dedicated virtual site + relation for the plugin projects (keeps
+          # the core leg's assertions scoped to its own relation).
+          $vs_table = $wpdb->prefix . 'wptsall_virtual_sites';
+          $virtual_id = 'v_plugin_rt';
+          if ( ! (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$vs_table} WHERE id = %s", $virtual_id ) ) ) {
+              $wpdb->insert( $vs_table, array(
+                  'id' => $virtual_id, 'site_name' => 'Journey Plugins 站',
+                  'site_path' => '/zh-plugins/', 'site_language' => 'zh_CN',
+                  'source_blog_id' => 1, 'enable_blog_sync' => 1, 'status' => 'enabled',
+              ) );
+          }
+          $rel_table = $wpdb->prefix . 'wptsall_site_relations';
+          $rel_id = (int) $wpdb->get_var( $wpdb->prepare(
+              "SELECT id FROM {$rel_table} WHERE target_site_id = %s AND source_lang = %s AND target_lang = %s LIMIT 1",
+              $virtual_id, 'en_US', 'zh_CN' ) );
+          if ( $rel_id <= 0 ) {
+              $wpdb->insert( $rel_table, array(
+                  'source_site_id' => 1, 'source_site_type' => 'wp', 'source_lang' => 'en_US',
+                  'source_theme_name' => 'Twenty Twenty-Five', 'source_theme_path' => 'twentytwentyfive',
+                  'template' => 'wordpress-blog', 'target_site_id' => $virtual_id,
+                  'target_site_type' => 'virtual', 'target_lang' => 'zh_CN',
+                  'target_theme_name' => 'Journey Plugins 站', 'target_theme_path' => 'zh-plugins',
+                  'media_handling' => 'copy', 'sync_mode' => 'new_only',
+                  'direction' => 'source_to_target', 'conflict_strategy' => 'source_wins',
+                  'status' => 'active',
+              ) );
+              $rel_id = (int) $wpdb->insert_id;
+          }
+          if ( $rel_id <= 0 ) { $fail( 'no relation' ); }
+
+          # Bind every model the projects need to the relation. Rules live on
+          # MODELS (not relations), so the existing post rule on wordpress-blog
+          # applies to the wordpress-seo post item automatically.
+          $rm_table = $wpdb->prefix . 'wptsall_relation_models';
+          $bind = static function ( int $mid ) use ( $wpdb, $rm_table, $rel_id ): void {
+              if ( $mid <= 0 ) { return; }
+              if ( ! (int) $wpdb->get_var( $wpdb->prepare( "SELECT COUNT(*) FROM {$rm_table} WHERE relation_id = %d AND model_id = %d", $rel_id, $mid ) ) ) {
+                  $wpdb->insert( $rm_table, array( 'relation_id' => $rel_id, 'model_id' => $mid ) );
+              }
+          };
+          $blog_model = $model_id( 'wordpress-blog' );
+          if ( $blog_model <= 0 ) { $fail( 'wordpress-blog model missing' ); }
+          $bind( $blog_model );
+          foreach ( array_keys( $own ) as $slug ) {
+              $mid = $model_id( $slug );
+              if ( $mid <= 0 ) { $fail( "model missing for $slug (scan did not create it?)" ); }
+              $bind( $mid );
+          }
+
+          # Rules: the product's own bulk generation — the same path the
+          # setup wizard / trigger-scan uses (create_rules_for_model first
+          # merges the model's scan_result fields into the template, THEN
+          # generates rules with proper caps: post_title/post_content as
+          # translate). Hand-rolled create_rule with post caps is rejected
+          # by the template constraint on fresh plugin models — their post
+          # objects carry no declared fields until the scan result is
+          # merged (runner round 2: rule_fields_not_in_template).
+          if ( ! class_exists( 'WPTSALL\Models\Services\Translation_Rule_Service' ) ) {
+              require_once trailingslashit( WP_PLUGIN_DIR ) . 'wpmmcc-ats/includes/models/services/class-translation-rule-service.php';
+          }
+          if ( ! class_exists( 'WPTSALL\Models\Services\Translation_Rule_Service' ) ) { $fail( 'Translation_Rule_Service unavailable' ); }
+          foreach ( array_merge( array( 'wordpress-blog' ), array_keys( $own ) ) as $slug ) {
+              $mid = $model_id( $slug );
+              $res = WPTSALL\Models\Services\Translation_Rule_Service::create_rules_for_model( $mid );
+              # The product flow tolerates per-object errors (e.g. non-public
+              # CPTs are skipped as not_publicly_accessible); the hard gate is
+              # that the objects the projects NEED have rules afterwards.
+              $need = 'wordpress-blog' === $slug ? array( 'post', 'page' ) : array( $own[ $slug ] );
+              foreach ( $need as $cpt ) {
+                  $has = (int) $wpdb->get_var( $wpdb->prepare(
+                      "SELECT COUNT(*) FROM {$wpdb->prefix}wptsall_translation_rules WHERE model_id = %d AND data_type = %s AND object_name = %s",
+                      $mid, 'post', $cpt ) );
+                  if ( $has <= 0 ) { $fail( "no rule generated for {$slug}/{$cpt}: " . wp_json_encode( $res ) ); }
+              }
+              echo 'rules ' . $slug . ': created=' . (int) ( $res['created'] ?? 0 )
+                  . ' updated=' . (int) ( $res['updated'] ?? 0 )
+                  . ' skipped=' . (int) ( $res['skipped'] ?? 0 )
+                  . ' errors=' . (int) ( $res['errors'] ?? 0 ) . "\n";
+          }
+
+          # Seed one published item per project. bbpress topics need a forum
+          # parent; everything else seeds bare (CPTs register on activation).
+          $stamp = gmdate( 'Ymd-His' );
+          $items = array();
+          $seed = static function ( string $project, string $plugin, string $cpt, array $extra = array() ) use ( &$items, $stamp ) {
+              $title = 'Journey ' . $project . ' ' . $stamp;
+              $post_id = wp_insert_post( array_merge( array(
+                  'post_title' => $title,
+                  'post_content' => "<!-- wp:paragraph -->\n<p>Content item for the {$plugin} plugin project. The client should discover it via its {$cpt} rule and translate it to Chinese.</p>\n<!-- /wp:paragraph -->\n",
+                  'post_status' => 'publish', 'post_type' => $cpt, 'post_author' => 1,
+              ), $extra ), true );
+              if ( is_wp_error( $post_id ) ) { fwrite( STDERR, $post_id->get_error_message() . "\n" ); exit( 1 ); }
+              $items[] = array( 'project' => $project, 'plugin' => $plugin, 'cpt' => $cpt, 'post_id' => (int) $post_id );
+          };
+          foreach ( $own as $slug => $cpt ) {
+              if ( 'bbpress' === $slug ) {
+                  $forum_id = wp_insert_post( array(
+                      'post_title' => 'Journey bbpress forum ' . $stamp,
+                      'post_content' => 'Forum container for the topic item.',
+                      'post_status' => 'publish', 'post_type' => 'forum', 'post_author' => 1,
+                  ), true );
+                  if ( is_wp_error( $forum_id ) ) { fwrite( STDERR, $forum_id->get_error_message() . "\n" ); exit( 1 ); }
+                  $seed( 'bbpress-content', 'bbpress', 'topic', array( 'post_parent' => (int) $forum_id ) );
+              } else {
+                  $seed( $slug . '-content', $slug, $cpt );
+              }
+          }
+          $seed( 'elementor-content', 'elementor', 'page' );
+          $seed( 'wordpress-seo-content', 'wordpress-seo', 'post' );
+          $seed( 'advanced-custom-fields-content', 'advanced-custom-fields', 'product' );
+          $out( array( 'success' => true, 'relation_id' => $rel_id, 'items' => $items ) );
+          PHP
+          cp /tmp/journey-provision-plugins.php "$WP_PATH/journey-provision-plugins.php"
+          PLUGIN_PROVISION="$(wp eval-file "$WP_PATH/journey-provision-plugins.php" --path="$WP_PATH" --allow-root | tail -n 1)"
+          PLUGIN_RELATION_ID="$(echo "$PLUGIN_PROVISION" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("success"), d; print(d["relation_id"])')"
+          echo "$PLUGIN_PROVISION" | python3 -c 'import json,sys; d=json.load(sys.stdin); json.dump(d["items"], open("/tmp/journey-plugin-items.json","w")); print("provisioned plugin projects:", len(d["items"]))'
+
+          # WP-side per-plugin verifier: mapping + published target + markers
+          # + the virtual URL for the browser sweep. Env-driven, exit-code
+          # propagates through wp eval-file.
+          cat > /tmp/journey-verify-plugins.php <<'PHP'
+          <?php
+          if ( ! defined( 'ABSPATH' ) ) { fwrite( STDERR, "wp eval-file only\n" ); exit( 1 ); }
+          global $wpdb;
+          $relation_id = (int) getenv( 'JOURNEY_PLUGIN_RELATION_ID' );
+          $items = json_decode( (string) getenv( 'JOURNEY_PLUGIN_ITEMS' ), true );
+          $out = static function ( array $d ) { echo wp_json_encode( $d, JSON_UNESCAPED_SLASHES ) . "\n"; };
+          if ( $relation_id <= 0 || ! is_array( $items ) ) { $out( array( 'pass' => false, 'error' => 'input' ) ); exit( 1 ); }
+          $pm_table = $wpdb->prefix . 'wptsall_post_mappings';
+          $prefix = trim( (string) $wpdb->get_var( $wpdb->prepare(
+              "SELECT target_theme_path FROM {$wpdb->prefix}wptsall_site_relations WHERE id = %d", $relation_id ) ), '/' );
+          $projects = array();
+          $pass = true;
+          foreach ( $items as $it ) {
+              $post_id = (int) ( $it['post_id'] ?? 0 );
+              $project = (string) ( $it['project'] ?? '?' );
+              $cpt = (string) ( $it['cpt'] ?? '?' );
+              # CPTs registered without editor support (envira, give_forms)
+              # have no post_content field at all — the product correctly
+              # translates title-only for them; the content marker is only
+              # required for editor-capable CPTs.
+              $editor_cpt = post_type_supports( $cpt, 'editor' );
+              $row = array(
+                  'project' => $project, 'plugin' => (string) ( $it['plugin'] ?? '?' ),
+                  'cpt' => $cpt, 'post_id' => $post_id, 'editor' => $editor_cpt,
+                  'target_post_id' => 0, 'title_marker' => false, 'content_marker' => false,
+                  'virtual_url' => '',
+              );
+              $mapping = $wpdb->get_row( $wpdb->prepare(
+                  "SELECT * FROM {$pm_table} WHERE source_post_id = %d AND relation_id = %d LIMIT 1", $post_id, $relation_id ), ARRAY_A );
+              if ( ! empty( $mapping ) ) {
+                  $target_post_id = (int) $mapping['target_post_id'];
+                  $target = get_post( $target_post_id );
+                  $row['target_post_id'] = $target_post_id;
+                  if ( $target && 'publish' === $target->post_status ) {
+                      $row['title_marker'] = false !== mb_strpos( $target->post_title, '【zh_CN】' );
+                      $row['content_marker'] = $editor_cpt
+                          ? ( false !== mb_strpos( $target->post_content, '【zh_CN】' ) )
+                          : true;
+                      if ( '' !== $prefix && '' !== (string) $target->post_name ) {
+                          $row['virtual_url'] = '/' . $prefix . '/' . $target->post_name . '/';
+                      }
+                  }
+              }
+              if ( ! $row['title_marker'] || ! $row['content_marker'] || '' === $row['virtual_url'] ) { $pass = false; }
+              $projects[] = $row;
+          }
+          $out( array( 'pass' => $pass, 'relation_id' => $relation_id, 'projects' => $projects ) );
+          exit( $pass ? 0 : 1 );
+          PHP
+          cp /tmp/journey-verify-plugins.php "$WP_PATH/journey-verify-plugins.php"
+          plugins_translated() {
+            JOURNEY_PLUGIN_RELATION_ID="$PLUGIN_RELATION_ID" \
+            JOURNEY_PLUGIN_ITEMS="$(cat /tmp/journey-plugin-items.json)" \
+              wp eval-file "$WP_PATH/journey-verify-plugins.php" --path="$WP_PATH" --allow-root \
+              > /tmp/journey-plugins-verify.json 2>/dev/null
+          }
+
+          curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/discovery-tasks/bootstrap" -o /dev/null
+          PLUGINS_DONE=0
+          for round in $(seq 1 12); do
+            if plugins_translated; then PLUGINS_DONE=1; break; fi
+            curl -sf -X POST "http://127.0.0.1:$JOURNEY_A_PORT/api/worker/run-once" \
+              -H 'Content-Type: application/json' \
+              -d '{"max_iterations":25,"max_elapsed_secs":180,"max_items_per_run":80}' -o /dev/null || true
+            if plugins_translated; then PLUGINS_DONE=1; break; fi
+            echo "plugins round $round: not all translated yet; continuing"
+          done
+          if [ "$PLUGINS_DONE" != "1" ]; then
+            cat /tmp/journey-plugins-verify.json 2>/dev/null || true
+            tail -n 60 /tmp/journey-a/client.log 2>/dev/null || true
+            tail -n 20 /tmp/journey-mock.log 2>/dev/null || true
+            echo "not all plugin projects were translated" >&2
+            exit 1
+          fi
+          echo "plugins translated: $(python3 -c 'import json; d=json.load(open("/tmp/journey-plugins-verify.json")); print(d["pass"], len(d["projects"]), "projects")')"
+          python3 -c '
+          import json
+          d = json.load(open("/tmp/journey-plugins-verify.json"))
+          targets = [ { "project": p["project"], "plugin": p["plugin"], "virtual_url": p["virtual_url"] } for p in d["projects"] ]
+          json.dump(targets, open("/tmp/journey-plugin-targets.json", "w"))
+          print("targets:", len(targets))'
+
+          # Browser sweep: every translated plugin page rendered in a real
+          # browser, zh_CN markers asserted in the DOM, one screenshot per
+          # plugin page (artifact evidence).
+          cat > "$ROOT/client-wpplugin/source/frontend/journey-plugins.tmp.mjs" <<'EOF'
+          import { chromium } from '@playwright/test';
+          import fs from 'node:fs';
+          const WP = process.env.JOURNEY_WP_URL;
+          const TARGETS = JSON.parse(fs.readFileSync(process.env.JOURNEY_PLUGIN_TARGETS, 'utf8'));
+          const OUTDIR = process.env.JOURNEY_PLUGIN_SHOTS;
+          const browser = await chromium.launch();
+          const page = await browser.newPage();
+          // With all 19 plugins active every page pulls dozens of assets
+          // through the single php -S router (each missing asset even boots
+          // WP), so domcontentloaded can exceed any sane timeout. The
+          // assertion targets the SERVER-RENDERED document (title element +
+          // body text), so static subresources are aborted; only the
+          // document itself loads.
+          await page.route('**/*', (route) => {
+            const req = route.request();
+            if (req.isNavigationRequest() || req.resourceType() === 'document') {
+              route.continue();
+              return;
+            }
+            route.abort();
+          });
+          const failures = [];
+          const step = (name, ok) => {
+            console.log(`${ok ? 'PASS' : 'FAIL'}: ${name}`);
+            if (!ok) failures.push(name);
+          };
+          for (const t of TARGETS) {
+            const url = WP + t.virtual_url;
+            let ok = false, status = 0;
+            try {
+              const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+              status = resp ? resp.status() : 0;
+              // Rendered-DOM marker evidence: the translated title always
+              // lands in the page <title> element; plugin-templated CPTs
+              // (e.g. woocommerce product / directorist listing singles)
+              // may not echo title/content in their body templates, so the
+              // assertion accepts either the page title or the body text.
+              const title = await page.title();
+              const body = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+              const html = await page.content();
+              ok = status === 200
+                && (title.includes('【zh_CN】') || body.includes('【zh_CN】'))
+                && !html.includes('url_pattern_not_registered');
+            } catch {}
+            step(`plugin frontend ${t.project} (${t.plugin}) ${t.virtual_url} -> ${status}`, ok);
+            await page.screenshot({ path: `${OUTDIR}/journey-plugin-${t.project}.png` }).catch(() => {});
+          }
+          await browser.close();
+          if (failures.length) {
+            console.log('plugin frontend failures: ' + failures.join(', '));
+            process.exit(1);
+          }
+          console.log(`plugin frontend sweep OK: ${TARGETS.length} plugin pages rendered with zh_CN markers in the DOM`);
+          EOF
+          JOURNEY_WP_URL="$WP_URL" \
+          JOURNEY_PLUGIN_TARGETS="/tmp/journey-plugin-targets.json" \
+          JOURNEY_PLUGIN_SHOTS="$RUNNER_TEMP" \
+            node "$ROOT/client-wpplugin/source/frontend/journey-plugins.tmp.mjs"
+          rm -f "$ROOT/client-wpplugin/source/frontend/journey-plugins.tmp.mjs"
+          echo "plugins leg OK: 19 content plugins installed -> scanned -> translated -> WP-verified -> browser-rendered"
+
+          # --- UI ops leg: real browser against the served WebUI ------------
+          cat > "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs" <<'EOF'
+          import { chromium } from '@playwright/test';
+          const BASE = process.env.JOURNEY_WEBUI_BASE;
+          const SITE_URL = process.env.JOURNEY_SITE_URL;
+          const POST_ID = process.env.JOURNEY_POST_ID;
+          const OUT = process.env.JOURNEY_SHOT;
+          const OUT_TASKS = process.env.JOURNEY_SHOT_TASKS;
+          const browser = await chromium.launch();
+          const page = await browser.newPage();
+          const failures = [];
+          const step = (name, ok) => {
+            console.log(`${ok ? 'PASS' : 'FAIL'}: ${name}`);
+            if (!ok) failures.push(name);
+          };
+          await page.goto(BASE + '/', { waitUntil: 'domcontentloaded', timeout: 20000 });
+          step('title is WPTSALL Client', (await page.title()) === 'WPTSALL Client');
+          const sitesNav = page.getByRole('button', { name: 'Sites', exact: true });
+          await sitesNav.waitFor({ state: 'visible', timeout: 15000 });
+          await sitesNav.click();
+          let listed = false;
+          try {
+            await page.getByText(SITE_URL, { exact: false }).first()
+              .waitFor({ state: 'visible', timeout: 15000 });
+            listed = true;
+          } catch { listed = false; }
+          step(`bound site ${SITE_URL} listed on Sites page`, listed);
+          // Tasks page: the discovery job cards prove the translation run
+          // surfaced in the client's task UI. Post translations stream
+          // through the inline discover -> translate -> callback pipeline
+          // and do NOT create item rows (translation_items only holds the
+          // config_i18n review flow), so the post's client-side trace is
+          // asserted on the Logs page below.
+          const tasksNav = page.getByRole('button', { name: 'Tasks', exact: true });
+          await tasksNav.waitFor({ state: 'visible', timeout: 15000 });
+          await tasksNav.click();
+          const jobCards = page.locator('button').filter({ hasText: '127.0.0.1:8080' });
+          let jobOk = false;
+          try {
+            await jobCards.first().waitFor({ state: 'visible', timeout: 15000 });
+            const cardCount = await jobCards.count();
+            for (let i = 0; i < cardCount; i++) {
+              if (/[1-9]\d*\s*\/\s*\d+/.test(await jobCards.nth(i).innerText())) {
+                jobOk = true;
+                break;
+              }
+            }
+          } catch { jobOk = false; }
+          step('translation job card visible with >= 1 done item', jobOk);
+          // Logs page: the discovery.item_translated event for the source
+          // post is the client-side trace of the translation. Posts stream
+          // through the inline discover -> translate -> callback pipeline
+          // (discovery.item_translated / discovery.callback_sent events);
+          // pipeline.sync_done belongs to the config_i18n review flow only.
+          const logsNav = page.getByRole('button', { name: 'Logs', exact: true });
+          await logsNav.waitFor({ state: 'visible', timeout: 15000 });
+          await logsNav.click();
+          await page.locator('#logs-limit-input').fill('1000');
+          await page.getByRole('button', { name: 'Load Logs', exact: true }).click();
+          await page.locator('#log-container .font-mono > div').first()
+            .waitFor({ state: 'visible', timeout: 15000 });
+          await page.getByPlaceholder('Filter Placeholder').fill('item_translated');
+          // Rendered detail is the JSON.stringify'd detail object, so the
+          // post id appears as "object_id":N (trailing , or } keeps an
+          // exact-value match: 6 cannot match 61).
+          const logLines = page.locator('#log-container .font-mono > div');
+          const translatedCount = await logLines
+            .filter({ hasText: /"object_id":\d+/ }).count();
+          step(`discovery item_translated events visible (${translatedCount} lines)`,
+            translatedCount > 0);
+          let postOk = false;
+          try {
+            await logLines
+              .filter({ hasText: new RegExp('"object_id":' + POST_ID + '[,}]') })
+              .first().waitFor({ state: 'visible', timeout: 10000 });
+            postOk = true;
+          } catch { postOk = false; }
+          step(`client log shows item_translated for post ${POST_ID}`, postOk);
+          await page.screenshot({ path: OUT_TASKS, fullPage: true });
+          await page.getByRole('button', { name: 'Overview', exact: true }).click();
+          await page.waitForTimeout(300);
+          step('navigated back to Overview', true);
+          await page.screenshot({ path: OUT, fullPage: true });
+          await browser.close();
+          if (failures.length) {
+            console.error('UI journey FAILED: ' + failures.join(', '));
+            process.exit(1);
+          }
+          console.log('UI journey OK');
+          EOF
+          JOURNEY_WEBUI_BASE="http://127.0.0.1:$JOURNEY_A_PORT" \
+          JOURNEY_SITE_URL="$WP_URL" \
+          JOURNEY_POST_ID="$JOURNEY_POST_ID" \
+          JOURNEY_SHOT="$RUNNER_TEMP/journey-ui-sites.png" \
+          JOURNEY_SHOT_TASKS="$RUNNER_TEMP/journey-ui-translate.png" \
+            node "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
+          rm -f "$ROOT/client-wpplugin/source/frontend/journey-ui.tmp.mjs"
+          echo "ui ops leg OK: SPA served, Sites nav, paired site listed, Tasks job card, Logs item_translated trace, round trip"
+
+          # --- uninstall leg: stop, no residue, remove, ports freed ---------
+          # Grace first, then escalate: a fixed 2s TERM window flakes when a
+          # client is mid-shutdown. The strict assertion stays AFTER the
+          # escalation — once SIGKILL has been delivered, zero residue is a
+          # hard requirement (a survivor would mean the path/pid model is
+          # wrong, not that shutdown was slow).
+          kill "$(cat /tmp/journey-a/pid)" "$(cat /tmp/journey-b/pid)" 2>/dev/null || true
+          sleep 2
+          stragglers="$(pgrep -f '/tmp/journey-install-' || true)"
+          if [ -n "$stragglers" ]; then
+            echo "TERM window elapsed; escalating to KILL for: $stragglers" >&2
+            kill -9 $stragglers 2>/dev/null || true
+            sleep 1
+          fi
+          residue="$(pgrep -f '/tmp/journey-install-' || true)"
+          if [ -n "$residue" ]; then
+            echo "client processes survived SIGKILL on install paths:" >&2
+            echo "$residue" >&2
+            exit 1
+          fi
+          rm -rf /tmp/journey-install-a /tmp/journey-install-b \
+                 /tmp/journey-a /tmp/journey-b
+          for port in "$JOURNEY_A_PORT" "$JOURNEY_B_PORT"; do
+            if curl -s -o /dev/null -m 2 "http://127.0.0.1:$port/api/status"; then
+              echo "port $port still answering after uninstall" >&2
+              exit 1
+            fi
+          done
+          for p in /tmp/journey-install-a /tmp/journey-a /tmp/journey-install-b /tmp/journey-b; do
+            [ ! -e "$p" ] || { echo "$p survived uninstall" >&2; exit 1; }
+          done
+          echo "uninstall leg OK: no process residue, roots + data removed, ports freed"
+
+          pkill -f 'php -S 127.0.0.1:8080' 2>/dev/null || true
+          pkill -f 'journey-mock.py' 2>/dev/null || true
+          echo "JOURNEY OK: install -> pair -> translate (full flow vs mock) -> UI ops -> uninstall (dual agents) all green"
+
+      - name: Upload UI screenshots
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: journey-ui
+          path: |
+            ${{ runner.temp }}/journey-ui-sites.png
+            ${{ runner.temp }}/journey-ui-translate.png
+            ${{ runner.temp }}/journey-plugin-*.png
+          if-no-files-found: ignore
